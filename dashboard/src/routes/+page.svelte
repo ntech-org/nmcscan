@@ -68,6 +68,11 @@
 		players_online: number;
 	}
 
+	interface ExcludeEntry {
+		network: string;
+		comment: string | null;
+	}
+
 	// State
 	let apiKey = $state(browser ? localStorage.getItem('nmcscan_api_key') || '' : '');
 	let isAuthenticated = $state(false);
@@ -77,7 +82,7 @@
 	let asns = $state<Asn[]>([]);
 	let loading = $state(false);
 	let error = $state<string | null>(null);
-	let selectedTab = $state<'overview' | 'servers' | 'asns' | 'players'>('overview');
+	let selectedTab = $state<'overview' | 'servers' | 'players' | 'asns' | 'exclusions'>('overview');
 
 	// Search and Filtering
 	let searchQuery = $state('');
@@ -87,6 +92,12 @@
 	let playerSearchQuery = $state('');
 	let playerSearchResults = $state<PlayerResponse[]>([]);
 	let playerSearchLoading = $state(false);
+
+	// Exclusions
+	let exclusions = $state<ExcludeEntry[]>([]);
+	let newExcludeNetwork = $state('');
+	let newExcludeComment = $state('');
+	let excludeSubmitting = $state(false);
 
 	// Server History
 	let selectedServerHistory = $state<{ip: string, data: HistoryResponse[]} | null>(null);
@@ -112,7 +123,10 @@
 			isAuthenticated = false;
 			throw new Error('Unauthorized: Invalid API Key');
 		}
-		if (!res.ok) throw new Error(`HTTP Error: ${res.status}`);
+		if (!res.ok) {
+			const text = await res.text();
+			throw new Error(text || `HTTP Error: ${res.status}`);
+		}
 		return res;
 	}
 
@@ -151,12 +165,44 @@
 			stats = await statsRes.json();
 			asns = await asnsRes.json();
 			
-			await searchServers();
+			if (selectedTab === 'servers') await searchServers();
+			if (selectedTab === 'exclusions') await loadExclusions();
 		} catch (e) {
 			if (e instanceof Error && e.message.includes('Unauthorized')) {
 				isAuthenticated = false;
 			}
 			console.error("Data load error:", e);
+		}
+	}
+
+	async function loadExclusions() {
+		try {
+			const res = await fetchWithAuth(`${API_BASE}/api/exclude`);
+			exclusions = await res.json();
+		} catch (e) {
+			console.error("Failed to load exclusions:", e);
+		}
+	}
+
+	async function addExclusion() {
+		if (!newExcludeNetwork) return;
+		excludeSubmitting = true;
+		try {
+			await fetchWithAuth(`${API_BASE}/api/exclude`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					network: newExcludeNetwork,
+					comment: newExcludeComment || null
+				})
+			});
+			newExcludeNetwork = '';
+			newExcludeComment = '';
+			await loadExclusions();
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Failed to add exclusion');
+		} finally {
+			excludeSubmitting = false;
 		}
 	}
 
@@ -319,6 +365,12 @@
 		clearTimeout(searchTimeout);
 		searchTimeout = setTimeout(searchServers, 500);
 	}
+
+	$effect(() => {
+		if (selectedTab === 'exclusions' && isAuthenticated) {
+			loadExclusions();
+		}
+	});
 </script>
 
 <svelte:head>
@@ -392,7 +444,7 @@
 			<!-- Navigation Tabs -->
 			<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
 				<div class="flex space-x-1">
-					{#each ['overview', 'servers', 'players', 'asns'] as tab}
+					{#each ['overview', 'servers', 'players', 'asns', 'exclusions'] as tab}
 						<button
 							class="px-4 py-3 text-sm font-medium transition-all relative {selectedTab === tab ? 'text-blue-400' : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50 rounded-t-lg'}"
 							onclick={() => selectedTab = tab as any}
@@ -697,6 +749,79 @@
 								{/each}
 							</tbody>
 						</table>
+					</div>
+				</div>
+			{/if}
+
+			{#if selectedTab === 'exclusions'}
+				<div class="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+					<div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm">
+						<h2 class="text-xl font-bold text-white mb-2">Network Exclusions</h2>
+						<p class="text-gray-400 text-sm mb-6">Instantly block IP ranges or specific addresses from being scanned.</p>
+						
+						<form onsubmit={(e) => { e.preventDefault(); addExclusion(); }} class="grid grid-cols-1 md:grid-cols-3 gap-4">
+							<div class="md:col-span-1">
+								<label for="network" class="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">IP or CIDR</label>
+								<input
+									id="network"
+									type="text"
+									placeholder="e.g. 1.2.3.4 or 1.2.3.0/24"
+									bind:value={newExcludeNetwork}
+									class="w-full bg-gray-950 border border-gray-700 rounded-lg px-4 py-2.5 text-sm text-gray-200 focus:border-red-500 focus:ring-1 focus:ring-red-500 outline-none transition-all"
+									required
+								/>
+							</div>
+							<div class="md:col-span-1">
+								<label for="comment" class="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Reason / Comment</label>
+								<input
+									id="comment"
+									type="text"
+									placeholder="Who requested this?"
+									bind:value={newExcludeComment}
+									class="w-full bg-gray-950 border border-gray-700 rounded-lg px-4 py-2.5 text-sm text-gray-200 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all"
+								/>
+							</div>
+							<div class="flex items-end">
+								<button 
+									type="submit"
+									disabled={excludeSubmitting || !newExcludeNetwork}
+									class="w-full bg-red-600/90 hover:bg-red-600 disabled:opacity-50 rounded-lg text-white font-medium py-2.5 transition-all shadow-md flex items-center justify-center gap-2"
+								>
+									{#if excludeSubmitting}
+										<svg class="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+										Processing
+									{:else}
+										Add Exclusion
+									{/if}
+								</button>
+							</div>
+						</form>
+					</div>
+
+					<div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+						<div class="p-4 border-b border-gray-800 bg-gray-950/30">
+							<h3 class="font-semibold text-white">Current Exclusions ({exclusions.length})</h3>
+						</div>
+						<div class="max-h-[500px] overflow-y-auto">
+							<table class="w-full text-left border-collapse">
+								<thead>
+									<tr class="bg-gray-950/50 text-gray-400 text-xs uppercase tracking-wider sticky top-0">
+										<th class="p-4 font-medium">Network Range</th>
+										<th class="p-4 font-medium">Comment</th>
+									</tr>
+								</thead>
+								<tbody class="divide-y divide-gray-800/50">
+									{#each exclusions.slice().reverse() as entry}
+										<tr class="hover:bg-gray-800/20 transition-colors">
+											<td class="p-4 font-mono text-sm text-red-400">{entry.network}</td>
+											<td class="p-4 text-sm text-gray-400 italic">
+												{entry.comment || '-'}
+											</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						</div>
 					</div>
 				</div>
 			{/if}

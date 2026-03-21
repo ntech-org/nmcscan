@@ -105,68 +105,98 @@ impl ExcludeList {
     /// Parse exclude list from a string (for testing).
     pub fn from_str(content: &str) -> Result<Self, ExcludeListError> {
         let mut networks = Vec::new();
-        
         for line in content.lines() {
             let line = line.trim();
-            
-            // Skip empty lines and full-line comments
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            
-            // Remove inline comments (anything after #)
+            if line.is_empty() || line.starts_with('#') { continue; }
             let line = line.split('#').next().unwrap_or(line).trim();
-            
-            // Skip if line became empty after removing comments
-            if line.is_empty() {
-                continue;
-            }
-            
-            // Handle IP ranges (e.g., 202.91.162.0-202.91.175.255)
+            if line.is_empty() { continue; }
             if line.contains('-') && !line.contains('/') {
                 if let Some((start, end)) = parse_ip_range(line) {
-                    // Convert range to CIDR networks (approximate)
                     networks.extend(range_to_cidrs(start, end));
                 }
                 continue;
             }
-            
-            // Try parsing as CIDR first, then as single IP
-            // Handle leading zeros in IP octets (e.g., 07.60.122.24/29)
             let normalized = normalize_ip_line(line);
             if let Ok(network) = normalized.parse::<Ipv4Network>() {
                 networks.push(network);
             } else if let Ok(ip) = normalized.parse::<Ipv4Addr>() {
-                // Single IP becomes a /32 network
                 networks.push(Ipv4Network::new(ip, 32).unwrap());
-            } else {
-                tracing::warn!("Invalid exclude entry: {}", line);
             }
         }
-        
-        tracing::info!("Loaded {} exclude networks", networks.len());
         Ok(Self { networks })
     }
 
-    /// Check if an IP address is excluded.
-    /// 
-    /// # Safety
-    /// This method MUST be called before ANY connection attempt.
-    /// If true, SKIP immediately. Do not log, do not ping.
     pub fn is_excluded(&self, ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(ipv4) => self.networks.iter().any(|n| n.contains(ipv4)),
-            IpAddr::V6(_) => false, // We only scan IPv4 for Minecraft
+            IpAddr::V6(_) => false,
         }
     }
 
-    /// Get the number of excluded networks.
     pub fn len(&self) -> usize {
         self.networks.len()
     }
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.networks.is_empty()
+use tokio::sync::RwLock;
+use std::sync::Arc;
+use std::io::Write;
+
+/// Manager for dynamic exclusion list.
+pub struct ExcludeManager {
+    inner: Arc<RwLock<ExcludeList>>,
+    file_path: String,
+}
+
+impl ExcludeManager {
+    pub fn new(file_path: &str) -> Self {
+        let initial = ExcludeList::from_file(file_path).unwrap_or_else(|_| {
+            ExcludeList { networks: Vec::new() }
+        });
+        
+        Self {
+            inner: Arc::new(RwLock::new(initial)),
+            file_path: file_path.to_string(),
+        }
+    }
+
+    /// Check if an IP is excluded.
+    pub async fn is_excluded(&self, ip: IpAddr) -> bool {
+        self.inner.read().await.is_excluded(ip)
+    }
+
+    /// Add a new exclusion to the file and reload memory.
+    pub async fn add_exclusion(&self, network: &str, comment: Option<&str>) -> Result<(), ExcludeListError> {
+        // 1. Validate the entry first
+        let normalized = normalize_ip_line(network.trim());
+        if normalized.parse::<Ipv4Network>().is_err() && normalized.parse::<Ipv4Addr>().is_err() {
+            return Err(ExcludeListError::ParseError(format!("Invalid network format: {}", network)));
+        }
+
+        // 2. Append to file
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.file_path)?;
+        
+        let entry = if let Some(c) = comment {
+            format!("\n{} # {}\n", network, c)
+        } else {
+            format!("\n{}\n", network)
+        };
+        
+        file.write_all(entry.as_bytes())?;
+
+        // 3. Reload in memory
+        let new_list = ExcludeList::from_file(&self.file_path)?;
+        let mut write_lock = self.inner.write().await;
+        *write_lock = new_list;
+
+        Ok(())
+    }
+
+    /// Get current list count.
+    pub async fn len(&self) -> usize {
+        self.inner.read().await.len()
     }
 }
 

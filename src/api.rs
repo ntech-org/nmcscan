@@ -10,6 +10,7 @@
 //! - GET /asns - List ASNs with server counts
 //! - GET /asns/{asn} - ASN details with IP ranges
 //! - GET /exclude - Current exclude list
+//! - POST /exclude - Add new exclusion
 //! - POST /scan/test - Trigger test scan
 //! - GET / - Static dashboard (fallback to assets)
 
@@ -29,12 +30,14 @@ use tower_http::services::ServeDir;
 
 use crate::db::{Database, Server};
 use crate::scheduler::Scheduler;
+use crate::exclude::ExcludeManager;
 
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Database>,
     pub scheduler: Arc<Scheduler>,
+    pub exclude_list: Arc<ExcludeManager>,
     pub api_key: Option<String>,
 }
 
@@ -79,6 +82,12 @@ pub struct TestScanRequest {
     pub region: Option<String>,
     /// Quick test with 10 servers
     pub quick: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct AddExcludeRequest {
+    pub network: String,
+    pub comment: Option<String>,
 }
 
 /// Test scan response.
@@ -166,7 +175,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/players", get(search_players))
         .route("/asns", get(list_asns))
         .route("/asns/:asn", get(get_asn))
-        .route("/exclude", get(get_exclude_list))
+        .route("/exclude", get(get_exclude_list).post(add_exclusion))
         .route("/scan/test", post(trigger_test_scan))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
@@ -351,6 +360,21 @@ async fn get_exclude_list() -> Json<Vec<ExcludeEntry>> {
         .collect();
 
     Json(entries)
+}
+
+/// POST /api/exclude - Add a new exclusion.
+async fn add_exclusion(
+    State(state): State<AppState>,
+    Json(payload): Json<AddExcludeRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state
+        .exclude_list
+        .add_exclusion(&payload.network, payload.comment.as_deref())
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    
+    tracing::info!("IP/Network {} excluded via dashboard: {:?}", payload.network, payload.comment);
+    Ok(StatusCode::CREATED)
 }
 
 /// POST /api/scan/test - Trigger a test scan with known servers.

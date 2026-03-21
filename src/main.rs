@@ -109,13 +109,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 4. Create scanner and scheduler
+    let exclude_manager = Arc::new(exclude::ExcludeManager::new("exclude.conf"));
+    
     let scanner = scanner::Scanner::new(
-        exclude::ExcludeList::from_file("exclude.conf").unwrap_or_else(|_| {
-            exclude::ExcludeList::from_str("").unwrap()
-        }),
+        Arc::clone(&exclude_manager),
         Arc::clone(&db),
     );
-    let mut scheduler = scheduler::Scheduler::new(Arc::clone(&db), args.test_mode || args.quick_test, args.test_interval as u32);
+    let scheduler = scheduler::Scheduler::new(Arc::clone(&db), args.test_mode || args.quick_test, args.test_interval as u32);
 
     // Load servers based on mode
     if args.test_mode || args.quick_test {
@@ -190,6 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_state = api::AppState {
         db: Arc::clone(&db),
         scheduler: Arc::clone(&scheduler),
+        exclude_list: Arc::clone(&exclude_manager),
         api_key: args.api_key.clone(),
     };
     let api_handle = tokio::spawn(async move {

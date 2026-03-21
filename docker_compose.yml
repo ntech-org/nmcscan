@@ -11,7 +11,7 @@ services:
       - TEST_MODE=${TEST_MODE:-false}
     volumes:
       - ./data:/app/data
-      - ./exclude.conf:/app/exclude.conf:ro
+      - ./exclude.conf:/app/exclude.conf
     working_dir: /app
     command: ["/app/nmcscan", "--api-key", "${API_KEY}", "--log-level", "${RUST_LOG:-info}"]
 
