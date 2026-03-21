@@ -115,14 +115,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         Arc::clone(&db),
     );
-    let mut scheduler = scheduler::Scheduler::new(Arc::clone(&db));
+    let mut scheduler = scheduler::Scheduler::new(Arc::clone(&db), args.test_mode || args.quick_test, args.test_interval as u32);
 
     // Load servers based on mode
     if args.test_mode || args.quick_test {
         // Test mode: load known Minecraft servers
-        scheduler.test_mode = true;
-        scheduler.test_interval = args.test_interval;
-        
         let test_servers: Vec<(String, u16, String, String)> = if args.quick_test {
             test_mode::get_quick_test_servers()
         } else if let Some(ref regions) = args.test_regions {
@@ -157,12 +154,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Pre-populate Warm queue with hosting ASN ranges
         for (cidr, asn) in scheduler::HOSTING_ASN_RANGES {
-            scheduler
-                .add_asn_range_servers(cidr, asn)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::debug!("Failed to add servers from {} ({}): {}", cidr, asn, e);
-                });
+            let _ = scheduler
+                .add_shuffled_range(cidr, asn, 2)
+                .await;
         }
     }
 
@@ -265,8 +259,10 @@ async fn run_scanner_loop(
                         let _permit = permit;
                         let category = server.category.clone();
 
+                        let is_cold = matches!(category, asn::AsnCategory::Residential | asn::AsnCategory::Unknown);
+
                         let was_online = scanner
-                            .scan_server(&server.ip, server.port, server.hostname.as_deref())
+                            .scan_server(&server.ip, server.port, server.hostname.as_deref(), is_cold)
                             .await;
 
                         // Re-queue with updated priority

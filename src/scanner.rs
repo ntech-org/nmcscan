@@ -20,10 +20,14 @@ const MAX_CONCURRENCY: usize = 200;
 /// Connections per second limit.
 const RATE_LIMIT_PER_SEC: u64 = 100;
 
+/// Stricter rate limit for residential/unknown IPs to avoid abuse.
+const COLD_RATE_LIMIT_PER_SEC: u64 = 5;
+
 /// Scanner with rate limiting and concurrency control.
 pub struct Scanner {
     semaphore: Arc<Semaphore>,
     rate_limiter: Arc<RateLimiter>,
+    cold_rate_limiter: Arc<RateLimiter>,
     exclude_list: Arc<ExcludeList>,
     db: Arc<Database>,
 }
@@ -72,6 +76,7 @@ impl Scanner {
         Self {
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENCY)),
             rate_limiter: RateLimiter::new(RATE_LIMIT_PER_SEC),
+            cold_rate_limiter: RateLimiter::new(COLD_RATE_LIMIT_PER_SEC),
             exclude_list: Arc::new(exclude_list),
             db,
         }
@@ -82,7 +87,7 @@ impl Scanner {
     /// # Safety
     /// - Checks exclude list BEFORE any connection
     /// - If excluded, SKIP immediately (no log, no ping)
-    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>) -> bool {
+    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>, is_cold: bool) -> bool {
         // Parse IP
         let ip_addr: IpAddr = match ip.parse() {
             Ok(addr) => addr,
@@ -95,7 +100,10 @@ impl Scanner {
             return false;
         }
 
-        // Acquire rate limit token
+        // Apply tiered rate limiting
+        if is_cold {
+            self.cold_rate_limiter.acquire().await;
+        }
         self.rate_limiter.acquire().await;
 
         // Acquire concurrency permit
@@ -139,7 +147,7 @@ impl Scanner {
             .map(|(ip, port)| {
                 let scanner = Arc::clone(&this);
                 tokio::spawn(async move {
-                    let result = scanner.scan_server(&ip, port, None).await;
+                    let result = scanner.scan_server(&ip, port, None, false).await;
                     (ip, result)
                 })
             })
@@ -168,7 +176,7 @@ mod tests {
         let scanner = Scanner::new(exclude_list, db);
 
         // Should return false immediately without attempting connection
-        let result = scanner.scan_server("192.0.2.1", 25565, None).await;
+        let result = scanner.scan_server("192.0.2.1", 25565, None, false).await;
         assert!(!result);
     }
 }
