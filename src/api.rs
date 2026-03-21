@@ -2,14 +2,16 @@
 //!
 //! Endpoints:
 //! - GET /health - Health check with server count
-//! - GET /servers?limit=50&status=online - List servers
-//! - GET /server/{ip} - Server details
 //! - GET /stats - Scanner statistics (queues, ASN counts)
+//! - GET /servers - List servers with search and filtering
+//! - GET /server/{ip} - Server details
+//! - GET /server/{ip}/history - Historical player count
+//! - GET /players - Search for a player
 //! - GET /asns - List ASNs with server counts
 //! - GET /asns/{asn} - ASN details with IP ranges
-//! - GET /api/exclude - Current exclude list
-//! - POST /api/scan/test - Trigger test scan
-//! - GET / - Static HTML dashboard
+//! - GET /exclude - Current exclude list
+//! - POST /scan/test - Trigger test scan
+//! - GET / - Static dashboard (fallback to assets)
 
 use axum::{
     extract::{Path, Query, State, Request},
@@ -23,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeDir;
 
 use crate::db::{Database, Server};
 use crate::scheduler::Scheduler;
@@ -41,10 +44,30 @@ pub struct ServerQuery {
     #[serde(default = "default_limit")]
     pub limit: i32,
     pub status: Option<String>,
+    pub search: Option<String>,
 }
 
 fn default_limit() -> i32 {
     50
+}
+
+/// Query parameters for /players endpoint.
+#[derive(Deserialize)]
+pub struct PlayerQuery {
+    pub name: String,
+}
+
+#[derive(Serialize)]
+pub struct PlayerResponse {
+    pub ip: String,
+    pub player_name: String,
+    pub last_seen: chrono::NaiveDateTime,
+}
+
+#[derive(Serialize)]
+pub struct HistoryResponse {
+    pub timestamp: chrono::NaiveDateTime,
+    pub players_online: i32,
 }
 
 /// Test scan request.
@@ -74,14 +97,14 @@ pub struct TestServerInfo {
 }
 
 /// Health check response.
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 pub struct HealthResponse {
     pub status: String,
     pub total_servers: i64,
 }
 
 /// Scanner statistics.
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 pub struct StatsResponse {
     pub total_servers: i64,
     pub online_servers: i64,
@@ -92,7 +115,7 @@ pub struct StatsResponse {
 }
 
 /// ASN record for API response.
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 pub struct AsnResponse {
     pub asn: String,
     pub org: String,
@@ -102,7 +125,7 @@ pub struct AsnResponse {
 }
 
 /// Exclude list entry.
-#[derive(serde::Serialize)]
+#[derive(Serialize)]
 pub struct ExcludeEntry {
     pub network: String,
     pub comment: Option<String>,
@@ -139,6 +162,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/stats", get(get_stats))
         .route("/servers", get(list_servers))
         .route("/server/:ip", get(get_server))
+        .route("/server/:ip/history", get(get_server_history))
+        .route("/players", get(search_players))
         .route("/asns", get(list_asns))
         .route("/asns/:asn", get(get_asn))
         .route("/exclude", get(get_exclude_list))
@@ -147,8 +172,8 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health_check))
-        .merge(api_routes)
-        .route("/", get(dashboard))
+        .nest("/api", api_routes)
+        .fallback_service(ServeDir::new("assets").fallback(ServeDir::new("assets/index.html")))
         .layer(CompressionLayer::new())
         .layer(cors)
         .with_state(state)
@@ -163,7 +188,7 @@ async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-/// GET /stats - Get scanner statistics.
+/// GET /api/stats - Get scanner statistics.
 async fn get_stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let total_servers = state.db.get_server_count().await.unwrap_or(0);
     let online_servers = state.db.get_online_count().await.unwrap_or(0);
@@ -182,20 +207,20 @@ async fn get_stats(State(state): State<AppState>) -> Json<StatsResponse> {
     })
 }
 
-/// GET /servers - List servers with optional filters.
+/// GET /api/servers - List servers with optional filters.
 async fn list_servers(
     State(state): State<AppState>,
     Query(query): Query<ServerQuery>,
 ) -> Json<Vec<Server>> {
     let servers = state
         .db
-        .get_all_servers(query.status.as_deref(), query.limit)
+        .get_all_servers(query.status.as_deref(), query.search.as_deref(), query.limit)
         .await
         .unwrap_or_default();
     Json(servers)
 }
 
-/// GET /server/{ip} - Get server details.
+/// GET /api/server/{ip} - Get server details.
 async fn get_server(
     State(state): State<AppState>,
     Path(ip): Path<String>,
@@ -204,12 +229,54 @@ async fn get_server(
         .db
         .get_server(&ip)
         .await
-        .unwrap()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// GET /asns - List all ASNs.
+/// GET /api/server/{ip}/history - Get historical player count.
+async fn get_server_history(
+    State(state): State<AppState>,
+    Path(ip): Path<String>,
+) -> Json<Vec<HistoryResponse>> {
+    let history = state
+        .db
+        .get_server_history(&ip, 100)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(timestamp, players_online)| HistoryResponse {
+            timestamp,
+            players_online,
+        })
+        .collect();
+    Json(history)
+}
+
+/// GET /api/players - Search for a player.
+async fn search_players(
+    State(state): State<AppState>,
+    Query(query): Query<PlayerQuery>,
+) -> Json<Vec<PlayerResponse>> {
+    if query.name.len() < 3 {
+        return Json(vec![]);
+    }
+    let players = state
+        .db
+        .search_players(&query.name)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(ip, player_name, last_seen)| PlayerResponse {
+            ip,
+            player_name,
+            last_seen,
+        })
+        .collect();
+    Json(players)
+}
+
+/// GET /api/asns - List all ASNs.
 async fn list_asns(State(state): State<AppState>) -> Json<Vec<AsnResponse>> {
     let asns = state.db.get_all_asns().await.unwrap_or_default();
 
@@ -227,7 +294,7 @@ async fn list_asns(State(state): State<AppState>) -> Json<Vec<AsnResponse>> {
     Json(responses)
 }
 
-/// GET /asns/{asn} - Get ASN details.
+/// GET /api/asns/{asn} - Get ASN details.
 async fn get_asn(
     State(state): State<AppState>,
     Path(asn): Path<String>,
@@ -255,9 +322,8 @@ async fn get_asn(
     }))
 }
 
-/// GET /exclude - Get current exclude list.
+/// GET /api/exclude - Get current exclude list.
 async fn get_exclude_list() -> Json<Vec<ExcludeEntry>> {
-    // Read exclude.conf and parse entries
     let content = std::fs::read_to_string("exclude.conf").unwrap_or_default();
     let entries: Vec<ExcludeEntry> = content
         .lines()
@@ -267,7 +333,6 @@ async fn get_exclude_list() -> Json<Vec<ExcludeEntry>> {
                 return None;
             }
 
-            // Extract comment if present
             let (network, comment) = if let Some(idx) = line.find('#') {
                 (line[..idx].trim(), Some(line[idx + 1..].trim()))
             } else {
@@ -288,12 +353,7 @@ async fn get_exclude_list() -> Json<Vec<ExcludeEntry>> {
     Json(entries)
 }
 
-/// GET / - Static HTML dashboard.
-async fn dashboard() -> Html<&'static str> {
-    Html(include_str!("../assets/index.html"))
-}
-
-/// POST /scan/test - Trigger a test scan with known servers.
+/// POST /api/scan/test - Trigger a test scan with known servers.
 async fn trigger_test_scan(
     State(state): State<AppState>,
     Json(payload): Json<TestScanRequest>,
@@ -319,28 +379,24 @@ async fn trigger_test_scan(
         servers
     };
 
-    // Add servers to scheduler
     for (ip, port, _name, host) in &test_servers {
         let mut target = crate::scheduler::ServerTarget::new(ip.clone(), *port);
         target.category = AsnCategory::Hosting;
-        target.priority = 1; // Hot priority
+        target.priority = 1;
         target.hostname = Some(host.clone());
         
         let _ = state.db.insert_server_if_new(ip, *port as i32).await;
-        
         state.scheduler.add_server(target).await;
     }
 
     let servers_info: Vec<TestServerInfo> = test_servers
-        .iter()
+        .into_iter()
         .map(|(ip, port, name, _host)| TestServerInfo {
-            ip: ip.clone(),
-            port: *port,
-            name: name.clone(),
+            ip,
+            port,
+            name,
         })
         .collect();
-
-    tracing::info!("Test scan triggered: {} servers added", servers_info.len());
 
     Json(TestScanResponse {
         status: "ok".to_string(),

@@ -323,7 +323,7 @@ impl Scheduler {
 
     /// Load servers from database and populate queues.
     pub async fn load_from_database(&self) -> Result<(), crate::db::DatabaseError> {
-        let servers = self.db.get_all_servers(None, 10000).await?;
+        let servers = self.db.get_all_servers(None, None, 10000).await?;
 
         for server in servers {
             let mut target = ServerTarget::new(server.ip, server.port as u16);

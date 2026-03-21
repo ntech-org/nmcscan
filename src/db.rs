@@ -112,6 +112,36 @@ impl Database {
         .execute(pool)
         .await?;
 
+        // Player tracking
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS server_players (
+                ip TEXT,
+                player_name TEXT,
+                player_uuid TEXT,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (ip, player_name),
+                FOREIGN KEY (ip) REFERENCES servers(ip)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        // Historical player count
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS server_history (
+                ip TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                players_online INTEGER,
+                FOREIGN KEY (ip) REFERENCES servers(ip)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
         // ASN tables for dynamic provider detection
         sqlx::query(
             r#"
@@ -153,6 +183,12 @@ impl Database {
             .execute(pool)
             .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_asn_ranges_asn ON asn_ranges(asn)")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_player_name ON server_players(player_name)")
+            .execute(pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_server_history_ip ON server_history(ip)")
             .execute(pool)
             .await?;
 
@@ -238,26 +274,56 @@ impl Database {
         Ok(servers)
     }
 
-    /// Get all servers with optional status filter.
+    /// Get all servers with optional status filter and search query.
     pub async fn get_all_servers(
         &self,
         status_filter: Option<&str>,
+        search_query: Option<&str>,
         limit: i32,
     ) -> Result<Vec<Server>, DatabaseError> {
-        let query = match status_filter {
-            Some(status) => format!(
-                "SELECT * FROM servers WHERE status = '{}' ORDER BY players_online DESC LIMIT {}",
-                status, limit
-            ),
-            None => format!(
-                "SELECT * FROM servers ORDER BY players_online DESC LIMIT {}",
-                limit
-            ),
-        };
+        let mut query = String::from("SELECT * FROM servers WHERE 1=1");
+        
+        if let Some(status) = status_filter {
+            query.push_str(&format!(" AND status = '{}'", status));
+        }
+
+        if let Some(search) = search_query {
+            // Very simple SQL injection protection for the LIKE clause by replacing '
+            let safe_search = search.replace("'", "''");
+            query.push_str(&format!(" AND (ip LIKE '%{}%' OR motd LIKE '%{}%' OR version LIKE '%{}%')", safe_search, safe_search, safe_search));
+        }
+
+        query.push_str(&format!(" ORDER BY players_online DESC LIMIT {}", limit));
+
         let servers = sqlx::query_as::<_, Server>(&query)
             .fetch_all(&self.pool)
             .await?;
         Ok(servers)
+    }
+
+    /// Get player count history for a server
+    pub async fn get_server_history(&self, ip: &str, limit: i32) -> Result<Vec<(NaiveDateTime, i32)>, DatabaseError> {
+        let rows = sqlx::query_as::<_, (NaiveDateTime, i32)>(
+            "SELECT timestamp, players_online FROM server_history WHERE ip = ? ORDER BY timestamp DESC LIMIT ?"
+        )
+        .bind(ip)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Search for a player by name
+    pub async fn search_players(&self, name: &str) -> Result<Vec<(String, String, NaiveDateTime)>, DatabaseError> {
+        let safe_name = name.replace("'", "''");
+        let query = format!(
+            "SELECT ip, player_name, last_seen FROM server_players WHERE player_name LIKE '%{}%' COLLATE NOCASE ORDER BY last_seen DESC LIMIT 50",
+            safe_name
+        );
+        let rows = sqlx::query_as::<_, (String, String, NaiveDateTime)>(&query)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
     }
 
     /// Get server count.
@@ -296,7 +362,10 @@ impl Database {
         players_max: i32,
         motd: Option<String>,
         version: Option<String>,
+        players_sample: Option<Vec<crate::slp::PlayerSample>>,
     ) -> Result<(), DatabaseError> {
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
             r#"
             UPDATE servers SET
@@ -316,8 +385,44 @@ impl Database {
         .bind(&motd)
         .bind(&version)
         .bind(ip)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        // Insert into history
+        sqlx::query(
+            "INSERT INTO server_history (ip, players_online) VALUES (?, ?)"
+        )
+        .bind(ip)
+        .bind(players_online)
+        .execute(&mut *tx)
+        .await?;
+
+        // Update players
+        if let Some(sample) = players_sample {
+            for player in sample {
+                // Ensure player name is valid/non-empty
+                let name = player.name.trim();
+                if !name.is_empty() {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO server_players (ip, player_name, player_uuid, last_seen)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(ip, player_name) DO UPDATE SET
+                            player_uuid = excluded.player_uuid,
+                            last_seen = CURRENT_TIMESTAMP
+                        "#
+                    )
+                    .bind(ip)
+                    .bind(name)
+                    .bind(&player.id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+
+        tx.commit().await?;
+
         Ok(())
     }
 

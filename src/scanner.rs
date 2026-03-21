@@ -111,10 +111,11 @@ impl Scanner {
                 // Server is online
                 let players_online = status.players.as_ref().map(|p| p.online).unwrap_or(0);
                 let players_max = status.players.as_ref().map(|p| p.max).unwrap_or(0);
+                let players_sample = status.players.as_ref().and_then(|p| p.sample.clone());
                 let motd = Some(crate::slp::extract_motd(&status));
                 let version = status.version.as_ref().map(|v| v.name.clone());
 
-                if let Err(e) = self.db.mark_online(ip, players_online, players_max, motd, version).await {
+                if let Err(e) = self.db.mark_online(ip, players_online, players_max, motd, version, players_sample).await {
                     tracing::error!("Failed to update DB for {}: {}", ip, e);
                 }
                 tracing::info!("Server {}:{} is online ({} players)", ip, port, players_online);
