@@ -72,6 +72,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env file
+    let _ = dotenvy::dotenv();
+    
     let args = Args::parse();
 
     // Initialize tracing
