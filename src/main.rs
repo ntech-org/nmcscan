@@ -60,6 +60,14 @@ struct Args {
     /// API key for dashboard authentication (optional, disables auth if empty)
     #[arg(long, env = "API_KEY")]
     api_key: Option<String>,
+
+    /// Contact email for public landing page
+    #[arg(long, env = "CONTACT_EMAIL")]
+    contact_email: Option<String>,
+
+    /// Discord link for public landing page
+    #[arg(long, env = "DISCORD_LINK")]
+    discord_link: Option<String>,
 }
 
 #[tokio::main]
@@ -192,6 +200,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scheduler: Arc::clone(&scheduler),
         exclude_list: Arc::clone(&exclude_manager),
         api_key: args.api_key.clone(),
+        contact_email: args.contact_email.clone(),
+        discord_link: args.discord_link.clone(),
     };
     let api_handle = tokio::spawn(async move {
         api::run_server(api_state, "0.0.0.0:3000").await.unwrap();

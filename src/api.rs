@@ -2,16 +2,17 @@
 //!
 //! Endpoints:
 //! - GET /health - Health check with server count
-//! - GET /stats - Scanner statistics (queues, ASN counts)
-//! - GET /servers - List servers with search and filtering
-//! - GET /server/{ip} - Server details
-//! - GET /server/{ip}/history - Historical player count
-//! - GET /players - Search for a player
-//! - GET /asns - List ASNs with server counts
-//! - GET /asns/{asn} - ASN details with IP ranges
-//! - GET /exclude - Current exclude list
-//! - POST /exclude - Add new exclusion
-//! - POST /scan/test - Trigger test scan
+//! - GET /info - Contact information for public landing page
+//! - GET /api/stats - Scanner statistics (queues, ASN counts)
+//! - GET /api/servers - List servers with search and filtering
+//! - GET /api/server/{ip} - Server details
+//! - GET /api/server/{ip}/history - Historical player count
+//! - GET /api/players - Search for a player
+//! - GET /api/asns - List ASNs with server counts
+//! - GET /api/asns/{asn} - ASN details with IP ranges
+//! - GET /api/exclude - Current exclude list
+//! - POST /api/exclude - Add new exclusion
+//! - POST /api/scan/test - Trigger test scan
 //! - GET / - Static dashboard (fallback to assets)
 
 use axum::{
@@ -39,6 +40,14 @@ pub struct AppState {
     pub scheduler: Arc<Scheduler>,
     pub exclude_list: Arc<ExcludeManager>,
     pub api_key: Option<String>,
+    pub contact_email: Option<String>,
+    pub discord_link: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ContactResponse {
+    pub email: Option<String>,
+    pub discord: Option<String>,
 }
 
 /// Query parameters for /servers endpoint.
@@ -181,6 +190,7 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health_check))
+        .route("/info", get(get_info))
         .nest("/api", api_routes)
         .fallback_service(ServeDir::new("assets").fallback(ServeDir::new("assets/index.html")))
         .layer(CompressionLayer::new())
@@ -194,6 +204,14 @@ async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
         total_servers,
+    })
+}
+
+/// GET /info - Get contact information for the public landing page.
+async fn get_info(State(state): State<AppState>) -> Json<ContactResponse> {
+    Json(ContactResponse {
+        email: state.contact_email.clone(),
+        discord: state.discord_link.clone(),
     })
 }
 
