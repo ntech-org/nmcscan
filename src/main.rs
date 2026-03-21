@@ -244,6 +244,7 @@ async fn run_scanner_loop(
             _ = fill_interval.tick() => {
                 if !scheduler.test_mode {
                     scheduler.fill_warm_queue_if_needed().await;
+                    scheduler.fill_cold_queue_if_needed().await;
                 }
             }
             server_opt = scheduler.next_server() => {

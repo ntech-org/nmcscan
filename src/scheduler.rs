@@ -201,37 +201,33 @@ impl Scheduler {
         queue.lock().await.push_back(server);
     }
 
-    /// Get the next server to scan (priority order: Hot > Warm > Cold).
-    /// This now skips servers that are not yet ready for their next scan.
+    /// Get the next server to scan using weighted random selection to prevent tier starvation.
+    /// Priority: Hot (70% weight), Warm (20% weight), Cold (10% weight)
+    /// If a tier is empty or not ready, its weight is distributed to the others.
     pub async fn next_server(&self) -> Option<ServerTarget> {
         let now = Utc::now();
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let roll = rng.gen_range(0..100);
 
-        // Try Hot queue first
-        {
-            let mut q = self.hot_queue.lock().await;
-            for i in 0..q.len() {
-                if q[i].next_scan_at.map_or(true, |t| t <= now) {
-                    return q.remove(i);
-                }
-                // Only check first few to avoid O(N) in hot loop
-                if i >= 10 { break; }
-            }
-        }
+        // Define search order based on weight roll
+        // This ensures Cold and Warm get scanned even if Hot is full
+        let tiers = if roll < 70 {
+            vec![1, 2, 3] // Prefer Hot
+        } else if roll < 90 {
+            vec![2, 1, 3] // Prefer Warm
+        } else {
+            vec![3, 1, 2] // Prefer Cold
+        };
 
-        // Then Warm queue
-        {
-            let mut q = self.warm_queue.lock().await;
-            for i in 0..q.len() {
-                if q[i].next_scan_at.map_or(true, |t| t <= now) {
-                    return q.remove(i);
-                }
-                if i >= 10 { break; }
-            }
-        }
+        for tier in tiers {
+            let queue = match tier {
+                1 => &self.hot_queue,
+                2 => &self.warm_queue,
+                _ => &self.cold_queue,
+            };
 
-        // Finally Cold queue
-        {
-            let mut q = self.cold_queue.lock().await;
+            let mut q = queue.lock().await;
             for i in 0..q.len() {
                 if q[i].next_scan_at.map_or(true, |t| t <= now) {
                     return q.remove(i);
@@ -246,24 +242,82 @@ impl Scheduler {
     /// Dynamic range filling: adds new servers from hosting ASNs if Warm queue is low.
     pub async fn fill_warm_queue_if_needed(&self) {
         let warm_len = self.warm_queue.lock().await.len();
-        if warm_len > 500 {
-            return; // Already has enough work
+        if warm_len > 1000 {
+            return;
         }
 
         if let Some(asn) = self.select_next_asn_for_warm_scan().await {
-            tracing::info!("Dynamic filling: Selecting ASN {} for discovery", asn);
-            
-            // Find CIDRs for this ASN
+            tracing::info!("Dynamic filling: Selecting Hosting ASN {} for discovery", asn);
             let ranges = self.db.get_all_asn_ranges().await.unwrap_or_default();
             let asn_ranges: Vec<_> = ranges.into_iter().filter(|r| r.asn == asn).collect();
             
             if let Some(range) = asn_ranges.first() {
-                if let Err(e) = self.add_asn_range_servers(&range.cidr, &asn).await {
-                    tracing::warn!("Failed to add servers from range {}: {}", range.cidr, e);
-                }
+                self.add_range_to_queue(&range.cidr, &asn, 2).await; // 2 = Warm
                 self.record_asn_scan(&asn).await;
             }
         }
+    }
+
+    /// Dynamic range filling for Cold queue (Residential IPs).
+    pub async fn fill_cold_queue_if_needed(&self) {
+        let cold_len = self.cold_queue.lock().await.len();
+        if cold_len > 500 {
+            return;
+        }
+
+        // Find a residential ASN
+        let asns = self.db.get_asns_by_category("residential").await.unwrap_or_default();
+        if let Some(asn_record) = asns.first() {
+            tracing::info!("Dynamic filling: Selecting Residential ASN {} for slow discovery", asn_record.asn);
+            let ranges = self.db.get_all_asn_ranges().await.unwrap_or_default();
+            let asn_ranges: Vec<_> = ranges.into_iter().filter(|r| r.asn == asn_record.asn).collect();
+            
+            if let Some(range) = asn_ranges.first() {
+                // Scan residential ranges much more slowly/sparsely
+                self.add_range_to_queue(&range.cidr, &asn_record.asn, 3).await; // 3 = Cold
+                self.record_asn_scan(&asn_record.asn).await;
+            }
+        }
+    }
+
+    async fn add_range_to_queue(&self, cidr: &str, asn: &str, priority: i32) {
+        if let Err(e) = self.add_asn_range_servers_weighted(cidr, asn, priority).await {
+            tracing::warn!("Failed to add servers from range {}: {}", cidr, e);
+        }
+    }
+
+    async fn add_asn_range_servers_weighted(
+        &self,
+        cidr: &str,
+        asn: &str,
+        priority: i32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use ipnetwork::Ipv4Network;
+        let network: Ipv4Network = cidr.parse()?;
+        
+        // Samples per range: Hosting (50), Residential (10)
+        let max_samples = if priority == 2 { 50 } else { 10 };
+        let mut count = 0;
+
+        let sample_size = std::cmp::min(network.size() as u32, 100);
+        let step = std::cmp::max(1, network.size() as u32 / sample_size);
+
+        for (i, ip) in network.iter().enumerate() {
+            if i % step as usize != 0 { continue; }
+            if i == 0 || i == network.size() as usize - 1 { continue; }
+
+            let ip_str = ip.to_string();
+            let mut target = ServerTarget::new(ip_str.clone(), 25565);
+            target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
+            target.priority = priority;
+
+            let _ = self.db.insert_server_if_new(&ip_str, 25565).await;
+            self.add_server(target).await;
+            count += 1;
+
+            if count >= max_samples { break; }
+        }
+        Ok(())
     }
 
     /// Re-queue a server after scanning with updated status.
