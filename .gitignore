@@ -1,0 +1,22 @@
+# Rust
+/target
+Cargo.lock
+
+# Database
+nmcscan.db
+nmcscan.db-shm
+nmcscan.db-wal
+
+# Dashboard
+dashboard/node_modules
+dashboard/build
+dashboard/.svelte-kit
+dashboard/package-lock.json
+dashboard/bun.lockb
+
+# Logs & Temp
+*.log
+.env
+
+# OS
+.DS_Store

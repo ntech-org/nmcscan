@@ -1,0 +1,19 @@
+services:
+  nmcscan:
+    build: .
+    container_name: nmcscan
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - RUST_LOG=info
+      - API_KEY=${API_KEY:-changeme}
+      - TEST_MODE=false
+    volumes:
+      - ./data:/app/data
+      - ./exclude.conf:/app/exclude.conf:ro
+    working_dir: /app
+    command: ["/app/nmcscan", "--api-key", "${API_KEY:-changeme}"]
+
+volumes:
+  data:

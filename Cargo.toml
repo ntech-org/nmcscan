@@ -1,0 +1,47 @@
+[package]
+name = "nmcscan"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance Minecraft Server Scanner with priority-based scanning"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
+
+# Web server
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["compression-gzip", "cors", "fs"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Networking
+tokio-util = "0.7"
+
+# IP parsing
+ipnetwork = "0.20"
+
+# HTTP client for ASN API
+reqwest = { version = "0.11", features = ["json"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
