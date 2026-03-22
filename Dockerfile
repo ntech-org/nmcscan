@@ -7,10 +7,21 @@ COPY dashboard/ .
 RUN bun run build
 
 # Build stage
-FROM rust:slim as builder
+FROM rust:1.80-slim as builder
 WORKDIR /usr/src/nmcscan
-RUN apt-get update && apt-get install -y pkg-config libssl-dev sqlite3 &> /dev/null
+
+# Install dependencies for building (OpenSSL, SQLite, and build tools)
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    sqlite3 \
+    gcc \
+    perl \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY Cargo.toml Cargo.lock ./
+
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
 COPY src ./src
