@@ -87,8 +87,9 @@ impl Scanner {
         rps: u64,
     ) -> Self {
         let cold_rps = (rps / 10).max(1);
+        let concurrency = (rps * 10) as usize; // Allow more concurrency to absorb latencies
         Self {
-            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENCY)),
+            semaphore: Arc::new(Semaphore::new(concurrency)),
             rate_limiter: RateLimiter::new(rps),
             cold_rate_limiter: RateLimiter::new(cold_rps),
             exclude_list,
@@ -102,7 +103,7 @@ impl Scanner {
     /// # Safety
     /// - Checks exclude list BEFORE any connection
     /// - If excluded, SKIP immediately (no log, no ping)
-    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>, is_discovery: bool, server_type: &str) -> (bool, bool) {
+    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>, priority: i32, is_discovery: bool, server_type: &str) -> (bool, bool) {
         // Parse IP
         let ip_addr: IpAddr = match ip.parse() {
             Ok(addr) => addr,
@@ -116,10 +117,12 @@ impl Scanner {
         }
 
         // Apply tiered rate limiting
-        if is_discovery {
+        // Priority 3 (Cold) is limited to 10 RPS, others (Hot/Warm) get full speed
+        if priority >= 3 {
             self.cold_rate_limiter.acquire().await;
+        } else {
+            self.rate_limiter.acquire().await;
         }
-        self.rate_limiter.acquire().await;
 
         // Acquire concurrency permit
         let _permit = match self.semaphore.acquire().await {
@@ -196,7 +199,7 @@ impl Scanner {
             .map(|(ip, port)| {
                 let scanner = Arc::clone(&this);
                 tokio::spawn(async move {
-                    let (online, _is_new) = scanner.scan_server(&ip, port, None, false, "java").await;
+                    let (online, _is_new) = scanner.scan_server(&ip, port, None, 2, false, "java").await;
                     (ip, online)
                 })
             })

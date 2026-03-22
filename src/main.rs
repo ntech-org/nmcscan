@@ -290,6 +290,13 @@ async fn run_scanner_loop(
             }
             server_opt = scheduler.next_server() => {
                 if let Some(server) = server_opt {
+                    // BACKPRESSURE: If we have too many active tasks, wait before spawning more.
+                    // This is critical to prevent the task queue from ballooning while tasks
+                    // are waiting for the rate limiter.
+                    while active_tasks.load(Ordering::Relaxed) >= 1000 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
+
                     let scanner = Arc::clone(&scanner);
                     let scheduler = Arc::clone(&scheduler);
                     let hot_count = Arc::clone(&hot_count);
@@ -307,14 +314,13 @@ async fn run_scanner_loop(
                     active_tasks.fetch_add(1, Ordering::SeqCst);
                     
                     tokio::spawn(async move {
-                        let category = server.category.clone();
                         let priority = server.priority;
                         
                         // Check if it's a brand new discovery target (never scanned)
                         let is_discovery = server.last_scanned.is_none();
 
                         let (was_online, is_new) = scanner
-                            .scan_server(&server.ip, server.port, server.hostname.as_deref(), is_discovery, &server.server_type)
+                            .scan_server(&server.ip, server.port, server.hostname.as_deref(), priority, is_discovery, &server.server_type)
                             .await;
 
                         // Re-queue with updated priority
@@ -341,13 +347,6 @@ async fn run_scanner_loop(
                         
                         active_tasks_inner.fetch_sub(1, Ordering::SeqCst);
                     });
-
-                    // BACKPRESSURE: If we have too many active tasks, wait a bit before picking more
-                    // This keeps the scheduler queues representative and avoids massive task backlogs
-                    // that would just wait at the rate limiter anyway.
-                    if active_tasks.load(Ordering::Relaxed) >= 1000 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
                 } else {
                     // No servers ready, sleep a bit to avoid CPU spin
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
