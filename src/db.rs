@@ -58,13 +58,20 @@ impl Database {
     /// Create a new database connection with WAL mode enabled.
     pub async fn new(db_path: &str) -> Result<Self, DatabaseError> {
         // Ensure proper SQLite URL format
-        let url = if db_path.starts_with("sqlite:") || db_path.starts_with("file:") {
+        let mut url = if db_path.starts_with("sqlite:") || db_path.starts_with("file:") {
             db_path.to_string()
         } else if db_path == ":memory:" {
             "sqlite::memory:".to_string()
         } else {
             format!("sqlite:{}", db_path)
         };
+
+        // Ensure the file is created if it doesn't exist
+        if !url.contains('?') {
+            url.push_str("?mode=rwc");
+        } else if !url.contains("mode=rwc") {
+            url.push_str("&mode=rwc");
+        }
         
         let pool = SqlitePoolOptions::new()
             .max_connections(10)
