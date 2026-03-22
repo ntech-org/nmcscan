@@ -7,7 +7,7 @@ COPY dashboard/ .
 RUN bun run build
 
 # Build stage
-FROM rust:slim as builder
+FROM rust:slim-bookworm as builder
 WORKDIR /usr/src/nmcscan
 
 # Install dependencies for building (OpenSSL, SQLite, and build tools)
