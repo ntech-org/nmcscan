@@ -15,13 +15,13 @@ use tokio::time::{self, Duration};
 use tracing;
 
 /// Maximum concurrent scan tasks.
-const MAX_CONCURRENCY: usize = 200;
+const MAX_CONCURRENCY: usize = 1000;
 
 /// Connections per second limit.
 const RATE_LIMIT_PER_SEC: u64 = 100;
 
 /// Stricter rate limit for residential/unknown IPs to avoid abuse.
-const COLD_RATE_LIMIT_PER_SEC: u64 = 5;
+const COLD_RATE_LIMIT_PER_SEC: u64 = 10;
 
 /// Scanner with rate limiting and concurrency control.
 pub struct Scanner {
@@ -77,11 +77,12 @@ impl RateLimiter {
 }
 
 impl Scanner {
-    pub fn new(exclude_list: Arc<ExcludeManager>, db: Arc<Database>) -> Self {
+    pub fn new(exclude_list: Arc<ExcludeManager>, db: Arc<Database>, rps: u64) -> Self {
+        let cold_rps = (rps / 10).max(1);
         Self {
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENCY)),
-            rate_limiter: RateLimiter::new(RATE_LIMIT_PER_SEC),
-            cold_rate_limiter: RateLimiter::new(COLD_RATE_LIMIT_PER_SEC),
+            rate_limiter: RateLimiter::new(rps),
+            cold_rate_limiter: RateLimiter::new(cold_rps),
             exclude_list,
             db,
         }

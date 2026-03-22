@@ -11,6 +11,7 @@ services:
       - TEST_MODE=${TEST_MODE:-false}
       - CONTACT_EMAIL=${CONTACT_EMAIL}
       - DISCORD_LINK=${DISCORD_LINK}
+      - TARGET_RPS=${TARGET_RPS:-100}
     volumes:
       - ./data:/app/data
       - ./exclude.conf:/app/exclude.conf

@@ -76,6 +76,10 @@ struct Args {
     /// Path to exclude.conf file
     #[arg(short, long, env = "EXCLUDE_FILE", default_value = "exclude.conf")]
     exclude_file: String,
+
+    /// Target scans per second (Connections Per Second)
+    #[arg(long, env = "TARGET_RPS", default_value = "100")]
+    target_rps: u64,
 }
 
 #[tokio::main]
@@ -133,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scanner = scanner::Scanner::new(
         Arc::clone(&exclude_manager),
         Arc::clone(&db),
+        args.target_rps,
     );
     let scheduler = scheduler::Scheduler::new(Arc::clone(&db), args.test_mode || args.quick_test, args.test_interval as u32);
 
@@ -161,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             let _ = db.insert_server_if_new(ip, *port as i32).await;
             
-            scheduler.add_server(target).await;
+            scheduler.add_server(target, false).await;
             tracing::debug!("  Added test server: {} ({}:{} as {})", name, ip, port, host);
         }
         tracing::info!("✅ Loaded {} test servers", test_servers.len());
@@ -235,11 +240,8 @@ async fn run_scanner_loop(
     let warm_count = Arc::new(AtomicU32::new(0));
     let cold_count = Arc::new(AtomicU32::new(0));
     
-    // Concurrency limit for task spawning to avoid memory pressure
-    let spawn_semaphore = Arc::new(tokio::sync::Semaphore::new(1000));
-
     let mut status_interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-    let mut fill_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+    let mut fill_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
 
     loop {
         tokio::select! {
@@ -265,14 +267,7 @@ async fn run_scanner_loop(
                     let warm_count = Arc::clone(&warm_count);
                     let cold_count = Arc::clone(&cold_count);
                     
-                    // Wait for a spawn slot
-                    let permit = match spawn_semaphore.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => break, // Should not happen
-                    };
-
                     tokio::spawn(async move {
-                        let _permit = permit;
                         let category = server.category.clone();
                         let priority = server.priority;
 

@@ -430,7 +430,7 @@ async fn trigger_test_scan(
         target.hostname = Some(host.clone());
         
         let _ = state.db.insert_server_if_new(ip, *port as i32).await;
-        state.scheduler.add_server(target).await;
+        state.scheduler.add_server(target, true).await;
     }
 
     let servers_info: Vec<TestServerInfo> = test_servers
