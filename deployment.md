@@ -1,46 +1,83 @@
 # NMCScan Deployment Guide
 
-NMCScan is designed to be deployed on a VPS using Docker.
+NMCScan consists of a Rust backend (API) and a SvelteKit frontend (Dashboard). They are decoupled for maximum performance and reliability.
 
-## Prerequisites
-- Docker and Docker Compose installed on your VPS.
-- An `exclude.conf` file in the same directory as `docker-compose.yml`.
+## 🏗️ Architecture
+- **Backend**: Rust binary running in Docker. Port 3000.
+- **Frontend**: Statically generated SvelteKit app. Served by Caddy on the host.
 
-## Deployment Steps
+## 🚀 Deployment Steps
 
-1. **Clone the repository** (or copy the files to your VPS).
-2. **Create a `.env` file** (optional but recommended):
+### 1. Backend (Docker)
+1. Prepare your environment:
    ```bash
-   API_KEY=your_secure_random_key_here
-   RUST_LOG=info
-   ```
-3. **Set up directories**:
-   ```bash
+   # Create data directory
    mkdir -p data
-   touch exclude.conf # Ensure it has content or copy from repo
+   # Ensure exclude.conf exists
+   touch exclude.conf
    ```
-4. **Build and start**:
+2. Update `compose.yaml` or `.env` with your `API_KEY`.
+3. Start the backend:
    ```bash
    docker compose up -d --build
    ```
 
-## Security & Authentication
+### 2. Frontend (Static Build)
+1. Go to the dashboard directory:
+   ```bash
+   cd dashboard
+   ```
+2. Build the static site (ensure you have Node/Bun installed):
+   ```bash
+   # Set the API URL for the frontend
+   export PUBLIC_API_URL="https://your-domain.com"
+   bun install
+   bun run build
+   ```
+   This will generate a `build/` directory with all static files.
 
-All API endpoints (except `/health` and the dashboard root `/`) are protected by the `X-API-Key` header.
+### 3. Caddy Configuration
+Serve the static files and proxy the API using Caddy on your host machine.
 
-### Accessing the API via CLI
-```bash
-curl -H "X-API-Key: your_secure_random_key_here" http://your-vps-ip:3000/stats
+Example `Caddyfile`:
+```caddy
+your-domain.com {
+    # 1. Serve the frontend statically
+    root * /path/to/NMCScan/dashboard/build
+    file_server {
+        index index.html
+    }
+
+    # 2. Handle SvelteKit client-side routing
+    try_files {path} /index.html
+
+    # 3. Proxy API requests to the Rust backend
+    handle_path /api/* {
+        reverse_proxy localhost:3000
+    }
+    
+    # 4. Fallback for public info/health (if needed)
+    handle /info {
+        reverse_proxy localhost:3000
+    }
+    handle /health {
+        reverse_proxy localhost:3000
+    }
+
+    # Security headers
+    header {
+        # Enable CORS if frontend/backend are on different subdomains
+        Access-Control-Allow-Origin *
+        Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        Access-Control-Allow-Headers "Content-Type, X-API-Key"
+    }
+}
 ```
 
-### Accessing the Dashboard
-Since the dashboard is a pre-built static asset, you may need a browser extension to inject the `X-API-Key` header or use a reverse proxy (like Nginx) to handle authentication or header injection if the UI doesn't natively prompt for it.
+## 🔒 Security & Authentication
+The Dashboard will prompt you for your `API_KEY` on first visit and save it in `localStorage`.
+All API requests (except `/health` and `/info`) require the `X-API-Key` header.
 
-## Volumes & Persistence
-- `/app/data`: Contains `nmcscan.db`. This directory is mounted to `./data` on your host for persistence across container restarts.
-- `/app/exclude.conf`: Mounted as read-only. Update this file on the host to change excluded networks.
-
-## Monitoring Logs
-```bash
-docker compose logs -f
-```
+## 📂 Persistence
+- **Database**: Stored in `./data/nmcscan.db`.
+- **Exclusions**: Update `./exclude.conf` on the host. The scanner reloads this file automatically or via the dashboard API.
