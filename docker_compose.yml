@@ -1,0 +1,29 @@
+services:
+  nmcscan:
+    build: .
+    container_name: nmcscan
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - API_KEY=${API_KEY}
+      - TEST_MODE=${TEST_MODE:-false}
+      - CONTACT_EMAIL=${CONTACT_EMAIL}
+      - DISCORD_LINK=${DISCORD_LINK}
+    volumes:
+      - ./data:/app/data
+      - ./exclude.conf:/app/exclude.conf
+    working_dir: /app
+    command: [
+      "/app/nmcscan", 
+      "--api-key", "${API_KEY}", 
+      "--log-level", "${RUST_LOG:-info}",
+      "--contact-email", "${CONTACT_EMAIL}",
+      "--discord-link", "${DISCORD_LINK}",
+      "--database", "/app/data/nmcscan.db",
+      "--exclude-file", "/app/exclude.conf"
+    ]
+
+volumes:
+  data:

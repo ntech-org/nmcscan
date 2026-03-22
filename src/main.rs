@@ -68,6 +68,14 @@ struct Args {
     /// Discord link for public landing page
     #[arg(long, env = "DISCORD_LINK")]
     discord_link: Option<String>,
+
+    /// Path to SQLite database file
+    #[arg(short, long, env = "DATABASE_URL", default_value = "data/nmcscan.db")]
+    database: String,
+
+    /// Path to exclude.conf file
+    #[arg(short, long, env = "EXCLUDE_FILE", default_value = "exclude.conf")]
+    exclude_file: String,
 }
 
 #[tokio::main]
@@ -95,18 +103,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 1. Load exclude list
-    tracing::info!("Loading exclude list...");
-    let exclude_list = exclude::ExcludeList::from_file("exclude.conf")
+    tracing::info!("Loading exclude list from {}...", args.exclude_file);
+    let exclude_list = exclude::ExcludeList::from_file(&args.exclude_file)
         .unwrap_or_else(|e| {
-            tracing::warn!("Could not load exclude.conf: {}", e);
+            tracing::warn!("Could not load {}: {}", args.exclude_file, e);
             tracing::warn!("Using empty exclude list - BE CAREFUL!");
             exclude::ExcludeList::from_str("").unwrap()
         });
     tracing::info!("Loaded {} exclude networks", exclude_list.len());
 
     // 2. Initialize database
-    tracing::info!("Initializing database...");
-    let db = db::Database::new("nmcscan.db").await?;
+    tracing::info!("Initializing database at {}...", args.database);
+    let db = db::Database::new(&args.database).await?;
     let db = Arc::new(db);
 
     // 3. Initialize ASN fetcher
@@ -120,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 4. Create scanner and scheduler
-    let exclude_manager = Arc::new(exclude::ExcludeManager::new("exclude.conf"));
+    let exclude_manager = Arc::new(exclude::ExcludeManager::new(&args.exclude_file));
     
     let scanner = scanner::Scanner::new(
         Arc::clone(&exclude_manager),
