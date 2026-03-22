@@ -51,16 +51,8 @@ your-domain.com {
     # 2. Handle SvelteKit client-side routing
     try_files {path} /index.html
 
-    # 3. Proxy API requests to the Rust backend
-    handle_path /api/* {
-        reverse_proxy localhost:3000
-    }
-    
-    # 4. Fallback for public info/health (if needed)
-    handle /info {
-        reverse_proxy localhost:3000
-    }
-    handle /health {
+    # 3. Proxy all API requests to the Rust backend
+    handle /api/* {
         reverse_proxy localhost:3000
     }
 

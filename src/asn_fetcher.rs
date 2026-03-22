@@ -135,14 +135,15 @@ impl AsnFetcher {
             return Err(AsnError::AsnNotFound);
         }
 
-        // Check cache first
-        if let Some(cached) = self.db.get_asn_for_ip(ip).await.unwrap_or(None) {
-            // Check if cache is still valid (7 days)
-            if let Some(last_updated) = cached.last_updated {
-                if Utc::now().signed_duration_since(last_updated) < Duration::days(7) {
-                    let mut manager = self.asn_manager.write().await;
-                    manager.add_asn(cached.clone());
-                    return Ok(cached);
+        // Check in-memory manager (which includes DB cache)
+        if let Ok(ip_addr) = ip.parse::<std::net::Ipv4Addr>() {
+            let manager = self.asn_manager.read().await;
+            if let Some(cached) = manager.get_asn_for_ip(ip_addr) {
+                // Check if cache is still valid (7 days)
+                if let Some(last_updated) = cached.last_updated {
+                    if Utc::now().signed_duration_since(last_updated) < Duration::days(7) {
+                        return Ok(cached.clone());
+                    }
                 }
             }
         }

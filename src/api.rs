@@ -175,7 +175,7 @@ pub fn create_router(state: AppState) -> Router {
         .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::HeaderName::from_static("x-api-key")]);
 
     // Protected API routes
-    let api_routes = Router::new()
+    let protected_routes = Router::new()
         .route("/stats", get(get_stats))
         .route("/servers", get(list_servers))
         .route("/server/{ip}", get(get_server))
@@ -187,9 +187,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/scan/test", post(trigger_test_scan))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
-    Router::new()
+    // Combine all API routes under /api
+    let api_routes = Router::new()
         .route("/health", get(health_check))
         .route("/info", get(get_info))
+        .merge(protected_routes);
+
+    Router::new()
         .nest("/api", api_routes)
         .layer(CompressionLayer::new())
         .layer(cors)

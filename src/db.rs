@@ -403,27 +403,30 @@ impl Database {
         players_sample: Option<Vec<crate::slp::PlayerSample>>,
     ) -> Result<(), DatabaseError> {
         let mut tx = self.pool.begin().await?;
-        // ... rest of the logic
 
         sqlx::query(
             r#"
-            UPDATE servers SET
+            INSERT INTO servers (
+                ip, port, status, players_online, players_max, motd, version, 
+                priority, last_seen, consecutive_failures
+            )
+            VALUES (?, 25565, 'online', ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, 0)
+            ON CONFLICT(ip) DO UPDATE SET
                 status = 'online',
-                players_online = ?,
-                players_max = ?,
-                motd = ?,
-                version = ?,
+                players_online = excluded.players_online,
+                players_max = excluded.players_max,
+                motd = excluded.motd,
+                version = excluded.version,
                 priority = 1,
                 last_seen = CURRENT_TIMESTAMP,
                 consecutive_failures = 0
-            WHERE ip = ?
             "#,
         )
+        .bind(ip)
         .bind(players_online)
         .bind(players_max)
         .bind(&motd)
         .bind(&version)
-        .bind(ip)
         .execute(&mut *tx)
         .await?;
 
@@ -593,34 +596,6 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
         Ok(ranges)
-    }
-
-    /// Get ASN for an IP by checking ranges.
-    pub async fn get_asn_for_ip(&self, ip: &str) -> Result<Option<AsnRecord>, DatabaseError> {
-        // First try to find a matching range
-        let row = sqlx::query_as::<_, AsnRow>(
-            r#"
-            SELECT a.* FROM asns a
-            JOIN asn_ranges r ON a.asn = r.asn
-            WHERE ? >= r.cidr
-            LIMIT 1
-            "#,
-        )
-        .bind(ip)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(|row| AsnRecord {
-            asn: row.asn,
-            org: row.org,
-            category: match row.category.as_str() {
-                "hosting" => AsnCategory::Hosting,
-                "residential" => AsnCategory::Residential,
-                _ => AsnCategory::Unknown,
-            },
-            country: row.country,
-            last_updated: row.last_updated,
-        }))
     }
 
     /// Get ASNs by category.
