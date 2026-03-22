@@ -137,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scanner = scanner::Scanner::new(
         Arc::clone(&exclude_manager),
         Arc::clone(&db),
+        asn_fetcher.asn_manager(),
         args.target_rps,
     );
     let scheduler = scheduler::Scheduler::new(Arc::clone(&db), args.test_mode || args.quick_test, args.test_interval as u32);
@@ -239,6 +240,7 @@ async fn run_scanner_loop(
     let hot_count = Arc::new(AtomicU32::new(0));
     let warm_count = Arc::new(AtomicU32::new(0));
     let cold_count = Arc::new(AtomicU32::new(0));
+    let active_tasks = Arc::new(AtomicU32::new(0));
     
     let mut status_interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
     let mut fill_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
@@ -248,7 +250,8 @@ async fn run_scanner_loop(
             _ = status_interval.tick() => {
                 let (h, w, c) = scheduler.get_queue_sizes().await;
                 tracing::info!("Queue sizes: Hot={}, Warm={}, Cold={}", h, w, c);
-                tracing::info!("Scans today: Hot={}, Warm={}, Cold={}", 
+                tracing::info!("Status: Active Tasks={}, Scans today: Hot={}, Warm={}, Cold={}", 
+                    active_tasks.load(Ordering::Relaxed),
                     hot_count.load(Ordering::Relaxed), 
                     warm_count.load(Ordering::Relaxed), 
                     cold_count.load(Ordering::Relaxed));
@@ -266,6 +269,11 @@ async fn run_scanner_loop(
                     let hot_count = Arc::clone(&hot_count);
                     let warm_count = Arc::clone(&warm_count);
                     let cold_count = Arc::clone(&cold_count);
+                    let active_tasks = Arc::clone(&active_tasks);
+                    
+                    let active_tasks_inner = Arc::clone(&active_tasks);
+                    
+                    active_tasks.fetch_add(1, Ordering::SeqCst);
                     
                     tokio::spawn(async move {
                         let category = server.category.clone();
@@ -273,14 +281,16 @@ async fn run_scanner_loop(
 
                         let is_cold = matches!(category, asn::AsnCategory::Residential | asn::AsnCategory::Unknown);
 
-                        let was_online = scanner
+                        let (was_online, is_new) = scanner
                             .scan_server(&server.ip, server.port, server.hostname.as_deref(), is_cold)
                             .await;
 
                         // Re-queue with updated priority
                         scheduler.requeue_server(server, was_online).await;
 
-                        // Track scan counts per tier
+                        // Track scan counts per tier in memory and DB
+                        let _ = scheduler.db.increment_stats(priority, is_new).await;
+
                         match priority {
                             1 => {
                                 hot_count.fetch_add(1, Ordering::Relaxed);
@@ -292,7 +302,15 @@ async fn run_scanner_loop(
                                 cold_count.fetch_add(1, Ordering::Relaxed);
                             }
                         }
+                        active_tasks_inner.fetch_sub(1, Ordering::SeqCst);
                     });
+
+                    // BACKPRESSURE: If we have too many active tasks, wait a bit before picking more
+                    // This keeps the scheduler queues representative and avoids massive task backlogs
+                    // that would just wait at the rate limiter anyway.
+                    if active_tasks.load(Ordering::Relaxed) >= 1000 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
                 } else {
                     // No servers ready, sleep a bit to avoid CPU spin
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;

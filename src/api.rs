@@ -361,7 +361,7 @@ async fn search_players(
 
 /// GET /api/asns - List all ASNs.
 async fn list_asns(State(state): State<AppState>) -> Json<Vec<AsnResponse>> {
-    let asns = state.db.get_all_asns().await.unwrap_or_default();
+    let asns: Vec<crate::asn::AsnRecord> = state.db.get_all_asns().await.unwrap_or_default();
 
     let responses: Vec<AsnResponse> = asns
         .into_iter()
@@ -382,7 +382,7 @@ async fn get_asn(
     State(state): State<AppState>,
     Path(asn): Path<String>,
 ) -> Result<Json<AsnResponse>, StatusCode> {
-    let all_asns = state.db.get_all_asns().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let all_asns: Vec<crate::asn::AsnRecord> = state.db.get_all_asns().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let asn_record = all_asns
         .into_iter()

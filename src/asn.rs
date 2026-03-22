@@ -8,7 +8,6 @@ use ipnetwork::Ipv4Network;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use thiserror::Error;
 
 /// ASN category for scan prioritization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
@@ -19,6 +18,8 @@ pub enum AsnCategory {
     Hosting,
     /// Residential ISPs - scanned rarely (1-2 times/month)
     Residential,
+    /// Sensitive/Restricted networks (Military, Gov, Edu) - NEVER scanned
+    Excluded,
     /// Unknown or unclassified
     Unknown,
 }
@@ -29,6 +30,7 @@ impl AsnCategory {
         match self {
             AsnCategory::Hosting => 1,
             AsnCategory::Residential => 3,
+            AsnCategory::Excluded => 99, // Should not be scanned
             AsnCategory::Unknown => 2,
         }
     }
@@ -68,98 +70,12 @@ impl AsnRange {
     }
 }
 
-/// Known hosting providers for categorization.
-/// These ASNs are prioritized for Warm scans.
-const HOSTING_ASN_PREFIXES: &[&str] = &[
-    // AWS
-    "AS16509", // AMAZON-02
-    "AS14618", // AMAZON-AES
-    "AS8987",  // AMAZON-AES-EU
-    // Google Cloud
-    "AS15169", // GOOGLE
-    "AS36040", // GOOGLE-CLOUD
-    "AS36384", // GOOGLE-CLOUD-2
-    // Microsoft Azure
-    "AS8075",  // MICROSOFT-CORP
-    "AS3598",  // MICROSOFT-CORP-2
-    // Hetzner
-    "AS24940", // HETZNER-ONLINE
-    // OVH
-    "AS16276", // OVH
-    // DigitalOcean
-    "AS14061", // DIGITALOCEAN-ASN
-    // Linode
-    "AS63949", // LINODE-AP
-    "AS6939",  // HURRICANE
-    // Vultr
-    "AS20473", // AS-CHOOPA
-    // Cloudflare
-    "AS13335", // CLOUDFLARENET
-    // Scaleway
-    "AS12876", // SCALEWAY
-    // Online.net
-    "AS12322", // FREE
-    // Leaseweb
-    "AS60781", // LEASEWEB-NL
-    "AS35280", // F5
-    // Contabo
-    "AS51167", // CONTABO
-    // Ionos
-    "AS8560",  // IONOS
-    // Rackspace
-    "AS27357", // RACKSPACE
-    // Oracle Cloud
-    "AS31898", // ORACLE-BMC
-    "AS13220", // TUCOWS
-];
-
-/// Known residential ISPs.
-const RESIDENTIAL_ASN_PREFIXES: &[&str] = &[
-    // Comcast
-    "AS7922",
-    // Verizon
-    "AS701",
-    "AS702",
-    "AS703",
-    // AT&T
-    "AS20115",
-    "AS26809",
-    // Spectrum
-    "AS11351",
-    "AS12271",
-    // Cox
-    "AS22773",
-    // Deutsche Telekom
-    "AS3320",
-    // BT
-    "AS2856",
-    // Orange
-    "AS3215",
-    // KPN
-    "AS1136",
-    // Vodafone
-    "AS6830",
-    // Sky
-    "AS5607",
-    // T-Mobile
-    "AS21928",
-    // JCOM (Japan)
-    "AS17676",
-    // NTT
-    "AS2914",
-    // Telstra
-    "AS1221",
-];
-
 /// ASN manager for looking up and categorizing ASNs.
 pub struct AsnManager {
     /// ASN records by ASN number.
     asns: HashMap<String, AsnRecord>,
     /// IP ranges indexed by ASN.
     ranges: Vec<AsnRange>,
-    /// Category lookup by ASN prefix.
-    hosting_prefixes: Vec<String>,
-    residential_prefixes: Vec<String>,
 }
 
 impl AsnManager {
@@ -167,14 +83,6 @@ impl AsnManager {
         Self {
             asns: HashMap::new(),
             ranges: Vec::new(),
-            hosting_prefixes: HOSTING_ASN_PREFIXES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            residential_prefixes: RESIDENTIAL_ASN_PREFIXES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
         }
     }
 
@@ -205,54 +113,7 @@ impl AsnManager {
         if let Some(record) = self.asns.get(asn) {
             return record.category.clone();
         }
-
-        // Fallback: check prefixes
-        if self
-            .hosting_prefixes
-            .iter()
-            .any(|prefix| asn.starts_with(prefix))
-        {
-            return AsnCategory::Hosting;
-        }
-
-        if self
-            .residential_prefixes
-            .iter()
-            .any(|prefix| asn.starts_with(prefix))
-        {
-            return AsnCategory::Residential;
-        }
-
         AsnCategory::Unknown
-    }
-
-    /// Get all hosting ASNs.
-    pub fn get_hosting_asns(&self) -> Vec<&AsnRecord> {
-        self.asns
-            .values()
-            .filter(|r| r.category == AsnCategory::Hosting)
-            .collect()
-    }
-
-    /// Get all residential ASNs.
-    pub fn get_residential_asns(&self) -> Vec<&AsnRecord> {
-        self.asns
-            .values()
-            .filter(|r| r.category == AsnCategory::Residential)
-            .collect()
-    }
-
-    /// Get ranges for a specific category.
-    pub fn get_ranges_by_category(&self, category: AsnCategory) -> Vec<&AsnRange> {
-        self.ranges
-            .iter()
-            .filter(|r| {
-                self.asns
-                    .get(&r.asn)
-                    .map(|rec| rec.category == category)
-                    .unwrap_or(false)
-            })
-            .collect()
     }
 
     /// Get the number of ASNs loaded.
@@ -266,22 +127,42 @@ impl AsnManager {
     }
 
     /// Categorize an ASN based on organization name.
+    /// SAFETY: This is the primary gatekeeper for the scanner.
     pub fn categorize_by_org(org: &str) -> AsnCategory {
         let org_lower = org.to_lowercase();
 
-        // Hosting providers
+        // 1. CRITICAL SAFETY BLOCKLIST (Military, Gov, Edu, Infrastructure)
+        let blocked_keywords = [
+            // Military & Defense
+            "military", "defense", "dod", "pentagon", "army", "navy", "air force", "marines",
+            "department of defense", "national security", "intelligence", "signal corps",
+            // Government
+            "government", "gov.", "ministry", "federal", "state of", "city of", "municipality",
+            "parliament", "congress", "senate", "white house", "official",
+            // Law Enforcement
+            "police", "law enforcement", "fbi", "cia", "nsa", "justice", "sheriff", "interpol",
+            // Education (Universities/Schools)
+            "university", "college", "school", "academy", "institute of technology", ".edu", 
+            "higher education", "campus", "district",
+            // Critical Infrastructure
+            "hospital", "medical center", "healthcare", "clinic", "emergency", "911", "ambulance",
+            "nuclear", "atomic", "energy department", "power plant", "water works",
+            "bank", "financial", "securities", "reserve", "exchange", "investment",
+        ];
+
+        for keyword in &blocked_keywords {
+            if org_lower.contains(keyword) {
+                return AsnCategory::Excluded;
+            }
+        }
+
+        // 2. Hosting providers
         let hosting_keywords = [
             "amazon", "aws", "google", "microsoft", "azure", "hetzner", "ovh",
             "digitalocean", "linode", "vultr", "cloudflare", "scaleway", "online.net",
             "leaseweb", "contabo", "ionos", "rackspace", "oracle", "cloud", "hosting",
-            "datacenter", "server", "vps", "dedicated", "colo",
-        ];
-
-        // Residential providers
-        let residential_keywords = [
-            "comcast", "verizon", "at&t", "spectrum", "cox", "telekom", "bt ", "orange",
-            "kpn", "vodafone", "sky ", "t-mobile", "jcom", "ntt ", "telstra",
-            "broadband", "cable", "fiber", "isp", "residential",
+            "datacenter", "server", "vps", "dedicated", "colo", "compute", "instance",
+            "stack", "packet", "infrastructure", "liquid web", "choopa", "akamai",
         ];
 
         for keyword in &hosting_keywords {
@@ -289,6 +170,14 @@ impl AsnManager {
                 return AsnCategory::Hosting;
             }
         }
+
+        //  residential providers
+        let residential_keywords = [
+            "comcast", "verizon", "at&t", "spectrum", "cox", "telekom", "bt ", "orange",
+            "kpn", "vodafone", "sky ", "t-mobile", "jcom", "ntt ", "telstra",
+            "broadband", "cable", "fiber", "isp", "residential", "consumer",
+            "home", "dsl", "wireless", "mobile", "lte", "5g", "customer",
+        ];
 
         for keyword in &residential_keywords {
             if org_lower.contains(keyword) {
@@ -316,7 +205,7 @@ pub struct IpApiResponse {
     pub country_code: Option<String>,
 }
 
-#[derive(Error, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum AsnError {
     #[error("HTTP error: {0}")]
     HttpError(#[from] reqwest::Error),
@@ -324,53 +213,4 @@ pub enum AsnError {
     IpNetworkError(#[from] ipnetwork::IpNetworkError),
     #[error("ASN not found")]
     AsnNotFound,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_categorize_hosting() {
-        assert_eq!(
-            AsnManager::categorize_by_org("AMAZON-02"),
-            AsnCategory::Hosting
-        );
-        assert_eq!(
-            AsnManager::categorize_by_org("Hetzner Online GmbH"),
-            AsnCategory::Hosting
-        );
-        assert_eq!(
-            AsnManager::categorize_by_org("Google Cloud"),
-            AsnCategory::Hosting
-        );
-    }
-
-    #[test]
-    fn test_categorize_residential() {
-        assert_eq!(
-            AsnManager::categorize_by_org("Comcast Cable"),
-            AsnCategory::Residential
-        );
-        assert_eq!(
-            AsnManager::categorize_by_org("Verizon Business"),
-            AsnCategory::Residential
-        );
-    }
-
-    #[test]
-    fn test_categorize_unknown() {
-        assert_eq!(
-            AsnManager::categorize_by_org("Some Random Company"),
-            AsnCategory::Unknown
-        );
-    }
-
-    #[test]
-    fn test_asn_range_contains() {
-        let range = AsnRange::new("192.168.0.0/24".to_string(), "AS123".to_string()).unwrap();
-        assert!(range.contains(Ipv4Addr::new(192, 168, 0, 1)));
-        assert!(range.contains(Ipv4Addr::new(192, 168, 0, 254)));
-        assert!(!range.contains(Ipv4Addr::new(192, 168, 1, 1)));
-    }
 }

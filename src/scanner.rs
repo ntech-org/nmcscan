@@ -30,6 +30,7 @@ pub struct Scanner {
     cold_rate_limiter: Arc<RateLimiter>,
     exclude_list: Arc<ExcludeManager>,
     db: Arc<Database>,
+    asn_manager: Arc<tokio::sync::RwLock<crate::asn::AsnManager>>,
 }
 
 /// Simple but efficient token bucket rate limiter using a Semaphore.
@@ -77,7 +78,12 @@ impl RateLimiter {
 }
 
 impl Scanner {
-    pub fn new(exclude_list: Arc<ExcludeManager>, db: Arc<Database>, rps: u64) -> Self {
+    pub fn new(
+        exclude_list: Arc<ExcludeManager>,
+        db: Arc<Database>,
+        asn_manager: Arc<tokio::sync::RwLock<crate::asn::AsnManager>>,
+        rps: u64,
+    ) -> Self {
         let cold_rps = (rps / 10).max(1);
         Self {
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENCY)),
@@ -85,6 +91,7 @@ impl Scanner {
             cold_rate_limiter: RateLimiter::new(cold_rps),
             exclude_list,
             db,
+            asn_manager,
         }
     }
 
@@ -93,17 +100,17 @@ impl Scanner {
     /// # Safety
     /// - Checks exclude list BEFORE any connection
     /// - If excluded, SKIP immediately (no log, no ping)
-    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>, is_cold: bool) -> bool {
+    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>, is_cold: bool) -> (bool, bool) {
         // Parse IP
         let ip_addr: IpAddr = match ip.parse() {
             Ok(addr) => addr,
-            Err(_) => return false,
+            Err(_) => return (false, false),
         };
 
         // CRITICAL SAFETY CHECK: Exclude list enforcement
         if self.exclude_list.is_excluded(ip_addr).await {
             tracing::debug!("Skipping excluded IP: {}", ip);
-            return false;
+            return (false, false);
         }
 
         // Apply tiered rate limiting
@@ -115,7 +122,7 @@ impl Scanner {
         // Acquire concurrency permit
         let _permit = match self.semaphore.acquire().await {
             Ok(p) => p,
-            Err(_) => return false,
+            Err(_) => return (false, false),
         };
 
         // Perform the ping
@@ -129,11 +136,15 @@ impl Scanner {
                 let motd = Some(crate::slp::extract_motd(&status));
                 let version = status.version.as_ref().map(|v| v.name.clone());
 
-                if let Err(e) = self.db.mark_online(ip, players_online, players_max, motd, version, players_sample).await {
-                    tracing::error!("Failed to update DB for {}: {}", ip, e);
-                }
+                let is_new = match self.db.mark_online(ip, players_online, players_max, motd, version, players_sample, Some(self.asn_manager.clone())).await {
+                    Ok(new) => new,
+                    Err(e) => {
+                        tracing::error!("Failed to update DB for {}: {}", ip, e);
+                        false
+                    }
+                };
                 tracing::info!("Server {}:{} is online ({} players)", ip, port, players_online);
-                true
+                (true, is_new)
             }
             Err(e) => {
                 // Server is offline or unreachable
@@ -141,7 +152,7 @@ impl Scanner {
                 if let Err(e) = self.db.mark_offline(ip).await {
                     tracing::error!("Failed to update DB for {}: {}", ip, e);
                 }
-                false
+                (false, false)
             }
         }
     }
@@ -153,8 +164,8 @@ impl Scanner {
             .map(|(ip, port)| {
                 let scanner = Arc::clone(&this);
                 tokio::spawn(async move {
-                    let result = scanner.scan_server(&ip, port, None, false).await;
-                    (ip, result)
+                    let (online, _is_new) = scanner.scan_server(&ip, port, None, false).await;
+                    (ip, online)
                 })
             })
             .collect();
