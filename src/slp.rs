@@ -145,19 +145,23 @@ pub fn build_ping(payload: i64) -> Vec<u8> {
 
 /// Perform a Server List Ping and return server status.
 pub async fn ping_server(addr: SocketAddr, hostname: Option<&str>) -> Result<ServerStatus, SlpError> {
-    // Try Modern SLP first
-    match ping_server_modern(addr, hostname).await {
-        Ok(status) => Ok(status),
-        Err(e) => {
-            tracing::debug!("Modern SLP failed for {}: {}, trying legacy...", addr, e);
-            ping_server_legacy(addr).await
+    // 10 second overall timeout for the entire operation
+    timeout(Duration::from_secs(10), async {
+        // Try Modern SLP first
+        match ping_server_modern(addr, hostname).await {
+            Ok(status) => Ok(status),
+            Err(e) => {
+                tracing::debug!("Modern SLP failed for {}: {}, trying legacy...", addr, e);
+                ping_server_legacy(addr).await
+            }
         }
-    }
+    }).await?
 }
 
 async fn ping_server_modern(addr: SocketAddr, hostname: Option<&str>) -> Result<ServerStatus, SlpError> {
     let start_time = std::time::Instant::now();
-    let mut stream = timeout(Duration::from_secs(3), TcpStream::connect(addr)).await??;
+    // 5 second connect timeout
+    let mut stream = timeout(Duration::from_secs(5), TcpStream::connect(addr)).await??;
     stream.set_nodelay(true)?;
 
     // Handshake & Status Request
@@ -169,52 +173,54 @@ async fn ping_server_modern(addr: SocketAddr, hostname: Option<&str>) -> Result<
     let status_request = build_status_request();
     stream.write_all(&status_request).await?;
 
-    // Read response length
-    let mut len_buf = [0u8; 5];
-    let mut bytes_read = 0;
-    loop {
-        let n = stream.read(&mut len_buf[bytes_read..bytes_read+1]).await?;
-        if n == 0 { return Err(SlpError::InvalidResponse("Connection closed while reading length".to_owned())); }
-        bytes_read += 1;
-        if len_buf[bytes_read - 1] & 0x80 == 0 { break; }
-        if bytes_read >= 5 { return Err(SlpError::InvalidResponse("VarInt too long".to_owned())); }
+    // Use a buffered reader for efficient VarInt parsing
+    let mut reader = tokio::io::BufReader::with_capacity(4096, stream);
+
+    // Helper to read a VarInt from tokio BufReader
+    async fn read_varint_async<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<u32> {
+        let mut result = 0u32;
+        let mut shift = 0;
+        loop {
+            let byte = reader.read_u8().await?;
+            result |= ((byte & 0x7F) as u32) << shift;
+            if byte & 0x80 == 0 { break; }
+            shift += 7;
+            if shift >= 35 { return Err(io::Error::new(io::ErrorKind::InvalidData, "VarInt too long")); }
+        }
+        Ok(result)
     }
 
-    let mut cursor = io::Cursor::new(&len_buf[..bytes_read]);
-    let packet_len = read_varint(&mut cursor)? as usize;
-    if packet_len > MAX_PACKET_SIZE {
-        return Err(SlpError::InvalidResponse(format!("Packet too large: {}", packet_len)));
-    }
+    // 1. Read Packet Length
+    let _packet_len = read_varint_async(&mut reader).await? as usize;
 
-    let mut packet_body = vec![0u8; packet_len];
-    stream.read_exact(&mut packet_body).await?;
-
-    let mut body_cursor = io::Cursor::new(packet_body);
-    let packet_id = read_varint(&mut body_cursor)?;
+    // 2. Read Packet ID
+    let packet_id = read_varint_async(&mut reader).await?;
     if packet_id != 0 {
         return Err(SlpError::InvalidResponse(format!("Expected packet ID 0, got {}", packet_id)));
     }
 
-    let json_len = read_varint(&mut body_cursor)? as usize;
+    // 3. Read JSON Length
+    let json_len = read_varint_async(&mut reader).await? as usize;
     if json_len > MAX_PACKET_SIZE {
         return Err(SlpError::InvalidResponse(format!("JSON too large: {}", json_len)));
     }
-    
+
+    // 4. Read JSON bytes
     let mut json_bytes = vec![0u8; json_len];
-    io::Read::read_exact(&mut body_cursor, &mut json_bytes)?;
+    reader.read_exact(&mut json_bytes).await?;
     
     let mut response: ServerStatus = serde_json::from_slice(&json_bytes)?;
     
-    // Optional Ping phase to verify and measure latency
+    // Optional Ping phase
     let ping_payload = 12345678i64;
     let ping_packet = build_ping(ping_payload);
+    let mut stream = reader.into_inner();
     let _ = stream.write_all(&ping_packet).await;
     
-    // Try to read pong
-    let mut pong_buf = [0u8; 12]; // Length(VarInt) + ID(VarInt) + Payload(8)
-    if let Ok(Ok(n)) = timeout(Duration::from_millis(500), stream.read(&mut pong_buf)).await {
+    // Try to read pong briefly (2s for high-latency)
+    let mut pong_buf = [0u8; 12];
+    if let Ok(Ok(n)) = timeout(Duration::from_secs(2), stream.read(&mut pong_buf)).await {
         if n >= 2 {
-            // Success, we got a pong (or at least some data)
             response.ping = Some(start_time.elapsed().as_millis());
         }
     }
@@ -226,57 +232,85 @@ async fn ping_server_modern(addr: SocketAddr, hostname: Option<&str>) -> Result<
     Ok(response)
 }
 
-/// Legacy SLP (1.6) support.
+/// Legacy SLP (1.6 and below) support.
 async fn ping_server_legacy(addr: SocketAddr) -> Result<ServerStatus, SlpError> {
-    let mut stream = timeout(Duration::from_secs(3), TcpStream::connect(addr)).await??;
-    
-    // Send 0xFE 0x01
-    stream.write_all(&[0xFE, 0x01]).await?;
-    
-    // Response starts with 0xFF
-    let mut header = [0u8; 1];
-    stream.read_exact(&mut header).await?;
-    if header[0] != 0xFF {
-        return Err(SlpError::InvalidResponse(format!("Legacy: expected 0xFF, got 0x{:02X}", header[0])));
-    }
-    
-    // Next is 2 bytes of length (short, number of characters)
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf).await?;
-    let char_count = u16::from_be_bytes(len_buf) as usize;
-    
-    // Read string (UTF-16BE)
-    let mut string_bytes = vec![0u8; char_count * 2];
-    stream.read_exact(&mut string_bytes).await?;
-    
-    let utf16_chars: Vec<u16> = string_bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
-        .collect();
-    
-    let response_str = String::from_utf16(&utf16_chars)
-        .map_err(|_| SlpError::InvalidResponse("Legacy: invalid UTF-16".to_owned()))?;
-    
-    // Format: §1\0Protocol\0Version\0MOTD\0Online\0Max
-    let parts: Vec<&str> = response_str.split('\0').collect();
-    if parts.len() >= 6 {
-        Ok(ServerStatus {
-            description: serde_json::Value::String(parts[3].to_string()),
-            players: Some(Players {
-                online: parts[4].parse().unwrap_or(0),
-                max: parts[5].parse().unwrap_or(0),
-                sample: None,
-            }),
-            version: Some(Version {
-                name: parts[2].to_string(),
-                protocol: parts[1].parse().unwrap_or(0),
-            }),
-            favicon: None,
-            ping: None,
-        })
-    } else {
-        Err(SlpError::InvalidResponse("Legacy: malformed response".to_owned()))
-    }
+    // 5 second overall timeout for legacy
+    timeout(Duration::from_secs(5), async {
+        let mut stream = TcpStream::connect(addr).await?;
+        
+        // Send 0xFE 0x01 (1.4-1.6)
+        stream.write_all(&[0xFE, 0x01]).await?;
+        
+        // Response starts with 0xFF
+        let mut header = [0u8; 1];
+        stream.read_exact(&mut header).await?;
+        if header[0] != 0xFF {
+            return Err(SlpError::InvalidResponse(format!("Legacy: expected 0xFF, got 0x{:02X}", header[0])));
+        }
+        
+        // Next is 2 bytes of length (short, number of characters)
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await?;
+        let char_count = u16::from_be_bytes(len_buf) as usize;
+        
+        if char_count > 1000 {
+            return Err(SlpError::InvalidResponse("Legacy: response too long".to_owned()));
+        }
+
+        // Read string (UTF-16BE)
+        let mut string_bytes = vec![0u8; char_count * 2];
+        stream.read_exact(&mut string_bytes).await?;
+        
+        let utf16_chars: Vec<u16> = string_bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        
+        let response_str = String::from_utf16(&utf16_chars)
+            .map_err(|_| SlpError::InvalidResponse("Legacy: invalid UTF-16".to_owned()))?;
+        
+        // Modern Legacy (1.6) starts with §1\0
+        if response_str.starts_with("§1") {
+            let parts: Vec<&str> = response_str.split('\0').collect();
+            if parts.len() >= 6 {
+                return Ok(ServerStatus {
+                    description: serde_json::Value::String(parts[3].to_string()),
+                    players: Some(Players {
+                        online: parts[4].parse().unwrap_or(0),
+                        max: parts[5].parse().unwrap_or(0),
+                        sample: None,
+                    }),
+                    version: Some(Version {
+                        name: parts[2].to_string(),
+                        protocol: parts[1].parse().unwrap_or(0),
+                    }),
+                    favicon: None,
+                    ping: None,
+                });
+            }
+        }
+        
+        // Old Legacy (pre-1.6) format: MOTD§Online§Max
+        let parts: Vec<&str> = response_str.split('§').collect();
+        if parts.len() >= 3 {
+             Ok(ServerStatus {
+                description: serde_json::Value::String(parts[0].to_string()),
+                players: Some(Players {
+                    online: parts[1].parse().unwrap_or(0),
+                    max: parts[2].parse().unwrap_or(0),
+                    sample: None,
+                }),
+                version: Some(Version {
+                    name: "Legacy".to_string(),
+                    protocol: 0,
+                }),
+                favicon: None,
+                ping: None,
+            })
+        } else {
+            Err(SlpError::InvalidResponse("Legacy: malformed response".to_owned()))
+        }
+    }).await?
 }
 
 /// Extract MOTD text from description, handling complex JSON recursive structures.

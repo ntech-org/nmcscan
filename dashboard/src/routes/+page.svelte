@@ -1,6 +1,9 @@
 <script lang="ts">
     import { onMount } from "svelte";
     import { browser } from "$app/environment";
+    import { env } from '$env/dynamic/public';
+
+    const API_BASE = env.PUBLIC_API_URL || (browser ? window.location.origin : 'http://localhost:3000');
 
     let contactInfo = $state({ email: "", discord: "" });
     let ip = $state("");
@@ -11,7 +14,7 @@
 
     onMount(async () => {
         try {
-            const res = await fetch("/api/info");
+            const res = await fetch(`${API_BASE}/api/info`);
             contactInfo = await res.json();
         } catch (e) {
             console.error("Failed to load contact info");

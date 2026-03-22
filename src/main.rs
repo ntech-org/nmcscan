@@ -166,17 +166,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         tracing::info!("✅ Loaded {} test servers", test_servers.len());
     } else {
-        // Production mode: load from database and ASN ranges
+        // Production mode: load from database. 
+        // Discovery will dynamically fill queues from ASN ranges.
         scheduler.load_from_database().await.unwrap_or_else(|e| {
             tracing::warn!("Failed to load servers from database: {}", e);
         });
-
-        // Pre-populate Warm queue with hosting ASN ranges
-        for (cidr, asn) in scheduler::HOSTING_ASN_RANGES {
-            let _ = scheduler
-                .add_shuffled_range(cidr, asn, 2)
-                .await;
-        }
     }
 
     tracing::info!(
@@ -280,6 +274,7 @@ async fn run_scanner_loop(
                     tokio::spawn(async move {
                         let _permit = permit;
                         let category = server.category.clone();
+                        let priority = server.priority;
 
                         let is_cold = matches!(category, asn::AsnCategory::Residential | asn::AsnCategory::Unknown);
 
@@ -291,14 +286,14 @@ async fn run_scanner_loop(
                         scheduler.requeue_server(server, was_online).await;
 
                         // Track scan counts per tier
-                        match category {
-                            asn::AsnCategory::Hosting => {
+                        match priority {
+                            1 => {
                                 hot_count.fetch_add(1, Ordering::Relaxed);
                             }
-                            asn::AsnCategory::Unknown => {
+                            2 => {
                                 warm_count.fetch_add(1, Ordering::Relaxed);
                             }
-                            asn::AsnCategory::Residential => {
+                            _ => {
                                 cold_count.fetch_add(1, Ordering::Relaxed);
                             }
                         }

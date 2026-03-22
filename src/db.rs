@@ -199,6 +199,13 @@ impl Database {
             .execute(pool)
             .await?;
 
+        // Cleanup: Remove 'unknown' status servers that were added as potential targets 
+        // but were never successfully scanned. This keeps the database clean from 
+        // pollution from previous versions of the scanner.
+        sqlx::query("DELETE FROM servers WHERE status = 'unknown'")
+            .execute(pool)
+            .await?;
+
         Ok(())
     }
 
@@ -371,7 +378,32 @@ impl Database {
         version: Option<String>,
         players_sample: Option<Vec<crate::slp::PlayerSample>>,
     ) -> Result<(), DatabaseError> {
+        let mut retries = 3;
+        while retries > 0 {
+            match self.mark_online_inner(ip, players_online, players_max, motd.clone(), version.clone(), players_sample.clone()).await {
+                Ok(_) => return Ok(()),
+                Err(_e) if retries > 1 => {
+                    tracing::debug!("DB locked for {}, retrying... ({} left)", ip, retries - 1);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    retries -= 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    async fn mark_online_inner(
+        &self,
+        ip: &str,
+        players_online: i32,
+        players_max: i32,
+        motd: Option<String>,
+        version: Option<String>,
+        players_sample: Option<Vec<crate::slp::PlayerSample>>,
+    ) -> Result<(), DatabaseError> {
         let mut tx = self.pool.begin().await?;
+        // ... rest of the logic
 
         sqlx::query(
             r#"
@@ -435,6 +467,22 @@ impl Database {
 
     /// Update server status to offline with failure increment.
     pub async fn mark_offline(&self, ip: &str) -> Result<(), DatabaseError> {
+        let mut retries = 3;
+        while retries > 0 {
+            match self.mark_offline_inner(ip).await {
+                Ok(_) => return Ok(()),
+                Err(_e) if retries > 1 => {
+                    tracing::debug!("DB locked for offline update of {}, retrying...", ip);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    retries -= 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    async fn mark_offline_inner(&self, ip: &str) -> Result<(), DatabaseError> {
         sqlx::query(
             r#"
             UPDATE servers SET

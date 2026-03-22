@@ -6,45 +6,50 @@ description = "High-performance Minecraft Server Scanner with priority-based sca
 license = "MIT"
 
 [dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime (minimal features for faster compilation)
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 
-# Database
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
+# Database (minimal features)
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
 
 # Web server
-axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["compression-gzip", "cors", "fs"] }
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["compression-gzip", "cors"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
-# Networking
-tokio-util = "0.7"
-
-# IP parsing
+# Networking & IP parsing
+tokio-util = { version = "0.7", features = ["io"] }
 ipnetwork = "0.20"
 
-# HTTP client for ASN API
-reqwest = { version = "0.11", features = ["json"] }
+# HTTP client (use rustls instead of openssl for significantly faster builds)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
-thiserror = "1"
+thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
 
-# CLI argument parsing
-clap = { version = "4", features = ["derive", "env"] }
+# CLI argument parsing (minimal features)
+clap = { version = "4.5", default-features = false, features = ["derive", "env", "std", "help", "usage"] }
 rand = "0.8"
 dotenvy = "0.15.7"
-openssl = { version = "0.10.76", features = ["vendored"] }
+
+[profile.dev]
+opt-level = 0
+debug = true
+# Speed up dev builds by disabling some debug info if needed
+split-debuginfo = "unpacked"
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"  # Thin LTO is much faster than full LTO with similar benefits
 strip = true
+codegen-units = 1
+panic = "abort" # Reduces binary size and improves performance slightly

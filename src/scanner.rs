@@ -43,16 +43,21 @@ impl RateLimiter {
             semaphore: Semaphore::new(rps as usize),
         });
 
-        // Background task to refill tokens every second
+        // Background task to refill tokens 10 times per second for smoother flow
         let limiter_clone = Arc::clone(&limiter);
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(1));
+            let mut interval = time::interval(Duration::from_millis(100));
+            let rps_per_tick = (rps as f64 / 10.0).max(1.0) as usize;
             loop {
                 interval.tick().await;
                 let current_permits = limiter_clone.semaphore.available_permits();
-                let to_add = rps as usize - current_permits;
-                if to_add > 0 {
-                    limiter_clone.semaphore.add_permits(to_add);
+                
+                // Only add if we are below the target burst capacity (rps)
+                if current_permits < rps as usize {
+                    let to_add = std::cmp::min(rps_per_tick, rps as usize - current_permits);
+                    if to_add > 0 {
+                        limiter_clone.semaphore.add_permits(to_add);
+                    }
                 }
             }
         });

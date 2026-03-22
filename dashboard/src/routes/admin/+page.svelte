@@ -111,7 +111,8 @@
 
 	let refreshInterval: ReturnType<typeof setInterval>;
 
-	const API_BASE = browser ? '' : 'http://localhost:3000';
+	import { env } from '$env/dynamic/public';
+	const API_BASE = env.PUBLIC_API_URL || (browser ? window.location.origin : 'http://localhost:3000');
 
 	async function fetchWithAuth(url: string, options: RequestInit = {}) {
 		const headers = new Headers(options.headers);
@@ -331,7 +332,7 @@
 			if (testScanRegion === 'quick') payload.quick = true;
 			else if (testScanRegion !== 'default') payload.region = testScanRegion;
 
-			const res = await fetchWithAuth('/api/scan/test', {
+			const res = await fetchWithAuth(`${API_BASE}/api/scan/test`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify(payload)
@@ -365,6 +366,12 @@
 		clearTimeout(searchTimeout);
 		searchTimeout = setTimeout(searchServers, 500);
 	}
+
+	$effect(() => {
+		if (selectedTab === 'servers' && isAuthenticated) {
+			untrack(() => searchServers());
+		}
+	});
 
 	$effect(() => {
 		if (selectedTab === 'exclusions' && isAuthenticated) {

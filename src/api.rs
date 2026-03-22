@@ -19,7 +19,7 @@ use axum::{
     extract::{Path, Query, State, Request},
     http::{StatusCode, HeaderMap},
     middleware::{self, Next},
-    response::{Html, Json, Response},
+    response::{Json, Response},
     routing::{get, post},
     Router,
 };
@@ -27,7 +27,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir;
 
 use crate::db::{Database, Server};
 use crate::scheduler::Scheduler;
@@ -173,7 +172,7 @@ pub fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::HeaderName::from_static("x-api-key")]);
 
     // Protected API routes
     let api_routes = Router::new()
@@ -192,7 +191,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/info", get(get_info))
         .nest("/api", api_routes)
-        .fallback_service(ServeDir::new("assets").fallback(ServeDir::new("assets/index.html")))
         .layer(CompressionLayer::new())
         .layer(cors)
         .with_state(state)

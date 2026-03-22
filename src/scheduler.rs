@@ -4,13 +4,14 @@
 
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+// use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use crate::db::Database;
 use crate::asn::AsnCategory;
 use rand::prelude::*;
+use rand::seq::SliceRandom;
 
 /// Pre-defined hosting ASN ranges for discovery.
 pub const HOSTING_ASN_RANGES: &[(&str, &str)] = &[
@@ -142,11 +143,15 @@ impl Scheduler {
             };
 
             let mut q = queue.lock().await;
-            for i in 0..q.len() {
+            
+            // Check up to 1000 elements to find one that is ready to scan.
+            // This is important because newly added servers (None next_scan_at) 
+            // are added to the back of the queue.
+            let search_limit = std::cmp::min(q.len(), 1000);
+            for i in 0..search_limit {
                 if q[i].next_scan_at.map_or(true, |t| t <= now) {
                     return q.remove(i);
                 }
-                if i >= 10 { break; }
             }
         }
         None
@@ -160,10 +165,24 @@ impl Scheduler {
             tracing::info!("Discovery: Selecting Hosting ASN {} for Warm queue", asn);
             let ranges = self.db.get_all_asn_ranges().await.unwrap_or_default();
             let asn_ranges: Vec<_> = ranges.into_iter().filter(|r| r.asn == asn).collect();
-            if let Some(range) = asn_ranges.first() {
-                let _ = self.add_shuffled_range(&range.cidr, &asn, 2).await;
-                self.record_asn_scan(&asn).await;
+            
+            if !asn_ranges.is_empty() {
+                // Select a random range to scan from this ASN
+                let range = {
+                    let mut rng = rand::thread_rng();
+                    asn_ranges.choose(&mut rng).cloned()
+                };
+                
+                if let Some(range) = range {
+                    let _ = self.add_shuffled_range(&range.cidr, &asn, 2).await;
+                }
+            } else {
+                tracing::debug!("No ranges found in database for ASN {}, skipping discovery for now", asn);
             }
+            
+            // CRITICAL: Always record the scan attempt to update last_scanned and frequency_penalty,
+            // otherwise we will get stuck in a loop selecting the same ASN if it has no ranges.
+            self.record_asn_scan(&asn).await;
         }
     }
 
@@ -172,21 +191,44 @@ impl Scheduler {
         if cold_len > 500 { return; }
 
         let asns = self.db.get_asns_by_category("residential").await.unwrap_or_default();
-        if let Some(asn_record) = asns.first() {
+        if asns.is_empty() { return; }
+
+        // Pick a random residential ASN that hasn't been scanned recently
+        let last_scanned = self.asn_last_scanned.lock().await;
+        let mut candidates: Vec<_> = asns.into_iter()
+            .map(|record| {
+                let hours_since = last_scanned.get(&record.asn)
+                    .map(|last| Utc::now().signed_duration_since(*last).num_hours() as f32)
+                    .unwrap_or(720.0); // 30 days default
+                (record, hours_since)
+            })
+            .collect();
+        
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        
+        if let Some((asn_record, _)) = candidates.first() {
             tracing::info!("Discovery: Selecting Residential ASN {} for Cold queue", asn_record.asn);
             let ranges = self.db.get_all_asn_ranges().await.unwrap_or_default();
             let asn_ranges: Vec<_> = ranges.into_iter().filter(|r| r.asn == asn_record.asn).collect();
-            if let Some(range) = asn_ranges.first() {
-                let _ = self.add_shuffled_range(&range.cidr, &asn_record.asn, 3).await;
-                self.record_asn_scan(&asn_record.asn).await;
+            
+            if !asn_ranges.is_empty() {
+                let range = {
+                    let mut rng = rand::thread_rng();
+                    asn_ranges.choose(&mut rng).cloned()
+                };
+                
+                if let Some(range) = range {
+                    let _ = self.add_shuffled_range(&range.cidr, &asn_record.asn, 3).await;
+                }
             }
+            self.record_asn_scan(&asn_record.asn).await;
         }
     }
 
     pub async fn add_shuffled_range(
         &self,
         cidr: &str,
-        asn: &str,
+        _asn: &str,
         priority: i32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use ipnetwork::Ipv4Network;
@@ -219,7 +261,9 @@ impl Scheduler {
             target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
             target.priority = priority;
 
-            let _ = self.db.insert_server_if_new(&ip_str, 25565).await;
+            // CRITICAL: We DO NOT insert the server into the database here.
+            // We only save it to the DB if the scan actually finds a Minecraft server (mark_online).
+            // This prevents polluting the database with millions of offline IPs.
             self.add_server(target).await;
             count += 1;
             if count >= max_to_add { break; }
@@ -228,6 +272,7 @@ impl Scheduler {
     }
 
     pub async fn requeue_server(&self, mut server: ServerTarget, was_online: bool) {
+        let is_new_discovery = server.last_scanned.is_none();
         let now = Utc::now();
         server.last_scanned = Some(now);
 
@@ -235,6 +280,13 @@ impl Scheduler {
             server.mark_online();
         } else {
             server.mark_offline();
+        }
+
+        // If it's a new discovery target and it's offline, don't re-queue it.
+        // This prevents the memory queue from being filled with thousands of offline IPs.
+        if is_new_discovery && !was_online {
+            tracing::debug!("Dropping offline discovery target: {}", server.ip);
+            return;
         }
 
         let delay = if self.test_mode {
@@ -259,7 +311,14 @@ impl Scheduler {
     }
 
     pub async fn load_from_database(&self) -> Result<(), crate::db::DatabaseError> {
-        let servers = self.db.get_all_servers(None, None, 10000).await?;
+        // Only load servers that are currently online or have been online in the past.
+        // We filter out 'unknown' status servers which were likely just potential discovery targets.
+        let servers = sqlx::query_as::<_, crate::db::Server>(
+            "SELECT * FROM servers WHERE status != 'unknown' AND (status = 'online' OR motd IS NOT NULL) ORDER BY priority ASC, last_seen ASC LIMIT 10000",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+
         for server in servers {
             let mut target = ServerTarget::new(server.ip, server.port as u16);
             target.priority = server.priority;
@@ -284,25 +343,50 @@ impl Scheduler {
     pub async fn select_next_asn_for_warm_scan(&self) -> Option<String> {
         let counts = self.asn_scan_counts.lock().await;
         let last_scanned = self.asn_last_scanned.lock().await;
+        
+        // Get all hosting ASNs from database
+        let hosting_asns = self.db.get_asns_by_category("hosting").await.unwrap_or_default();
+        if hosting_asns.is_empty() {
+            // Fallback to hardcoded list if DB is empty
+            let mut best_asn: Option<String> = None;
+            let mut best_score = f32::MIN;
+            for (_cidr, asn) in HOSTING_ASN_RANGES {
+                let score = self.calculate_asn_score(asn, &counts, &last_scanned).await;
+                if score > best_score {
+                    best_score = score;
+                    best_asn = Some(asn.to_string());
+                }
+            }
+            return best_asn;
+        }
+
         let mut best_asn: Option<String> = None;
         let mut best_score = f32::MIN;
 
-        for (_cidr, asn) in HOSTING_ASN_RANGES {
-            let scan_count = counts.get(*asn).copied().unwrap_or(0) as f32;
-            let hours_since = last_scanned.get(*asn)
-                .map(|last| Utc::now().signed_duration_since(*last).num_hours() as f32)
-                .unwrap_or(168.0);
-
-            let time_score = (hours_since / 24.0).min(7.0);
-            let frequency_penalty = (scan_count / 10.0).min(2.0);
-            let score = time_score - frequency_penalty;
-
+        for record in hosting_asns {
+            let score = self.calculate_asn_score(&record.asn, &counts, &last_scanned).await;
             if score > best_score {
                 best_score = score;
-                best_asn = Some(asn.to_string());
+                best_asn = Some(record.asn);
             }
         }
         best_asn
+    }
+
+    async fn calculate_asn_score(
+        &self, 
+        asn: &str, 
+        counts: &std::collections::HashMap<String, u32>,
+        last_scanned: &std::collections::HashMap<String, DateTime<Utc>>
+    ) -> f32 {
+        let scan_count = counts.get(asn).copied().unwrap_or(0) as f32;
+        let hours_since = last_scanned.get(asn)
+            .map(|last| Utc::now().signed_duration_since(*last).num_hours() as f32)
+            .unwrap_or(168.0); // 7 days default
+
+        let time_score = (hours_since / 24.0).min(7.0);
+        let frequency_penalty = (scan_count / 10.0).min(2.0);
+        time_score - frequency_penalty
     }
 
     pub async fn record_asn_scan(&self, asn: &str) {

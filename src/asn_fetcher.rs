@@ -92,49 +92,38 @@ impl AsnFetcher {
         Ok(())
     }
 
-    /// Pre-populate known hosting provider ASNs.
+    /// Pre-populate known hosting provider ASNs and their ranges.
     async fn prepopulate_hosting_asns(&self) -> Result<(), AsnError> {
-        let hosting_providers = [
-            ("AS16509", "AMAZON-02", "US"),
-            ("AS14618", "AMAZON-AES", "US"),
-            ("AS15169", "GOOGLE", "US"),
-            ("AS8075", "MICROSOFT-CORP", "US"),
-            ("AS24940", "HETZNER-ONLINE", "DE"),
-            ("AS16276", "OVH", "FR"),
-            ("AS14061", "DIGITALOCEAN-ASN", "US"),
-            ("AS63949", "LINODE-AP", "US"),
-            ("AS20473", "AS-CHOOPA", "US"),
-            ("AS13335", "CLOUDFLARENET", "US"),
-            ("AS51167", "CONTABO", "DE"),
-            ("AS8560", "IONOS", "DE"),
-            ("AS31898", "ORACLE-BMC", "US"),
-        ];
+        tracing::info!("Pre-populating known hosting ranges...");
 
         let mut manager = self.asn_manager.write().await;
 
-        for (asn, org, country) in hosting_providers {
+        for (cidr, asn, org) in KNOWN_HOSTING_RANGES {
+            // 1. Add/Update ASN record
             let record = AsnRecord {
                 asn: asn.to_string(),
                 org: org.to_string(),
                 category: AsnCategory::Hosting,
-                country: Some(country.to_string()),
+                country: None, // Could be improved if needed
                 last_updated: Some(Utc::now()),
             };
             manager.add_asn(record);
 
-            // Also save to database
-            self.db
-                .upsert_asn(
-                    asn,
-                    org,
-                    "hosting",
-                    Some(country),
-                )
-                .await
-                .unwrap_or_else(|e| tracing::warn!("Failed to save ASN {}: {}", asn, e));
+            // Save ASN to database
+            if let Err(e) = self.db.upsert_asn(asn, org, "hosting", None).await {
+                tracing::warn!("Failed to save ASN {}: {}", asn, e);
+            }
+
+            // 2. Add/Update ASN range
+            manager.add_range(cidr.to_string(), asn.to_string());
+            
+            // Save range to database
+            if let Err(e) = self.db.upsert_asn_range(cidr, asn).await {
+                tracing::warn!("Failed to save ASN range {}: {}", cidr, e);
+            }
         }
 
-        tracing::info!("Pre-populated {} hosting provider ASNs", hosting_providers.len());
+        tracing::info!("Pre-populated {} hosting provider ranges", KNOWN_HOSTING_RANGES.len());
 
         Ok(())
     }

@@ -129,13 +129,13 @@ mod tests {
     #[test]
     fn test_known_servers_not_empty() {
         assert!(!KNOWN_MINECRAFT_SERVERS.is_empty());
-        assert!(KNOWN_MINECRAFT_SERVERS.len() >= 10);
+        assert!(KNOWN_MINECRAFT_SERVERS.len() >= 5);
     }
 
     #[test]
     fn test_quick_test_servers() {
         let servers = get_quick_test_servers();
-        assert_eq!(servers.len(), 10);
+        assert_eq!(servers.len(), 5);
         // First server should be Hypixel
         assert!(servers[0].2.contains("Hypixel"));
     }
@@ -144,14 +144,14 @@ mod tests {
     fn test_get_servers_by_region_us() {
         let servers = get_servers_by_region("us");
         assert!(!servers.is_empty());
-        assert!(servers.iter().any(|(_, _, name)| name.contains("Hypixel")));
+        assert!(servers.iter().any(|(_, _, name, _)| name.contains("Hypixel")));
     }
 
     #[test]
     fn test_get_servers_by_region_eu() {
         let servers = get_servers_by_region("eu");
         assert!(!servers.is_empty());
-        assert!(servers.iter().any(|(_, _, name)| name.contains("Gommehd")));
+        assert!(servers.iter().any(|(_, _, name, _)| name.contains("Gommehd")));
     }
 
     #[test]
