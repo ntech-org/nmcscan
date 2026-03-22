@@ -35,7 +35,8 @@ RUN apt-get update && apt-get install -y ca-certificates sqlite3 &> /dev/null &&
 WORKDIR /app
 COPY --from=builder /usr/src/nmcscan/target/release/nmcscan /app/nmcscan
 COPY --from=builder /usr/src/nmcscan/assets /app/assets
-RUN mkdir /app/data && touch /app/exclude.conf
+COPY exclude.conf /app/exclude.conf
+RUN mkdir /app/data
 ENV RUST_LOG=info
 ENV API_KEY=""
 EXPOSE 3000
