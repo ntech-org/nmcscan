@@ -190,13 +190,18 @@ impl AsnFetcher {
 
         // Add to IP ranges if network is provided
         if let Some(network) = api_response.network {
-            self.db
-                .upsert_asn_range(&network, &asn)
-                .await
-                .unwrap_or_else(|e| tracing::warn!("Failed to save ASN range: {}", e));
+            // CRITICAL: Only scan IPv4 ranges. IPv6 is too massive for systematic discovery.
+            if !network.contains(':') {
+                self.db
+                    .upsert_asn_range(&network, &asn)
+                    .await
+                    .unwrap_or_else(|e| tracing::warn!("Failed to save ASN range: {}", e));
 
-            let mut manager = self.asn_manager.write().await;
-            manager.add_range(network, asn);
+                let mut manager = self.asn_manager.write().await;
+                manager.add_range(network, asn);
+            } else {
+                tracing::debug!("Ignoring IPv6 range discovery for {}", network);
+            }
         }
 
         // Add to in-memory manager

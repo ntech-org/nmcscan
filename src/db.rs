@@ -215,6 +215,9 @@ impl Database {
         let _ = sqlx::query("ALTER TABLE asn_ranges ADD COLUMN scan_offset INTEGER DEFAULT 0;").execute(pool).await;
         let _ = sqlx::query("ALTER TABLE asn_ranges ADD COLUMN last_scanned_at TIMESTAMP;").execute(pool).await;
 
+        // Cleanup: Remove any IPv6 ranges that might have been accidentally added
+        let _ = sqlx::query("DELETE FROM asn_ranges WHERE cidr LIKE '%:%'").execute(pool).await;
+
         Ok(())
     }
 

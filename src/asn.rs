@@ -93,6 +93,7 @@ impl AsnManager {
 
     /// Add an IP range for an ASN.
     pub fn add_range(&mut self, cidr: String, asn: String) {
+        if cidr.contains(':') { return; } // Skip IPv6
         if let Ok(range) = AsnRange::new(cidr, asn) {
             self.ranges.push(range);
         }
