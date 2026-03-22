@@ -86,7 +86,7 @@
                 </thead>
                 <tbody class="divide-y divide-gray-800/50">
                     {#each playerSearchResults as player}
-                        <tr class="hover:bg-gray-800/20 transition-colors group cursor-pointer" onclick={() => goto(`/admin/servers/${player.ip}`)}>
+                        <tr class="hover:bg-gray-800/20 transition-colors group cursor-pointer" onclick={() => goto(`/admin/servers/${player.ip}:${player.port}`)}>
                             <td class="p-4 font-medium text-white flex items-center gap-3">
                                 <img src={`https://minotar.net/helm/${player.player_name}/32.png`} alt={player.player_name} class="w-8 h-8 rounded shadow-sm" onerror={(e) => { (e.currentTarget as HTMLImageElement).src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24"><rect width="24" height="24" fill="%23333"/><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" fill="%23666"/></svg>'; }} />
                                 <span class="truncate max-w-[200px]">

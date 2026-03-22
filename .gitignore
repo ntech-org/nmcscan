@@ -20,3 +20,5 @@ dashboard/bun.lockb
 
 # OS
 .DS_Store
+
+data/

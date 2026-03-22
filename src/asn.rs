@@ -44,6 +44,7 @@ pub struct AsnRecord {
     pub category: AsnCategory,
     pub country: Option<String>,
     pub last_updated: Option<DateTime<Utc>>,
+    pub server_count: i64,
 }
 
 /// IP range with associated ASN.
@@ -196,22 +197,14 @@ impl Default for AsnManager {
     }
 }
 
-/// Response from ipapi.co API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IpApiResponse {
-    pub ip: String,
-    pub asn: Option<String>,
-    pub org: Option<String>,
-    pub network: Option<String>,
-    pub country_code: Option<String>,
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum AsnError {
-    #[error("HTTP error: {0}")]
-    HttpError(#[from] reqwest::Error),
+    #[error("Database error: {0}")]
+    MaxMindError(String),
     #[error("IP network error: {0}")]
     IpNetworkError(#[from] ipnetwork::IpNetworkError),
     #[error("ASN not found")]
     AsnNotFound,
+    #[error("HTTP error: {0}")]
+    HttpError(#[from] reqwest::Error),
 }

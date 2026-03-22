@@ -2,10 +2,13 @@
     import { onMount, untrack } from 'svelte';
     import { fetchWithAuth, authState } from '$lib/state.svelte';
     import { goto } from '$app/navigation';
+    import { page } from '$app/state';
+    import MinecraftText from '$lib/components/MinecraftText.svelte';
     
     interface Server {
         ip: string;
         port: number;
+        server_type: string;
         status: string;
         players_online: number;
         players_max: number;
@@ -16,6 +19,8 @@
         consecutive_failures: number;
         asn?: string | null;
         country?: string | null;
+        favicon?: string | null;
+        brand?: string | null;
     }
 
     let servers = $state<Server[]>([]);
@@ -25,16 +30,18 @@
     let error = $state<string | null>(null);
 
     // Filters
-    let searchQuery = $state('');
-    let statusFilter = $state('all');
-    let minPlayers = $state<number | null>(null);
-    let maxPlayers = $state<number | null>(null);
-    let versionFilter = $state('');
-    let whitelistProbMin = $state<number | null>(null);
-    let asnCategory = $state('all');
-    let countryFilter = $state('');
-    let sortBy = $state('players');
-    let sortOrder = $state('desc');
+    let searchQuery = $state(page.url.searchParams.get('search') || '');
+    let statusFilter = $state(page.url.searchParams.get('status') || 'all');
+    let minPlayers = $state<number | null>(page.url.searchParams.has('min_players') ? Number(page.url.searchParams.get('min_players')) : null);
+    let maxPlayers = $state<number | null>(page.url.searchParams.has('max_players') ? Number(page.url.searchParams.get('max_players')) : null);
+    let versionFilter = $state(page.url.searchParams.get('version') || '');
+    let brandFilter = $state(page.url.searchParams.get('brand') || 'all');
+    let whitelistProbMin = $state<number | null>(page.url.searchParams.has('whitelist_prob_min') ? Number(page.url.searchParams.get('whitelist_prob_min')) : null);
+    let asnCategory = $state(page.url.searchParams.get('asn_category') || 'all');
+    let countryFilter = $state(page.url.searchParams.get('country') || '');
+    let serverTypeFilter = $state(page.url.searchParams.get('server_type') || 'all');
+    let sortBy = $state(page.url.searchParams.get('sort_by') || 'players');
+    let sortOrder = $state(page.url.searchParams.get('sort_order') || 'desc');
     
     let searchTimeout: ReturnType<typeof setTimeout>;
 
@@ -49,26 +56,34 @@
         
         error = null;
         try {
-            let url = `/api/servers?limit=50`;
-            if (searchQuery) url += `&search=${encodeURIComponent(searchQuery)}`;
-            if (statusFilter !== 'all') url += `&status=${statusFilter}`;
-            if (minPlayers !== null && minPlayers !== undefined) url += `&min_players=${minPlayers}`;
-            if (maxPlayers !== null && maxPlayers !== undefined) url += `&max_players=${maxPlayers}`;
-            if (versionFilter) url += `&version=${encodeURIComponent(versionFilter)}`;
-            if (whitelistProbMin !== null && whitelistProbMin !== undefined) url += `&whitelist_prob_min=${whitelistProbMin}`;
-            if (asnCategory !== 'all') url += `&asn_category=${encodeURIComponent(asnCategory)}`;
-            if (countryFilter) url += `&country=${encodeURIComponent(countryFilter)}`;
-            
-            url += `&sort_by=${sortBy}&sort_order=${sortOrder}`;
+            const params = new URLSearchParams();
+            params.set('limit', '50');
+            if (searchQuery) params.set('search', searchQuery);
+            if (statusFilter !== 'all') params.set('status', statusFilter);
+            if (minPlayers !== null) params.set('min_players', minPlayers.toString());
+            if (maxPlayers !== null) params.set('max_players', maxPlayers.toString());
+            if (versionFilter) params.set('version', versionFilter);
+            if (brandFilter !== 'all') params.set('brand', brandFilter);
+            if (serverTypeFilter !== 'all') params.set('server_type', serverTypeFilter);
+            if (whitelistProbMin !== null) params.set('whitelist_prob_min', whitelistProbMin.toString());
+            if (asnCategory !== 'all') params.set('asn_category', asnCategory);
+            if (countryFilter) params.set('country', countryFilter);
+            params.set('sort_by', sortBy);
+            params.set('sort_order', sortOrder);
+
+            // Update URL without reloading (using SvelteKit's goto for better integration)
+            if (!append) {
+                goto(`?${params.toString()}`, { replaceState: true, noScroll: true, keepFocus: true });
+            }
 
             if (append && servers.length > 0) {
                 const last = servers[servers.length - 1];
-                url += `&cursor_ip=${encodeURIComponent(last.ip)}`;
-                if (sortBy === 'players') url += `&cursor_players=${last.players_online}`;
-                if (sortBy === 'last_seen' && last.last_seen) url += `&cursor_last_seen=${encodeURIComponent(last.last_seen)}`;
+                params.set('cursor_ip', last.ip);
+                if (sortBy === 'players') params.set('cursor_players', last.players_online.toString());
+                if (sortBy === 'last_seen' && last.last_seen) params.set('cursor_last_seen', last.last_seen);
             }
 
-            const res = await fetchWithAuth(url);
+            const res = await fetchWithAuth(`/api/servers?${params.toString()}`);
             const newServers: Server[] = await res.json();
             
             if (append) {
@@ -116,7 +131,7 @@
 
     <!-- Advanced Filters -->
     <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 shadow-sm space-y-4">
-        <div class="flex flex-col sm:flex-row gap-4">
+        <div class="flex flex-col xl:flex-row gap-4">
             <div class="relative flex-1">
                 <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
                     <svg class="h-5 w-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
@@ -130,33 +145,61 @@
                     class="w-full bg-gray-950 border border-gray-700 rounded-lg pl-10 pr-4 py-2 text-sm text-gray-200 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all"
                 />
             </div>
-            <select
-                aria-label="Status Filter"
-                bind:value={statusFilter}
-                onchange={onFilterChange}
-                class="w-full sm:w-40 bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
-            >
-                <option value="all">Any Status</option>
-                <option value="online">Online</option>
-                <option value="offline">Offline</option>
-            </select>
-            <select
-                aria-label="ASN Category Filter"
-                bind:value={asnCategory}
-                onchange={onFilterChange}
-                class="w-full sm:w-48 bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
-            >
-                <option value="all">Any Network</option>
-                <option value="hosting">Hosting</option>
-                <option value="residential">Residential</option>
-                <option value="unknown">Unknown</option>
-            </select>
-            <div class="flex gap-2 w-full sm:w-auto">
+            <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-4">
+                <select
+                    aria-label="Status Filter"
+                    bind:value={statusFilter}
+                    onchange={onFilterChange}
+                    class="bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-300 outline-none focus:border-blue-500 transition-all"
+                >
+                    <option value="all">All Status</option>
+                    <option value="online">Online Only</option>
+                    <option value="offline">Offline Only</option>
+                </select>
+
+                <select
+                    aria-label="Type Filter"
+                    bind:value={serverTypeFilter}
+                    onchange={onFilterChange}
+                    class="bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-300 outline-none focus:border-blue-500 transition-all"
+                >
+                    <option value="all">All Types</option>
+                    <option value="java">Java Only</option>
+                    <option value="bedrock">Bedrock Only</option>
+                </select>
+                <select
+                    aria-label="Brand Filter"
+                    bind:value={brandFilter}
+                    onchange={onFilterChange}
+                    class="bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none"
+                >
+                    <option value="all">Any Brand</option>
+                    <option value="Vanilla">Vanilla</option>
+                    <option value="Paper">Paper</option>
+                    <option value="Spigot">Spigot</option>
+                    <option value="Forge">Forge</option>
+                    <option value="NeoForge">NeoForge</option>
+                    <option value="Fabric">Fabric</option>
+                    <option value="Purpur">Purpur</option>
+                    <option value="BungeeCord">BungeeCord</option>
+                    <option value="Velocity">Velocity</option>
+                </select>
+                <select
+                    aria-label="ASN Category Filter"
+                    bind:value={asnCategory}
+                    onchange={onFilterChange}
+                    class="bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none"
+                >
+                    <option value="all">Any Network</option>
+                    <option value="hosting">Hosting</option>
+                    <option value="residential">Residential</option>
+                    <option value="unknown">Unknown</option>
+                </select>
                 <select
                     aria-label="Sort By"
                     bind:value={sortBy}
                     onchange={onFilterChange}
-                    class="w-full sm:w-32 bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
+                    class="bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none"
                 >
                     <option value="players">Players</option>
                     <option value="last_seen">Last Seen</option>
@@ -166,7 +209,7 @@
                     aria-label="Sort Order"
                     bind:value={sortOrder}
                     onchange={onFilterChange}
-                    class="w-full sm:w-24 bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
+                    class="bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none"
                 >
                     <option value="desc">DESC</option>
                     <option value="asc">ASC</option>
@@ -175,7 +218,7 @@
         </div>
         
         <!-- Deep Filters -->
-        <div class="grid grid-cols-2 md:grid-cols-5 gap-4 pt-4 border-t border-gray-800">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 pt-4 border-t border-gray-800">
             <div>
                 <label for="minPlayers" class="block text-xs font-medium text-gray-500 uppercase mb-1">Min Players</label>
                 <input id="minPlayers" type="number" bind:value={minPlayers} oninput={onFilterChange} placeholder="0" class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:border-blue-500 outline-none" />
@@ -192,10 +235,6 @@
                 <label for="countryFilter" class="block text-xs font-medium text-gray-500 uppercase mb-1">Country (ISO)</label>
                 <input id="countryFilter" type="text" bind:value={countryFilter} oninput={onFilterChange} placeholder="US, DE, etc." class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:border-blue-500 outline-none" />
             </div>
-            <div>
-                <label for="whitelistProbMin" class="block text-xs font-medium text-gray-500 uppercase mb-1">Min Whitelist %</label>
-                <input id="whitelistProbMin" type="number" step="0.1" bind:value={whitelistProbMin} oninput={onFilterChange} placeholder="0.0 - 1.0" class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:border-blue-500 outline-none" />
-            </div>
         </div>
     </div>
 
@@ -205,11 +244,11 @@
             <table class="w-full text-left border-collapse">
                 <thead>
                     <tr class="bg-gray-950/50 text-gray-400 text-xs uppercase tracking-wider">
+                        <th class="p-4 font-medium w-16"></th>
                         <th class="p-4 font-medium">Server Address</th>
                         <th class="p-4 font-medium">Status</th>
                         <th class="p-4 font-medium">Players</th>
-                        <th class="p-4 font-medium">Version</th>
-                        <th class="p-4 font-medium">Network</th>
+                        <th class="p-4 font-medium">Software</th>
                         <th class="p-4 font-medium text-right">Actions</th>
                     </tr>
                 </thead>
@@ -220,40 +259,48 @@
                         <tr><td colspan="6" class="p-12 text-center text-gray-500">No servers found matching criteria.</td></tr>
                     {/if}
                     {#each servers as server}
-                        <tr class="hover:bg-gray-800/40 transition-colors group cursor-pointer" onclick={() => goto(`/admin/servers/${server.ip}`)}>
+                        <tr class="hover:bg-gray-800/40 transition-colors group cursor-pointer" onclick={() => goto(`/admin/servers/${server.ip}:${server.port}`)}>
                             <td class="p-4">
-                                <div class="font-mono text-sm text-gray-200">{server.ip}</div>
-                                <div class="text-xs text-gray-500">Port {server.port}</div>
+                                {#if server.favicon}
+                                    <img src={server.favicon} alt="" class="w-8 h-8 rounded shadow-sm pixelated" />
+                                {:else}
+                                    <div class="w-8 h-8 rounded bg-gray-800 flex items-center justify-center text-gray-600">
+                                        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M4 3h16a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm1 2v14h14V5H5zm2 2h10v2H7V7zm0 4h10v2H7v-2zm0 4h7v2H7v-2z"/></svg>
+                                    </div>
+                                {/if}
                             </td>
                             <td class="p-4">
-                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border {getStatusColor(server.status)}">
-                                    <span class="w-1.5 h-1.5 rounded-full mr-1.5 {server.status === 'online' ? 'bg-green-400' : 'bg-gray-400'}"></span>
+                                <div class="flex items-center gap-2">
+                                    <span class="font-mono text-sm text-gray-200">{server.ip}:{server.port}</span>
+                                    {#if server.server_type === 'bedrock'}
+                                        <span class="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 font-bold uppercase tracking-wider">Bedrock</span>
+                                    {:else}
+                                        <span class="text-[9px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 font-bold uppercase tracking-wider">Java</span>
+                                    {/if}
+                                </div>
+                                <div class="text-[10px] text-gray-500 mt-0.5 truncate max-w-[200px]">
+                                    <MinecraftText text={server.motd || ''} />
+                                </div>
+                            </td>
+                            <td class="p-4">
+                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-medium border {getStatusColor(server.status)}">
                                     {server.status}
                                 </span>
                             </td>
                             <td class="p-4 text-sm">
                                 <div class="flex items-center gap-2">
-                                    <div class="w-16 h-1.5 bg-gray-800 rounded-full overflow-hidden">
-                                        <div 
-                                            class="h-full bg-blue-500 rounded-full" 
-                                            style="width: {server.players_max > 0 ? Math.min((server.players_online / server.players_max) * 100, 100) : 0}%"
-                                        ></div>
-                                    </div>
                                     <span class="{server.players_online > 0 ? 'text-white' : 'text-gray-500'} font-medium">{server.players_online}</span>
                                     <span class="text-gray-600">/ {server.players_max}</span>
                                 </div>
                             </td>
                             <td class="p-4">
-                                <span class="inline-block px-2 py-1 bg-gray-800 text-gray-300 rounded text-xs truncate max-w-[120px]" title={server.version || 'Unknown'}>
-                                    {server.version || 'Unknown'}
-                                </span>
-                            </td>
-                            <td class="p-4 text-sm text-gray-400">
-                                <div class="flex items-center gap-2">
-                                    {#if server.country}
-                                        <img src={`https://flagcdn.com/16x12/${server.country.toLowerCase()}.png`} alt={server.country} class="rounded shadow-sm opacity-80" />
-                                    {/if}
-                                    <span class="truncate max-w-[100px]" title={server.asn || ''}>{server.asn || '-'}</span>
+                                <div class="flex flex-col gap-1">
+                                    <span class="inline-block px-2 py-0.5 bg-blue-500/10 text-blue-400 rounded text-[10px] font-medium border border-blue-500/20 w-fit">
+                                        {server.brand || 'Vanilla'}
+                                    </span>
+                                    <span class="text-[10px] text-gray-500 truncate max-w-[100px]" title={server.version || 'Unknown'}>
+                                        {server.version || 'Unknown'}
+                                    </span>
                                 </div>
                             </td>
                             <td class="p-4 text-right">
@@ -287,3 +334,9 @@
         {/if}
     </div>
 </div>
+
+<style>
+    .pixelated {
+        image-rendering: pixelated;
+    }
+</style>

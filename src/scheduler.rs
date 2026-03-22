@@ -26,10 +26,12 @@ pub struct ServerTarget {
     pub consecutive_failures: i32,
     pub scan_count: u32,
     pub success_rate: f32,
+    pub server_type: String,
+    pub direction: i8,
 }
 
 impl ServerTarget {
-    pub fn new(ip: String, port: u16) -> Self {
+    pub fn new(ip: String, port: u16, server_type: String) -> Self {
         Self {
             ip,
             port,
@@ -41,6 +43,8 @@ impl ServerTarget {
             consecutive_failures: 0,
             scan_count: 0,
             success_rate: 0.0,
+            server_type,
+            direction: 0,
         }
     }
 
@@ -145,10 +149,11 @@ impl Scheduler {
         let warm_len = self.warm_queue.lock().await.len();
         if warm_len > 2000 { return; } 
 
-        // Systematic range exploration for Hosting
-        if let Ok(Some(range)) = self.db.get_next_range_to_scan("hosting").await {
-            tracing::info!("Discovery: Exploring Hosting CIDR {} at offset {}", range.cidr, range.scan_offset);
-            let _ = self.add_range_segment(&range.cidr, &range.asn, 2, range.scan_offset).await;
+        // INTERLEAVED DISCOVERY: Fetch up to 100 hosting ranges
+        if let Ok(ranges) = self.db.get_ranges_to_scan("hosting", 100).await {
+            if ranges.is_empty() { return; }
+            tracing::info!("Discovery: Filling Warm queue by interleaving {} hosting ranges", ranges.len());
+            let _ = self.fill_discovery_queue(ranges, 2, 20).await;
         }
     }
 
@@ -163,7 +168,7 @@ impl Scheduler {
         .fetch_all(self.db.pool())
         .await {
             for server in dead_servers {
-                let mut target = ServerTarget::new(server.ip, server.port as u16);
+                let mut target = ServerTarget::new(server.ip, server.port as u16, server.server_type);
                 target.priority = 3;
                 if let Some(last) = server.last_seen {
                     target.next_scan_at = Some(last.and_utc() + chrono::Duration::days(7));
@@ -172,47 +177,68 @@ impl Scheduler {
             }
         }
 
-        // 2. Systematic range exploration for Residential
-        if let Ok(Some(range)) = self.db.get_next_range_to_scan("residential").await {
-            tracing::info!("Discovery: Exploring Residential CIDR {} at offset {}", range.cidr, range.scan_offset);
-            let _ = self.add_range_segment(&range.cidr, &range.asn, 3, range.scan_offset).await;
-        } else if let Ok(Some(range)) = self.db.get_next_range_to_scan("unknown").await {
-            // Fallback to unknown if no residential identified yet
-            tracing::info!("Discovery: Exploring Unknown CIDR {} at offset {}", range.cidr, range.scan_offset);
-            let _ = self.add_range_segment(&range.cidr, &range.asn, 3, range.scan_offset).await;
+        // 2. INTERLEAVED DISCOVERY: Fetch up to 50 residential/unknown ranges
+        let mut ranges = self.db.get_ranges_to_scan("residential", 50).await.unwrap_or_default();
+        if ranges.is_empty() {
+            ranges = self.db.get_ranges_to_scan("unknown", 50).await.unwrap_or_default();
+        }
+
+        if !ranges.is_empty() {
+            tracing::info!("Discovery: Filling Cold queue by interleaving {} ranges", ranges.len());
+            let _ = self.fill_discovery_queue(ranges, 3, 10).await;
         }
     }
 
-    pub async fn add_range_segment(
+    /// Master discovery function that takes multiple ranges, pulls a few IPs from each,
+    /// shuffles the aggregate list, and pushes to the queue.
+    pub async fn fill_discovery_queue(
         &self,
-        cidr: &str,
-        asn: &str,
+        ranges: Vec<crate::db::AsnRangeRow>,
         priority: i32,
-        offset: i64,
+        ips_per_range: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use ipnetwork::Ipv4Network;
-        let network: Ipv4Network = cidr.parse()?;
-        let batch_size = if priority == 2 { 256 } else { 128 };
-        let total_ips = network.size() as i64;
+        let mut all_targets = Vec::new();
 
-        let mut current_offset = offset;
-        let mut added = 0;
+        for range in ranges {
+            let network: Ipv4Network = range.cidr.parse()?;
+            let total_ips = network.size() as i64;
+            let mut current_offset = range.scan_offset;
+            let mut added = 0;
 
-        while added < batch_size && current_offset < total_ips {
-            if let Some(ip) = network.nth(current_offset as u32) {
-                let mut target = ServerTarget::new(ip.to_string(), 25565);
-                target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
-                target.priority = priority;
-                self.add_server(target, true).await;
-                added += 1;
+            while added < ips_per_range && current_offset < total_ips {
+                if let Some(ip) = network.nth(current_offset as u32) {
+                    let mut java_target = ServerTarget::new(ip.to_string(), 25565, "java".to_string());
+                    java_target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
+                    java_target.priority = priority;
+                    all_targets.push(java_target);
+                    
+                    let mut bedrock_target = ServerTarget::new(ip.to_string(), 19132, "bedrock".to_string());
+                    bedrock_target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
+                    bedrock_target.priority = priority;
+                    all_targets.push(bedrock_target);
+                    
+                    added += 1;
+                }
+                current_offset += 1;
             }
-            current_offset += 1;
+
+            // Update database with new offset for THIS range
+            let is_done = current_offset >= total_ips;
+            self.db.update_range_progress(&range.cidr, current_offset, is_done).await?;
+            self.record_asn_scan(&range.asn).await;
         }
 
-        // Update database with new offset
-        let is_done = current_offset >= total_ips;
-        self.db.update_range_progress(cidr, current_offset, is_done).await?;
-        self.record_asn_scan(asn).await;
+        // GLOBAL SHUFFLE: Randomize the order of all collected IPs
+        {
+            let mut rng = rand::thread_rng();
+            all_targets.shuffle(&mut rng);
+        } // rng is dropped here, before any awaits
+
+        // Add all to the queue
+        for target in all_targets {
+            self.add_server(target, true).await;
+        }
 
         Ok(())
     }
@@ -251,6 +277,38 @@ impl Scheduler {
 
         if was_online {
             server.mark_online();
+            
+            // Progressive Port Scanning Logic (only for Java servers)
+            // User requested: "make sure the progressive scanning is in the hot stage instead of the discovery stage"
+            // This means we only do it if the server was already in our DB (!is_new_discovery)
+            if server.server_type == "java" && !is_new_discovery {
+                if server.direction == 0 {
+                    // Start progressive scan from default port
+                    if server.port == 25565 {
+                        let mut t_up = ServerTarget::new(server.ip.clone(), server.port + 1, "java".to_string());
+                        t_up.direction = 1;
+                        t_up.category = server.category.clone();
+                        self.add_server(t_up, false).await;
+                        
+                        let mut t_down = ServerTarget::new(server.ip.clone(), server.port - 1, "java".to_string());
+                        t_down.direction = -1;
+                        t_down.category = server.category.clone();
+                        self.add_server(t_down, false).await;
+                    }
+                } else if server.direction == 1 && server.port < 65535 {
+                    // Continue scanning upwards
+                    let mut t_up = ServerTarget::new(server.ip.clone(), server.port + 1, "java".to_string());
+                    t_up.direction = 1;
+                    t_up.category = server.category.clone();
+                    self.add_server(t_up, false).await;
+                } else if server.direction == -1 && server.port > 1 {
+                    // Continue scanning downwards
+                    let mut t_down = ServerTarget::new(server.ip.clone(), server.port - 1, "java".to_string());
+                    t_down.direction = -1;
+                    t_down.category = server.category.clone();
+                    self.add_server(t_down, false).await;
+                }
+            }
         } else {
             server.mark_offline();
         }
@@ -258,7 +316,7 @@ impl Scheduler {
         // If it's a new discovery target and it's offline, don't re-queue it.
         // This prevents the memory queue from being filled with thousands of offline IPs.
         if is_new_discovery && !was_online {
-            tracing::debug!("Dropping offline discovery target: {}", server.ip);
+            tracing::debug!("Dropping offline discovery target: {}:{}", server.ip, server.port);
             return;
         }
 
@@ -293,7 +351,7 @@ impl Scheduler {
         .await?;
 
         for server in servers {
-            let mut target = ServerTarget::new(server.ip, server.port as u16);
+            let mut target = ServerTarget::new(server.ip, server.port as u16, server.server_type);
             target.priority = server.priority;
             target.consecutive_failures = server.consecutive_failures;
             target.category = AsnCategory::Unknown;

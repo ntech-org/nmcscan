@@ -34,7 +34,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /usr/src/nmcscan/target/release/nmcscan /app/nmcscan
 
 # Ensure data directory exists
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data/maxmind
 
 # Default command
 CMD ["/app/nmcscan"]

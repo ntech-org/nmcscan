@@ -14,6 +14,8 @@ use tokio::sync::Semaphore;
 use tokio::time::{self, Duration};
 use tracing;
 
+use crate::asn_fetcher::AsnFetcher;
+
 /// Maximum concurrent scan tasks.
 const MAX_CONCURRENCY: usize = 1000;
 
@@ -30,7 +32,7 @@ pub struct Scanner {
     cold_rate_limiter: Arc<RateLimiter>,
     exclude_list: Arc<ExcludeManager>,
     db: Arc<Database>,
-    asn_manager: Arc<tokio::sync::RwLock<crate::asn::AsnManager>>,
+    asn_fetcher: Arc<AsnFetcher>,
 }
 
 /// Simple but efficient token bucket rate limiter using a Semaphore.
@@ -81,7 +83,7 @@ impl Scanner {
     pub fn new(
         exclude_list: Arc<ExcludeManager>,
         db: Arc<Database>,
-        asn_manager: Arc<tokio::sync::RwLock<crate::asn::AsnManager>>,
+        asn_fetcher: Arc<AsnFetcher>,
         rps: u64,
     ) -> Self {
         let cold_rps = (rps / 10).max(1);
@@ -91,7 +93,7 @@ impl Scanner {
             cold_rate_limiter: RateLimiter::new(cold_rps),
             exclude_list,
             db,
-            asn_manager,
+            asn_fetcher,
         }
     }
 
@@ -100,7 +102,7 @@ impl Scanner {
     /// # Safety
     /// - Checks exclude list BEFORE any connection
     /// - If excluded, SKIP immediately (no log, no ping)
-    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>, is_cold: bool) -> (bool, bool) {
+    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>, is_discovery: bool, server_type: &str) -> (bool, bool) {
         // Parse IP
         let ip_addr: IpAddr = match ip.parse() {
             Ok(addr) => addr,
@@ -114,7 +116,7 @@ impl Scanner {
         }
 
         // Apply tiered rate limiting
-        if is_cold {
+        if is_discovery {
             self.cold_rate_limiter.acquire().await;
         }
         self.rate_limiter.acquire().await;
@@ -127,7 +129,14 @@ impl Scanner {
 
         // Perform the ping
         let addr = SocketAddr::new(ip_addr, port);
-        match ping_server(addr, hostname).await {
+        
+        let ping_result = if server_type == "bedrock" {
+            crate::raknet::ping_server(addr).await.map_err(|e| e.to_string())
+        } else {
+            crate::slp::ping_server(addr, hostname).await.map_err(|e| e.to_string())
+        };
+        
+        match ping_result {
             Ok(status) => {
                 // Server is online
                 let players_online = status.players.as_ref().map(|p| p.online).unwrap_or(0);
@@ -135,11 +144,28 @@ impl Scanner {
                 let players_sample = status.players.as_ref().and_then(|p| p.sample.clone());
                 let motd = Some(crate::slp::extract_motd(&status));
                 let version = status.version.as_ref().map(|v| v.name.clone());
+                let favicon = status.favicon.clone();
+                let brand = Some(crate::slp::extract_brand(&status));
 
-                let is_new = match self.db.mark_online(ip, players_online, players_max, motd, version, players_sample, Some(self.asn_manager.clone())).await {
+                // DATA ENRICHMENT: If we don't have ASN info for this IP, fetch it now
+                let asn_manager = self.asn_fetcher.asn_manager();
+                let has_asn = {
+                    if let IpAddr::V4(v4) = ip_addr {
+                        asn_manager.read().await.get_asn_for_ip(v4).is_some()
+                    } else {
+                        false
+                    }
+                };
+
+                if !has_asn {
+                    tracing::debug!("Fetching missing ASN info for new discovery: {}", ip);
+                    let _ = self.asn_fetcher.fetch_asn_for_ip(ip).await;
+                }
+
+                let is_new = match self.db.mark_online(ip, port as i32, server_type, players_online, players_max, motd, version, players_sample, favicon, brand, Some(asn_manager)).await {
                     Ok(new) => new,
                     Err(e) => {
-                        tracing::error!("Failed to update DB for {}: {}", ip, e);
+                        tracing::error!("Failed to update DB for {}:{}: {}", ip, port, e);
                         false
                     }
                 };
@@ -149,9 +175,15 @@ impl Scanner {
             Err(e) => {
                 // Server is offline or unreachable
                 tracing::debug!("Server {}:{} is offline: {}", ip, port, e);
-                if let Err(e) = self.db.mark_offline(ip).await {
-                    tracing::error!("Failed to update DB for {}: {}", ip, e);
+                
+                // PERFORMANCE OPTIMIZATION: If it was a discovery target and it's offline, 
+                // DO NOT tell the database. We only want online servers in our DB.
+                if !is_discovery {
+                    if let Err(e) = self.db.mark_offline(ip, port as i32).await {
+                        tracing::error!("Failed to update DB for {}:{}: {}", ip, port, e);
+                    }
                 }
+                
                 (false, false)
             }
         }
@@ -164,7 +196,7 @@ impl Scanner {
             .map(|(ip, port)| {
                 let scanner = Arc::clone(&this);
                 tokio::spawn(async move {
-                    let (online, _is_new) = scanner.scan_server(&ip, port, None, false).await;
+                    let (online, _is_new) = scanner.scan_server(&ip, port, None, false, "java").await;
                     (ip, online)
                 })
             })
@@ -183,11 +215,10 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exclude::ExcludeList;
-    use crate::db::Database;
+    use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_excluded_server_skipped() {
+    async fn test_scanner_build() {
         let db = Arc::new(Database::new(":memory:").await.unwrap());
         // Since test_excluded_server_skipped was using ExcludeList, we need to adapt it
         // This is a unit test so we don't need the file manager here really, 

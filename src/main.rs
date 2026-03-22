@@ -19,6 +19,7 @@ mod asn;
 mod asn_fetcher;
 mod db;
 mod exclude;
+mod raknet;
 mod scheduler;
 mod scanner;
 mod slp;
@@ -137,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scanner = scanner::Scanner::new(
         Arc::clone(&exclude_manager),
         Arc::clone(&db),
-        asn_fetcher.asn_manager(),
+        Arc::clone(&asn_fetcher),
         args.target_rps,
     );
     let scheduler = scheduler::Scheduler::new(Arc::clone(&db), args.test_mode || args.quick_test, args.test_interval as u32);
@@ -160,12 +161,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing::info!("Loading {} test servers...", test_servers.len());
         for (ip, port, name, host) in &test_servers {
-            let mut target = scheduler::ServerTarget::new(ip.clone(), *port);
+            let server_type = if *port == 19132 { "bedrock".to_string() } else { "java".to_string() };
+            let mut target = scheduler::ServerTarget::new(ip.clone(), *port, server_type.clone());
             target.category = asn::AsnCategory::Hosting;
             target.priority = 1; // Hot priority for test servers
             target.hostname = Some(host.clone());
             
-            let _ = db.insert_server_if_new(ip, *port as i32).await;
+            let _ = db.insert_server_if_new(ip, *port as i32, &server_type).await;
             
             scheduler.add_server(target, false).await;
             tracing::debug!("  Added test server: {} ({}:{} as {})", name, ip, port, host);
@@ -177,6 +179,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scheduler.load_from_database().await.unwrap_or_else(|e| {
             tracing::warn!("Failed to load servers from database: {}", e);
         });
+
+        // BACKFILL: Link existing servers to ASNs if data is missing
+        match db.link_servers_to_asns().await {
+            Ok(count) if count > 0 => tracing::info!("Backfilled ASN data for {} servers", count),
+            _ => {}
+        }
     }
 
     tracing::info!(
@@ -242,8 +250,15 @@ async fn run_scanner_loop(
     let cold_count = Arc::new(AtomicU32::new(0));
     let active_tasks = Arc::new(AtomicU32::new(0));
     
+    // In-memory stats buffer to avoid DB write storm
+    let hot_buffer = Arc::new(AtomicU32::new(0));
+    let warm_buffer = Arc::new(AtomicU32::new(0));
+    let cold_buffer = Arc::new(AtomicU32::new(0));
+    let discoveries_buffer = Arc::new(AtomicU32::new(0));
+
     let mut status_interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
     let mut fill_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    let mut stats_flush_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
     loop {
         tokio::select! {
@@ -255,6 +270,17 @@ async fn run_scanner_loop(
                     hot_count.load(Ordering::Relaxed), 
                     warm_count.load(Ordering::Relaxed), 
                     cold_count.load(Ordering::Relaxed));
+            }
+            _ = stats_flush_interval.tick() => {
+                // Flush stats to DB
+                let h = hot_buffer.swap(0, Ordering::SeqCst);
+                let w = warm_buffer.swap(0, Ordering::SeqCst);
+                let c = cold_buffer.swap(0, Ordering::SeqCst);
+                let d = discoveries_buffer.swap(0, Ordering::SeqCst);
+                
+                if h > 0 || w > 0 || c > 0 || d > 0 {
+                    let _ = scheduler.db.increment_batch_stats(h as i32, w as i32, c as i32, d as i32).await;
+                }
             }
             _ = fill_interval.tick() => {
                 if !scheduler.test_mode {
@@ -271,6 +297,11 @@ async fn run_scanner_loop(
                     let cold_count = Arc::clone(&cold_count);
                     let active_tasks = Arc::clone(&active_tasks);
                     
+                    let hot_buffer = Arc::clone(&hot_buffer);
+                    let warm_buffer = Arc::clone(&warm_buffer);
+                    let cold_buffer = Arc::clone(&cold_buffer);
+                    let discoveries_buffer = Arc::clone(&discoveries_buffer);
+
                     let active_tasks_inner = Arc::clone(&active_tasks);
                     
                     active_tasks.fetch_add(1, Ordering::SeqCst);
@@ -278,30 +309,36 @@ async fn run_scanner_loop(
                     tokio::spawn(async move {
                         let category = server.category.clone();
                         let priority = server.priority;
-
-                        let is_cold = matches!(category, asn::AsnCategory::Residential | asn::AsnCategory::Unknown);
+                        
+                        // Check if it's a brand new discovery target (never scanned)
+                        let is_discovery = server.last_scanned.is_none();
 
                         let (was_online, is_new) = scanner
-                            .scan_server(&server.ip, server.port, server.hostname.as_deref(), is_cold)
+                            .scan_server(&server.ip, server.port, server.hostname.as_deref(), is_discovery, &server.server_type)
                             .await;
 
                         // Re-queue with updated priority
                         scheduler.requeue_server(server, was_online).await;
 
-                        // Track scan counts per tier in memory and DB
-                        let _ = scheduler.db.increment_stats(priority, is_new).await;
-
+                        // Track scan counts in memory buffers
                         match priority {
                             1 => {
                                 hot_count.fetch_add(1, Ordering::Relaxed);
+                                hot_buffer.fetch_add(1, Ordering::Relaxed);
                             }
                             2 => {
                                 warm_count.fetch_add(1, Ordering::Relaxed);
+                                warm_buffer.fetch_add(1, Ordering::Relaxed);
                             }
                             _ => {
                                 cold_count.fetch_add(1, Ordering::Relaxed);
+                                cold_buffer.fetch_add(1, Ordering::Relaxed);
                             }
                         }
+                        if is_new {
+                            discoveries_buffer.fetch_add(1, Ordering::Relaxed);
+                        }
+                        
                         active_tasks_inner.fetch_sub(1, Ordering::SeqCst);
                     });
 

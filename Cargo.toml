@@ -35,6 +35,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utilities
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
+maxminddb = "0.27"
+tar = "0.4"
+flate2 = "1.0"
 
 # CLI argument parsing (minimal features)
 clap = { version = "4.5", default-features = false, features = ["derive", "env", "std", "help", "usage"] }

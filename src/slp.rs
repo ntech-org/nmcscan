@@ -38,6 +38,14 @@ pub struct ServerStatus {
     pub favicon: Option<String>,
     #[serde(default)]
     pub ping: Option<u128>, // Latency in ms
+    #[serde(rename = "modinfo")]
+    pub mod_info: Option<ModInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModInfo {
+    #[serde(rename = "type")]
+    pub mod_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -286,6 +294,7 @@ async fn ping_server_legacy(addr: SocketAddr) -> Result<ServerStatus, SlpError> 
                     }),
                     favicon: None,
                     ping: None,
+                    mod_info: None,
                 });
             }
         }
@@ -306,6 +315,7 @@ async fn ping_server_legacy(addr: SocketAddr) -> Result<ServerStatus, SlpError> 
                 }),
                 favicon: None,
                 ping: None,
+                mod_info: None,
             })
         } else {
             Err(SlpError::InvalidResponse("Legacy: malformed response".to_owned()))
@@ -316,6 +326,30 @@ async fn ping_server_legacy(addr: SocketAddr) -> Result<ServerStatus, SlpError> 
 /// Extract MOTD text from description, handling complex JSON recursive structures.
 pub fn extract_motd(status: &ServerStatus) -> String {
     parse_json_text(&status.description)
+}
+
+/// Extract server brand (Vanilla, Paper, Forge, etc.) from status.
+pub fn extract_brand(status: &ServerStatus) -> String {
+    if let Some(mod_info) = &status.mod_info {
+        let t = mod_info.mod_type.to_lowercase();
+        if t == "fml" || t == "forge" { return "Forge".to_string(); }
+        return mod_info.mod_type.clone();
+    }
+    
+    if let Some(version) = &status.version {
+        let name = version.name.to_lowercase();
+        if name.contains("paper") { return "Paper".to_string(); }
+        if name.contains("spigot") { return "Spigot".to_string(); }
+        if name.contains("bukkit") { return "Bukkit".to_string(); }
+        if name.contains("forge") { return "Forge".to_string(); }
+        if name.contains("fabric") { return "Fabric".to_string(); }
+        if name.contains("neoforge") { return "NeoForge".to_string(); }
+        if name.contains("purpur") { return "Purpur".to_string(); }
+        if name.contains("velocity") { return "Velocity".to_string(); }
+        if name.contains("bungeecord") { return "BungeeCord".to_string(); }
+    }
+    
+    "Vanilla".to_string()
 }
 
 fn parse_json_text(val: &serde_json::Value) -> String {

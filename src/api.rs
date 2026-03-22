@@ -62,6 +62,8 @@ pub struct ServerQuery {
     pub asn_category: Option<String>,
     pub whitelist_prob_min: Option<f64>,
     pub country: Option<String>,
+    pub brand: Option<String>,
+    pub server_type: Option<String>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
     pub cursor_players: Option<i32>,
@@ -82,6 +84,7 @@ pub struct PlayerQuery {
 #[derive(Serialize)]
 pub struct PlayerResponse {
     pub ip: String,
+    pub port: i32,
     pub player_name: String,
     pub last_seen: chrono::NaiveDateTime,
 }
@@ -242,8 +245,8 @@ async fn get_stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let online_servers = state.db.get_online_count().await.unwrap_or(0);
     let total_players = state.db.get_total_players().await.unwrap_or(0);
 
-    let (asn_hosting, asn_residential, asn_unknown) =
-        state.db.get_asn_stats().await.unwrap_or((0, 0, 0));
+    let (asn_hosting, asn_residential, asn_excluded, asn_unknown) =
+        state.db.get_asn_stats_v2().await.unwrap_or((0, 0, 0, 0));
 
     Json(StatsResponse {
         total_servers,
@@ -251,7 +254,7 @@ async fn get_stats(State(state): State<AppState>) -> Json<StatsResponse> {
         total_players,
         asn_hosting,
         asn_residential,
-        asn_unknown,
+        asn_unknown: asn_unknown + asn_excluded, // Group excluded with unknown or add field to StatsResponse
     })
 }
 
@@ -272,6 +275,8 @@ async fn list_servers(
             query.asn_category.as_deref(),
             query.whitelist_prob_min,
             query.country.as_deref(),
+            query.brand.as_deref(),
+            query.server_type.as_deref(),
             query.sort_by.as_deref(),
             query.sort_order.as_deref(),
             query.cursor_players,
@@ -286,11 +291,17 @@ async fn list_servers(
 /// GET /api/server/{ip} - Get server details.
 async fn get_server(
     State(state): State<AppState>,
-    Path(ip): Path<String>,
+    Path(ip_param): Path<String>,
 ) -> Result<Json<Server>, StatusCode> {
+    let (ip, port) = if let Some((i, p)) = ip_param.split_once(':') {
+        (i, p.parse::<i32>().unwrap_or(25565))
+    } else {
+        (ip_param.as_str(), 25565)
+    };
+
     state
         .db
-        .get_server(&ip)
+        .get_server(ip, port)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map(Json)
@@ -300,11 +311,17 @@ async fn get_server(
 /// GET /api/server/{ip}/history - Get historical player count.
 async fn get_server_history(
     State(state): State<AppState>,
-    Path(ip): Path<String>,
+    Path(ip_param): Path<String>,
 ) -> Json<Vec<HistoryResponse>> {
+    let (ip, port) = if let Some((i, p)) = ip_param.split_once(':') {
+        (i, p.parse::<i32>().unwrap_or(25565))
+    } else {
+        (ip_param.as_str(), 25565)
+    };
+
     let history = state
         .db
-        .get_server_history(&ip, 100)
+        .get_server_history(ip, port, 100)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -319,11 +336,17 @@ async fn get_server_history(
 /// GET /api/server/{ip}/players - Get players seen on a server.
 async fn get_server_players(
     State(state): State<AppState>,
-    Path(ip): Path<String>,
+    Path(ip_param): Path<String>,
 ) -> Json<Vec<ServerPlayerResponse>> {
+    let (ip, port) = if let Some((i, p)) = ip_param.split_once(':') {
+        (i, p.parse::<i32>().unwrap_or(25565))
+    } else {
+        (ip_param.as_str(), 25565)
+    };
+
     let players = state
         .db
-        .get_server_players(&ip)
+        .get_server_players(ip, port)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -350,8 +373,9 @@ async fn search_players(
         .await
         .unwrap_or_default()
         .into_iter()
-        .map(|(ip, player_name, last_seen)| PlayerResponse {
+        .map(|(ip, port, player_name, last_seen)| PlayerResponse {
             ip,
+            port,
             player_name,
             last_seen,
         })
@@ -361,16 +385,24 @@ async fn search_players(
 
 /// GET /api/asns - List all ASNs.
 async fn list_asns(State(state): State<AppState>) -> Json<Vec<AsnResponse>> {
-    let asns: Vec<crate::asn::AsnRecord> = state.db.get_all_asns().await.unwrap_or_default();
+    let asns: Vec<crate::asn::AsnRecord> = state.db.get_asn_list_with_counts().await.unwrap_or_default();
 
     let responses: Vec<AsnResponse> = asns
         .into_iter()
-        .map(|asn| AsnResponse {
-            asn: asn.asn,
-            org: asn.org,
-            category: format!("{:?}", asn.category),
-            country: asn.country,
-            server_count: 0, // Would need to query servers by ASN
+        .map(|asn| {
+            let category = match asn.category {
+                crate::asn::AsnCategory::Hosting => "Hosting",
+                crate::asn::AsnCategory::Residential => "Residential",
+                crate::asn::AsnCategory::Excluded => "Excluded",
+                crate::asn::AsnCategory::Unknown => "Unknown",
+            };
+            AsnResponse {
+                asn: asn.asn,
+                org: asn.org,
+                category: category.to_string(),
+                country: asn.country,
+                server_count: asn.server_count,
+            }
         })
         .collect();
 
@@ -389,12 +421,8 @@ async fn get_asn(
         .find(|a| a.asn == asn)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Count servers in this ASN's ranges
-    let ranges = state.db.get_all_asn_ranges().await.unwrap_or_default();
-    let server_count = ranges
-        .iter()
-        .filter(|r| r.asn == asn)
-        .count() as i64;
+    // Count servers in this ASN
+    let server_count = state.db.get_server_count_by_asn(&asn).await.unwrap_or(0);
 
     Ok(Json(AsnResponse {
         asn: asn_record.asn,
@@ -478,12 +506,13 @@ async fn trigger_test_scan(
     };
 
     for (ip, port, _name, host) in &test_servers {
-        let mut target = crate::scheduler::ServerTarget::new(ip.clone(), *port);
+        let server_type = if *port == 19132 { "bedrock" } else { "java" };
+        let mut target = crate::scheduler::ServerTarget::new(ip.clone(), *port, server_type.to_string());
         target.category = AsnCategory::Hosting;
         target.priority = 1;
         target.hostname = Some(host.clone());
         
-        let _ = state.db.insert_server_if_new(ip, *port as i32).await;
+        let _ = state.db.insert_server_if_new(ip, *port as i32, server_type).await;
         state.scheduler.add_server(target, true).await;
     }
 
