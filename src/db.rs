@@ -30,6 +30,8 @@ pub struct Server {
     pub last_seen: Option<NaiveDateTime>,
     pub consecutive_failures: i32,
     pub whitelist_prob: f64,
+    pub asn: Option<String>,
+    pub country: Option<String>,
 }
 
 /// ASN record from database.
@@ -112,12 +114,18 @@ impl Database {
                 priority INTEGER DEFAULT 2,
                 last_seen TIMESTAMP,
                 consecutive_failures INTEGER DEFAULT 0,
-                whitelist_prob REAL DEFAULT 0.0
+                whitelist_prob REAL DEFAULT 0.0,
+                asn TEXT,
+                country TEXT
             )
             "#,
         )
         .execute(pool)
         .await?;
+
+        // Attempt to add new columns if table already exists (ignore errors if they already exist)
+        let _ = sqlx::query("ALTER TABLE servers ADD COLUMN asn TEXT;").execute(pool).await;
+        let _ = sqlx::query("ALTER TABLE servers ADD COLUMN country TEXT;").execute(pool).await;
 
         // Player tracking
         sqlx::query(
@@ -219,8 +227,8 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO servers (ip, port, status, players_online, players_max, motd, version, 
-                                priority, last_seen, consecutive_failures, whitelist_prob)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                priority, last_seen, consecutive_failures, whitelist_prob, asn, country)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ip) DO UPDATE SET
                 port = excluded.port,
                 status = excluded.status,
@@ -231,7 +239,9 @@ impl Database {
                 priority = excluded.priority,
                 last_seen = excluded.last_seen,
                 consecutive_failures = excluded.consecutive_failures,
-                whitelist_prob = excluded.whitelist_prob
+                whitelist_prob = excluded.whitelist_prob,
+                asn = excluded.asn,
+                country = excluded.country
             "#,
         )
         .bind(&server.ip)
@@ -245,6 +255,8 @@ impl Database {
         .bind(server.last_seen)
         .bind(server.consecutive_failures)
         .bind(server.whitelist_prob)
+        .bind(&server.asn)
+        .bind(&server.country)
         .execute(&self.pool)
         .await?;
 
@@ -288,12 +300,22 @@ impl Database {
         Ok(servers)
     }
 
-    /// Get all servers with optional status filter and search query.
     pub async fn get_all_servers(
         &self,
         status_filter: Option<&str>,
         search_query: Option<&str>,
         limit: i32,
+        min_players: Option<i32>,
+        max_players: Option<i32>,
+        version: Option<&str>,
+        asn_category: Option<&str>,
+        whitelist_prob_min: Option<f64>,
+        country: Option<&str>,
+        sort_by: Option<&str>,
+        sort_order: Option<&str>,
+        cursor_players: Option<i32>,
+        cursor_ip: Option<&str>,
+        cursor_last_seen: Option<NaiveDateTime>,
     ) -> Result<Vec<Server>, DatabaseError> {
         let mut query = String::from("SELECT * FROM servers WHERE 1=1");
         
@@ -302,17 +324,100 @@ impl Database {
         }
 
         if let Some(search) = search_query {
-            // Very simple SQL injection protection for the LIKE clause by replacing '
             let safe_search = search.replace("'", "''");
             query.push_str(&format!(" AND (ip LIKE '%{}%' OR motd LIKE '%{}%' OR version LIKE '%{}%')", safe_search, safe_search, safe_search));
         }
+        
+        if let Some(min_p) = min_players {
+            query.push_str(&format!(" AND players_online >= {}", min_p));
+        }
+        
+        if let Some(max_p) = max_players {
+            query.push_str(&format!(" AND players_online <= {}", max_p));
+        }
+        
+        if let Some(ver) = version {
+            let safe_ver = ver.replace("'", "''");
+            query.push_str(&format!(" AND version LIKE '%{}%'", safe_ver));
+        }
+        
+        if let Some(prob) = whitelist_prob_min {
+            query.push_str(&format!(" AND whitelist_prob >= {}", prob));
+        }
 
-        query.push_str(&format!(" ORDER BY players_online DESC LIMIT {}", limit));
+        if let Some(cat) = asn_category {
+            let safe_cat = cat.replace("'", "''");
+            query.push_str(&format!(" AND asn IN (SELECT asn FROM asns WHERE category = '{}')", safe_cat));
+        }
+        
+        if let Some(c) = country {
+            let safe_c = c.replace("'", "''");
+            query.push_str(&format!(" AND country = '{}'", safe_c));
+        }
+
+        let sort_col = match sort_by {
+            Some("players") => "players_online",
+            Some("last_seen") => "last_seen",
+            Some("ip") => "ip",
+            _ => "players_online",
+        };
+
+        let order = match sort_order {
+            Some("asc") => "ASC",
+            _ => "DESC",
+        };
+
+        // Pagination: Cursor-based
+        if let Some(c_ip) = cursor_ip {
+            let safe_c_ip = c_ip.replace("'", "''");
+            match sort_col {
+                "players_online" => {
+                    if let Some(c_val) = cursor_players {
+                        if order == "DESC" {
+                            query.push_str(&format!(" AND (players_online < {} OR (players_online = {} AND ip > '{}'))", c_val, c_val, safe_c_ip));
+                        } else {
+                            query.push_str(&format!(" AND (players_online > {} OR (players_online = {} AND ip > '{}'))", c_val, c_val, safe_c_ip));
+                        }
+                    }
+                }
+                "last_seen" => {
+                    if let Some(c_val) = cursor_last_seen {
+                        let c_val_str = c_val.format("%Y-%m-%d %H:%M:%S").to_string();
+                        if order == "DESC" {
+                            query.push_str(&format!(" AND (last_seen < '{}' OR (last_seen = '{}' AND ip > '{}'))", c_val_str, c_val_str, safe_c_ip));
+                        } else {
+                            query.push_str(&format!(" AND (last_seen > '{}' OR (last_seen = '{}' AND ip > '{}'))", c_val_str, c_val_str, safe_c_ip));
+                        }
+                    }
+                }
+                "ip" => {
+                    if order == "DESC" {
+                        query.push_str(&format!(" AND ip < '{}'", safe_c_ip));
+                    } else {
+                        query.push_str(&format!(" AND ip > '{}'", safe_c_ip));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        query.push_str(&format!(" ORDER BY {} {}, ip ASC LIMIT {}", sort_col, order, limit));
 
         let servers = sqlx::query_as::<_, Server>(&query)
             .fetch_all(&self.pool)
             .await?;
         Ok(servers)
+    }
+
+    /// Get players for a specific server
+    pub async fn get_server_players(&self, ip: &str) -> Result<Vec<(String, String, NaiveDateTime)>, DatabaseError> {
+        let rows = sqlx::query_as::<_, (String, String, NaiveDateTime)>(
+            "SELECT player_name, player_uuid, last_seen FROM server_players WHERE ip = ? ORDER BY last_seen DESC LIMIT 100"
+        )
+        .bind(ip)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Get player count history for a server

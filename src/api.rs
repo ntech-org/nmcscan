@@ -56,6 +56,17 @@ pub struct ServerQuery {
     pub limit: i32,
     pub status: Option<String>,
     pub search: Option<String>,
+    pub min_players: Option<i32>,
+    pub max_players: Option<i32>,
+    pub version: Option<String>,
+    pub asn_category: Option<String>,
+    pub whitelist_prob_min: Option<f64>,
+    pub country: Option<String>,
+    pub sort_by: Option<String>,
+    pub sort_order: Option<String>,
+    pub cursor_players: Option<i32>,
+    pub cursor_ip: Option<String>,
+    pub cursor_last_seen: Option<chrono::NaiveDateTime>,
 }
 
 fn default_limit() -> i32 {
@@ -72,6 +83,13 @@ pub struct PlayerQuery {
 pub struct PlayerResponse {
     pub ip: String,
     pub player_name: String,
+    pub last_seen: chrono::NaiveDateTime,
+}
+
+#[derive(Serialize)]
+pub struct ServerPlayerResponse {
+    pub player_name: String,
+    pub player_uuid: String,
     pub last_seen: chrono::NaiveDateTime,
 }
 
@@ -180,6 +198,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/servers", get(list_servers))
         .route("/server/{ip}", get(get_server))
         .route("/server/{ip}/history", get(get_server_history))
+        .route("/server/{ip}/players", get(get_server_players))
         .route("/players", get(search_players))
         .route("/asns", get(list_asns))
         .route("/asns/{asn}", get(get_asn))
@@ -243,7 +262,22 @@ async fn list_servers(
 ) -> Json<Vec<Server>> {
     let servers = state
         .db
-        .get_all_servers(query.status.as_deref(), query.search.as_deref(), query.limit)
+        .get_all_servers(
+            query.status.as_deref(),
+            query.search.as_deref(),
+            query.limit,
+            query.min_players,
+            query.max_players,
+            query.version.as_deref(),
+            query.asn_category.as_deref(),
+            query.whitelist_prob_min,
+            query.country.as_deref(),
+            query.sort_by.as_deref(),
+            query.sort_order.as_deref(),
+            query.cursor_players,
+            query.cursor_ip.as_deref(),
+            query.cursor_last_seen,
+        )
         .await
         .unwrap_or_default();
     Json(servers)
@@ -280,6 +314,26 @@ async fn get_server_history(
         })
         .collect();
     Json(history)
+}
+
+/// GET /api/server/{ip}/players - Get players seen on a server.
+async fn get_server_players(
+    State(state): State<AppState>,
+    Path(ip): Path<String>,
+) -> Json<Vec<ServerPlayerResponse>> {
+    let players = state
+        .db
+        .get_server_players(&ip)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(player_name, player_uuid, last_seen)| ServerPlayerResponse {
+            player_name,
+            player_uuid,
+            last_seen,
+        })
+        .collect();
+    Json(players)
 }
 
 /// GET /api/players - Search for a player.
