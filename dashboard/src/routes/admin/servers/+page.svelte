@@ -39,6 +39,7 @@
     let whitelistProbMin = $state<number | null>(page.url.searchParams.has('whitelist_prob_min') ? Number(page.url.searchParams.get('whitelist_prob_min')) : null);
     let asnCategory = $state(page.url.searchParams.get('asn_category') || 'all');
     let countryFilter = $state(page.url.searchParams.get('country') || '');
+    let asnFilter = $state(page.url.searchParams.get('asn') || '');
     let serverTypeFilter = $state(page.url.searchParams.get('server_type') || 'all');
     let sortBy = $state(page.url.searchParams.get('sort_by') || 'players');
     let sortOrder = $state(page.url.searchParams.get('sort_order') || 'desc');
@@ -68,6 +69,7 @@
             if (whitelistProbMin !== null) params.set('whitelist_prob_min', whitelistProbMin.toString());
             if (asnCategory !== 'all') params.set('asn_category', asnCategory);
             if (countryFilter) params.set('country', countryFilter);
+            if (asnFilter) params.set('asn', asnFilter);
             params.set('sort_by', sortBy);
             params.set('sort_order', sortOrder);
 
@@ -234,6 +236,10 @@
             <div>
                 <label for="countryFilter" class="block text-xs font-medium text-gray-500 uppercase mb-1">Country (ISO)</label>
                 <input id="countryFilter" type="text" bind:value={countryFilter} oninput={onFilterChange} placeholder="US, DE, etc." class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:border-blue-500 outline-none" />
+            </div>
+            <div>
+                <label for="asnFilter" class="block text-xs font-medium text-gray-500 uppercase mb-1">Specific ASN</label>
+                <input id="asnFilter" type="text" bind:value={asnFilter} oninput={onFilterChange} placeholder="AS12345" class="w-full bg-gray-950 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:border-blue-500 outline-none" />
             </div>
         </div>
     </div>

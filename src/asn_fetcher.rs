@@ -5,19 +5,24 @@
 
 use crate::asn::{AsnCategory, AsnError, AsnManager, AsnRecord};
 use crate::db::Database;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time;
 use tracing;
 use std::path::Path;
 use std::fs;
+use std::io::Read;
 use maxminddb::Reader;
+use flate2::read::GzDecoder;
 
 /// Path where MaxMind databases are stored.
 const DB_DIR: &str = "data/maxmind";
 const ASN_DB_PATH: &str = "data/maxmind/GeoLite2-ASN.mmdb";
 const COUNTRY_DB_PATH: &str = "data/maxmind/GeoLite2-Country.mmdb";
+
+/// URL for full ASN database from iptoasn.com
+const FULL_ASN_URL: &str = "https://iptoasn.com/data/ip2asn-v4.tsv.gz";
 
 /// URLs for downloading the databases (using a public mirror or requires license key).
 /// Note: Standard GeoLite2 requires a license key now.
@@ -155,6 +160,110 @@ impl AsnFetcher {
         Ok(())
     }
 
+    /// Import the full ASN database from iptoasn.com to discover all providers globally.
+    pub async fn import_full_database(&self) -> Result<(), AsnError> {
+        tracing::info!("Downloading full ASN database from iptoasn.com...");
+        let response = self.client.get(FULL_ASN_URL).send().await?;
+        if !response.status().is_success() {
+            return Err(AsnError::MaxMindError(format!("Failed to download ASN DB: {}", response.status())));
+        }
+
+        let bytes = response.bytes().await?;
+        let decoder = GzDecoder::new(&bytes[..]);
+        let mut tsv_content = String::new();
+        let mut gz_reader = decoder;
+        gz_reader.read_to_string(&mut tsv_content).map_err(|e| AsnError::MaxMindError(format!("Gzip error: {}", e)))?;
+
+        tracing::info!("Parsing global ASN data ({} entries)...", tsv_content.lines().count());
+        
+        // Group entries by ASN to reduce categorization calls
+        let mut asn_map: std::collections::HashMap<String, (String, String, Vec<String>)> = std::collections::HashMap::new();
+        let mut ranges = Vec::new();
+
+        for line in tsv_content.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 5 { continue; }
+
+            let range_start = parts[0];
+            let range_end = parts[1];
+            let asn = format!("AS{}", parts[2]);
+            let country = parts[3];
+            let org = parts[4];
+
+            if !asn_map.contains_key(&asn) {
+                asn_map.insert(asn.clone(), (org.to_string(), country.to_string(), Vec::new()));
+            }
+            
+            // Try to convert range to CIDR
+            if let (Ok(start), Ok(end)) = (range_start.parse::<std::net::Ipv4Addr>(), range_end.parse::<std::net::Ipv4Addr>()) {
+                // Approximate with /24 if it's large enough, or just use the start IP
+                // A better approach would be CIDR decomposition, but /24 is our discovery unit.
+                let start_octets = start.octets();
+                let end_octets = end.octets();
+                
+                // Add first /24 of the range
+                let cidr = format!("{}.{}.{}.0/24", start_octets[0], start_octets[1], start_octets[2]);
+                ranges.push((cidr, asn.clone()));
+
+                // If range is large (e.g. /16), add a middle /24 too to increase coverage
+                if start_octets[1] != end_octets[1] || (end_octets[2] as i16 - start_octets[2] as i16) > 10 {
+                    let mid_cidr = format!("{}.{}.{}.0/24", start_octets[0], start_octets[1], start_octets[2] + 5);
+                    ranges.push((mid_cidr, asn));
+                }
+            }
+        }
+
+        tracing::info!("Importing {} ASNs and {} discovery ranges into database...", asn_map.len(), ranges.len());
+        
+        let mut tx = self.db.pool().begin().await.map_err(|e| AsnError::MaxMindError(format!("Transaction start error: {}", e)))?;
+
+        // Bulk upsert ASNs
+        for (asn, (org, country, _)) in asn_map {
+            let (category, tags) = AsnManager::categorize_by_org(&org);
+            let tags_str = tags.join(",");
+            sqlx::query(
+                r#"
+                INSERT INTO asns (asn, org, category, country, tags, last_updated)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(asn) DO UPDATE SET
+                    org = excluded.org, 
+                    category = excluded.category, 
+                    country = COALESCE(excluded.country, asns.country), 
+                    tags = COALESCE(excluded.tags, asns.tags),
+                    last_updated = CURRENT_TIMESTAMP
+                "#,
+            )
+            .bind(asn)
+            .bind(org)
+            .bind(match category {
+                AsnCategory::Hosting => "hosting",
+                AsnCategory::Residential => "residential",
+                AsnCategory::Excluded => "excluded",
+                AsnCategory::Unknown => "unknown",
+            })
+            .bind(country)
+            .bind(tags_str)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AsnError::MaxMindError(format!("ASN bulk error: {}", e)))?;
+        }
+
+        // Bulk upsert ranges
+        for (cidr, asn) in ranges {
+            sqlx::query("INSERT INTO asn_ranges (cidr, asn) VALUES (?, ?) ON CONFLICT(cidr) DO UPDATE SET asn = excluded.asn")
+                .bind(cidr)
+                .bind(asn)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AsnError::MaxMindError(format!("Range bulk error: {}", e)))?;
+        }
+
+        tx.commit().await.map_err(|e| AsnError::MaxMindError(format!("Transaction commit error: {}", e)))?;
+
+        tracing::info!("Global ASN discovery sync complete.");
+        Ok(())
+    }
+
     /// Fetch ASN and Country data for a single IP using local MaxMind databases.
     pub async fn fetch_asn_for_ip(&self, ip: &str) -> Result<AsnRecord, AsnError> {
         let ip_addr: std::net::IpAddr = ip.parse().map_err(|_| AsnError::AsnNotFound)?;
@@ -189,7 +298,7 @@ impl AsnFetcher {
 
         let asn = asn_val.unwrap_or_else(|| "AS0".to_string());
         let org = org_val.unwrap_or_else(|| "Unknown".to_string());
-        let category = AsnManager::categorize_by_org(&org);
+        let (category, tags) = AsnManager::categorize_by_org(&org);
 
         let record = AsnRecord {
             asn: asn.clone(),
@@ -198,6 +307,7 @@ impl AsnFetcher {
             country: country_code,
             last_updated: Some(Utc::now()),
             server_count: 0,
+            tags: tags.clone(),
         };
 
         // Save to SQLite cache for fast dashboard listing
@@ -211,7 +321,21 @@ impl AsnFetcher {
                 AsnCategory::Unknown => "unknown",
             },
             record.country.as_deref(),
+            Some(tags),
         ).await;
+
+        // Add range to manager if it's IPv4. 
+        // Since lookup_prefix is missing in this context, we jumpstart by adding a /24 range.
+        if let std::net::IpAddr::V4(v4) = ip_addr {
+            let octets = v4.octets();
+            if let Ok(network) = ipnetwork::Ipv4Network::new(std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], 0), 24) {
+                let cidr = network.to_string();
+                let mut manager = self.asn_manager.write().await;
+                manager.add_range(cidr.clone(), asn.clone());
+                // Also save range to DB
+                let _ = self.db.upsert_asn_range(&cidr, &asn).await;
+            }
+        }
 
         // Add to in-memory manager
         let mut manager = self.asn_manager.write().await;
@@ -222,15 +346,16 @@ impl AsnFetcher {
 
     /// Background task to periodically update databases.
     pub async fn run_background_refresh(self: Arc<Self>) {
-        tracing::info!("Starting MaxMind background update task");
+        tracing::info!("Starting ASN intelligence background update task");
 
         let mut interval = time::interval(time::Duration::from_secs(86400 * 7)); // Weekly
 
         loop {
             interval.tick().await;
-            tracing::info!("Checking for MaxMind database updates...");
+            tracing::info!("Performing weekly ASN intelligence sync...");
             
             let mut updated = false;
+            // 1. Update MaxMind
             if let Ok(_) = self.download_db(ASN_DB_URL, ASN_DB_PATH).await {
                 updated = true;
             }
@@ -242,6 +367,9 @@ impl AsnFetcher {
                 let _ = self.reload_readers().await;
                 tracing::info!("MaxMind databases reloaded.");
             }
+
+            // 2. Refresh Full ASN Discovery Database
+            let _ = self.import_full_database().await;
         }
     }
 }

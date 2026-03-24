@@ -42,6 +42,8 @@
         whitelist_prob: number;
         asn?: string | null;
         country?: string | null;
+        asn_org?: string | null;
+        asn_tags?: string[];
     }
 
     interface HistoryResponse {
@@ -166,6 +168,16 @@
             default: return 'text-gray-400 bg-gray-400/10 border-gray-500/20';
         }
     }
+
+    function getTagColor(tag: string): string {
+        const t = tag.toLowerCase();
+        if (t.includes('ddos')) return 'text-red-400 bg-red-400/10 border-red-500/20';
+        if (t.includes('cloud')) return 'text-purple-400 bg-purple-400/10 border-purple-500/20';
+        if (t.includes('cdn')) return 'text-teal-400 bg-teal-400/10 border-teal-500/20';
+        if (t.includes('vpn') || t.includes('proxy')) return 'text-yellow-400 bg-yellow-400/10 border-yellow-500/20';
+        if (t.includes('defense') || t.includes('security')) return 'text-red-500 bg-red-500/10 border-red-600/20';
+        return 'text-gray-400 bg-gray-400/10 border-gray-500/20';
+    }
 </script>
 
 <div class="space-y-6">
@@ -220,16 +232,38 @@
                         </div>
                         <div class="flex justify-between pb-3 border-b border-gray-800/50">
                             <dt class="text-gray-500">Network (ASN)</dt>
-                            <dd class="text-gray-200 text-right truncate max-w-[150px]" title={server.asn || ''}>{server.asn || 'Unknown'}</dd>
+                            <dd class="text-gray-200 text-right">
+                                {#if server.asn}
+                                    <div class="flex flex-col items-end gap-1">
+                                        <a href={`/admin/servers?asn=${server.asn}`} class="text-blue-400 hover:text-blue-300 hover:underline font-mono">
+                                            {server.asn}
+                                        </a>
+                                        {#if server.asn_org}
+                                            <span class="text-xs text-gray-400 truncate max-w-[180px]" title={server.asn_org}>{server.asn_org}</span>
+                                        {/if}
+                                        {#if server.asn_tags && server.asn_tags.length > 0}
+                                            <div class="flex flex-wrap justify-end gap-1 mt-0.5">
+                                                {#each server.asn_tags as tag}
+                                                    <span class="px-1.5 py-0.5 rounded-md border {getTagColor(tag)} text-[9px] font-bold uppercase tracking-tight">
+                                                        {tag}
+                                                    </span>
+                                                {/each}
+                                            </div>
+                                        {/if}
+                                    </div>
+                                {:else}
+                                    Unknown
+                                {/if}
+                            </dd>
                         </div>
                         <div class="flex justify-between">
                             <dt class="text-gray-500">Country</dt>
                             <dd class="text-gray-200">
                                 {#if server.country}
-                                    <div class="flex items-center gap-2">
+                                    <a href={`/admin/servers?country=${server.country}`} class="flex items-center gap-2 hover:text-blue-400 transition-colors">
                                         <span>{server.country}</span>
                                         <img src={`https://flagcdn.com/20x15/${server.country.toLowerCase()}.png`} alt={server.country} class="rounded shadow-sm" />
-                                    </div>
+                                    </a>
                                 {:else}
                                     Unknown
                                 {/if}

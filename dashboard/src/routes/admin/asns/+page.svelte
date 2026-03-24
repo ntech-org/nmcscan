@@ -8,6 +8,7 @@
         category: string;
         country: string | null;
         server_count: number;
+        tags: string[];
     }
 
     let asns = $state<Asn[]>([]);
@@ -28,8 +29,19 @@
     }
 
     function getCategoryColor(category: string): string {
-        if (category.includes('Hosting')) return 'text-blue-400 bg-blue-400/10 border-blue-500/20';
-        if (category.includes('Residential')) return 'text-orange-400 bg-orange-400/10 border-orange-500/20';
+        const cat = category.toLowerCase();
+        if (cat.includes('hosting')) return 'text-blue-400 bg-blue-400/10 border-blue-500/20';
+        if (cat.includes('residential')) return 'text-orange-400 bg-orange-400/10 border-orange-500/20';
+        return 'text-gray-400 bg-gray-400/10 border-gray-500/20';
+    }
+
+    function getTagColor(tag: string): string {
+        const t = tag.toLowerCase();
+        if (t.includes('ddos')) return 'text-red-400 bg-red-400/10 border-red-500/20';
+        if (t.includes('cloud')) return 'text-purple-400 bg-purple-400/10 border-purple-500/20';
+        if (t.includes('cdn')) return 'text-teal-400 bg-teal-400/10 border-teal-500/20';
+        if (t.includes('vpn') || t.includes('proxy')) return 'text-yellow-400 bg-yellow-400/10 border-yellow-500/20';
+        if (t.includes('defense') || t.includes('security')) return 'text-red-500 bg-red-500/10 border-red-600/20';
         return 'text-gray-400 bg-gray-400/10 border-gray-500/20';
     }
 
@@ -70,8 +82,21 @@
                     {/if}
                     {#each asns as asn}
                         <tr class="hover:bg-gray-800/20 transition-colors">
-                            <td class="p-4 font-mono text-sm text-blue-400">{asn.asn}</td>
-                            <td class="p-4 text-sm text-gray-200">{asn.org}</td>
+                            <td class="p-4 font-mono text-sm">
+                                <a href={`/admin/servers?asn=${asn.asn}`} class="text-blue-400 hover:text-blue-300 hover:underline">
+                                    {asn.asn}
+                                </a>
+                            </td>
+                            <td class="p-4 text-sm text-gray-200">
+                                <div class="font-medium">{asn.org}</div>
+                                <div class="flex flex-wrap gap-1 mt-1">
+                                    {#each asn.tags as tag}
+                                        <span class="px-1.5 py-0.5 rounded-md border {getTagColor(tag)} text-[10px] font-bold uppercase tracking-tight">
+                                            {tag}
+                                        </span>
+                                    {/each}
+                                </div>
+                            </td>
                             <td class="p-4">
                                 <span class="inline-flex items-center px-2.5 py-0.5 rounded-full border {getCategoryColor(asn.category)} text-xs font-medium">
                                     {asn.category}

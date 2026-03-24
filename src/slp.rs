@@ -347,6 +347,21 @@ pub fn extract_brand(status: &ServerStatus) -> String {
         if name.contains("purpur") { return "Purpur".to_string(); }
         if name.contains("velocity") { return "Velocity".to_string(); }
         if name.contains("bungeecord") { return "BungeeCord".to_string(); }
+        
+        // Advanced Vanilla Check:
+        // Vanilla version strings are usually just "1.x.y" or "1.x".
+        // If it contains spaces, ranges (1.8x - 1.21), or extra text, it's almost certainly a proxy (Bungee/Velocity) 
+        // or a custom implementation (Hypixel).
+        let is_suspicious = version.name.contains(' ') || 
+                           version.name.contains(" - ") || 
+                           version.name.contains("Requires") ||
+                           version.name.contains(',') ||
+                           version.name.contains('x') ||
+                           version.name.len() > 10; // "1.20.4-rc1" is 10 chars. Anything longer is likely non-vanilla.
+
+        if is_suspicious {
+            return "Unknown".to_string();
+        }
     }
     
     "Vanilla".to_string()

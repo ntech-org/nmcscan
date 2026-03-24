@@ -7,7 +7,6 @@
 
 use crate::db::Database;
 use crate::exclude::ExcludeManager;
-use crate::slp::ping_server;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -17,7 +16,7 @@ use tracing;
 use crate::asn_fetcher::AsnFetcher;
 
 /// Maximum concurrent scan tasks.
-const MAX_CONCURRENCY: usize = 1000;
+const MAX_CONCURRENCY: usize = 2500;
 
 /// Connections per second limit.
 const RATE_LIMIT_PER_SEC: u64 = 100;
@@ -46,16 +45,15 @@ impl RateLimiter {
             semaphore: Semaphore::new(rps as usize),
         });
 
-        // Background task to refill tokens 10 times per second for smoother flow
+        // Background task to refill tokens frequently for smooth flow
         let limiter_clone = Arc::clone(&limiter);
         tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_millis(100));
-            let rps_per_tick = (rps as f64 / 10.0).max(1.0) as usize;
+            // Refill every 50ms for smoother distribution
+            let mut interval = time::interval(Duration::from_millis(50));
+            let rps_per_tick = (rps as f64 / 20.0).max(1.0) as usize;
             loop {
                 interval.tick().await;
                 let current_permits = limiter_clone.semaphore.available_permits();
-                
-                // Only add if we are below the target burst capacity (rps)
                 if current_permits < rps as usize {
                     let to_add = std::cmp::min(rps_per_tick, rps as usize - current_permits);
                     if to_add > 0 {
@@ -69,12 +67,8 @@ impl RateLimiter {
     }
 
     async fn acquire(&self) {
-        match self.semaphore.acquire().await {
-            Ok(permit) => permit.forget(), // Consume the token
-            Err(_) => {
-                // Should not happen unless semaphore is closed
-                time::sleep(Duration::from_millis(100)).await;
-            }
+        if let Ok(permit) = self.semaphore.acquire().await {
+            permit.forget();
         }
     }
 }
@@ -87,7 +81,7 @@ impl Scanner {
         rps: u64,
     ) -> Self {
         let cold_rps = (rps / 10).max(1);
-        let concurrency = (rps * 10) as usize; // Allow more concurrency to absorb latencies
+        let concurrency = 2500; 
         Self {
             semaphore: Arc::new(Semaphore::new(concurrency)),
             rate_limiter: RateLimiter::new(rps),
@@ -103,7 +97,7 @@ impl Scanner {
     /// # Safety
     /// - Checks exclude list BEFORE any connection
     /// - If excluded, SKIP immediately (no log, no ping)
-    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>, priority: i32, is_discovery: bool, server_type: &str) -> (bool, bool) {
+    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>, priority: i32, _is_discovery: bool, server_type: &str) -> (bool, bool) {
         // Parse IP
         let ip_addr: IpAddr = match ip.parse() {
             Ok(addr) => addr,
@@ -151,21 +145,24 @@ impl Scanner {
                 let brand = Some(crate::slp::extract_brand(&status));
 
                 // DATA ENRICHMENT: If we don't have ASN info for this IP, fetch it now
-                let asn_manager = self.asn_fetcher.asn_manager();
-                let has_asn = {
+                let mut asn_record = {
+                    let asn_manager = self.asn_fetcher.asn_manager();
+                    let manager = asn_manager.read().await;
                     if let IpAddr::V4(v4) = ip_addr {
-                        asn_manager.read().await.get_asn_for_ip(v4).is_some()
+                        manager.get_asn_for_ip(v4).cloned()
                     } else {
-                        false
+                        None
                     }
                 };
 
-                if !has_asn {
-                    tracing::debug!("Fetching missing ASN info for new discovery: {}", ip);
-                    let _ = self.asn_fetcher.fetch_asn_for_ip(ip).await;
+                if asn_record.is_none() {
+                    tracing::debug!("Fetching missing ASN info for discovery: {}", ip);
+                    if let Ok(record) = self.asn_fetcher.fetch_asn_for_ip(ip).await {
+                        asn_record = Some(record);
+                    }
                 }
 
-                let is_new = match self.db.mark_online(ip, port as i32, server_type, players_online, players_max, motd, version, players_sample, favicon, brand, Some(asn_manager)).await {
+                let is_new = match self.db.mark_online(ip, port as i32, server_type, players_online, players_max, motd, version, players_sample, favicon, brand, asn_record).await {
                     Ok(new) => new,
                     Err(e) => {
                         tracing::error!("Failed to update DB for {}:{}: {}", ip, port, e);
@@ -179,12 +176,25 @@ impl Scanner {
                 // Server is offline or unreachable
                 tracing::debug!("Server {}:{} is offline: {}", ip, port, e);
                 
-                // PERFORMANCE OPTIMIZATION: If it was a discovery target and it's offline, 
-                // DO NOT tell the database. We only want online servers in our DB.
-                if !is_discovery {
-                    if let Err(e) = self.db.mark_offline(ip, port as i32).await {
-                        tracing::error!("Failed to update DB for {}:{}: {}", ip, port, e);
+                // DATA ENRICHMENT: Even for offline servers, we want to know their ASN for categorization
+                let mut asn_record = {
+                    let asn_manager = self.asn_fetcher.asn_manager();
+                    let manager = asn_manager.read().await;
+                    if let IpAddr::V4(v4) = ip_addr {
+                        manager.get_asn_for_ip(v4).cloned()
+                    } else {
+                        None
                     }
+                };
+
+                if asn_record.is_none() {
+                    if let Ok(record) = self.asn_fetcher.fetch_asn_for_ip(ip).await {
+                        asn_record = Some(record);
+                    }
+                }
+
+                if let Err(e) = self.db.mark_offline(ip, port as i32, Some(server_type), asn_record).await {
+                    tracing::error!("Failed to update DB for {}:{}: {}", ip, port, e);
                 }
                 
                 (false, false)

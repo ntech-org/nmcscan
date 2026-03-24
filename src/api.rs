@@ -28,6 +28,28 @@ use std::sync::Arc;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 
+#[derive(Serialize)]
+pub struct ServerResponse {
+    pub ip: String,
+    pub port: i32,
+    pub server_type: String,
+    pub status: String,
+    pub players_online: i32,
+    pub players_max: i32,
+    pub motd: Option<String>,
+    pub version: Option<String>,
+    pub priority: i32,
+    pub last_seen: Option<chrono::NaiveDateTime>,
+    pub consecutive_failures: i32,
+    pub whitelist_prob: f64,
+    pub asn: Option<String>,
+    pub country: Option<String>,
+    pub favicon: Option<String>,
+    pub brand: Option<String>,
+    pub asn_org: Option<String>,
+    pub asn_tags: Vec<String>,
+}
+
 use crate::db::{Database, Server};
 use crate::scheduler::Scheduler;
 use crate::exclude::ExcludeManager;
@@ -38,6 +60,7 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub scheduler: Arc<Scheduler>,
     pub exclude_list: Arc<ExcludeManager>,
+    pub asn_manager: Arc<tokio::sync::RwLock<crate::asn::AsnManager>>,
     pub api_key: Option<String>,
     pub contact_email: Option<String>,
     pub discord_link: Option<String>,
@@ -69,6 +92,7 @@ pub struct ServerQuery {
     pub cursor_players: Option<i32>,
     pub cursor_ip: Option<String>,
     pub cursor_last_seen: Option<chrono::NaiveDateTime>,
+    pub asn: Option<String>,
 }
 
 fn default_limit() -> i32 {
@@ -160,6 +184,7 @@ pub struct AsnResponse {
     pub category: String,
     pub country: Option<String>,
     pub server_count: i64,
+    pub tags: Vec<String>,
 }
 
 /// Exclude list entry.
@@ -262,7 +287,7 @@ async fn get_stats(State(state): State<AppState>) -> Json<StatsResponse> {
 async fn list_servers(
     State(state): State<AppState>,
     Query(query): Query<ServerQuery>,
-) -> Json<Vec<Server>> {
+) -> Json<Vec<ServerResponse>> {
     let servers = state
         .db
         .get_all_servers(
@@ -282,30 +307,40 @@ async fn list_servers(
             query.cursor_players,
             query.cursor_ip.as_deref(),
             query.cursor_last_seen,
+            query.asn.as_deref(),
         )
         .await
         .unwrap_or_default();
-    Json(servers)
+
+    let manager = state.asn_manager.read().await;
+    let responses = servers
+        .into_iter()
+        .map(|s| enrich_server_response_sync(&manager, s))
+        .collect();
+    
+    Json(responses)
 }
 
 /// GET /api/server/{ip} - Get server details.
 async fn get_server(
     State(state): State<AppState>,
     Path(ip_param): Path<String>,
-) -> Result<Json<Server>, StatusCode> {
+) -> Result<Json<ServerResponse>, StatusCode> {
     let (ip, port) = if let Some((i, p)) = ip_param.split_once(':') {
         (i, p.parse::<i32>().unwrap_or(25565))
     } else {
         (ip_param.as_str(), 25565)
     };
 
-    state
+    let server = state
         .db
         .get_server(ip, port)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let manager = state.asn_manager.read().await;
+    Ok(Json(enrich_server_response_sync(&manager, server)))
 }
 
 /// GET /api/server/{ip}/history - Get historical player count.
@@ -383,6 +418,39 @@ async fn search_players(
     Json(players)
 }
 
+fn enrich_server_response_sync(manager: &crate::asn::AsnManager, server: Server) -> ServerResponse {
+    let mut asn_org = None;
+    let mut asn_tags = Vec::new();
+
+    if let Some(asn_num) = &server.asn {
+        if let Some(asn) = manager.get_asn(asn_num) {
+            asn_org = Some(asn.org.clone());
+            asn_tags = asn.tags.clone();
+        }
+    }
+
+    ServerResponse {
+        ip: server.ip,
+        port: server.port,
+        server_type: server.server_type,
+        status: server.status,
+        players_online: server.players_online,
+        players_max: server.players_max,
+        motd: server.motd,
+        version: server.version,
+        priority: server.priority,
+        last_seen: server.last_seen,
+        consecutive_failures: server.consecutive_failures,
+        whitelist_prob: server.whitelist_prob,
+        asn: server.asn,
+        country: server.country,
+        favicon: server.favicon,
+        brand: server.brand,
+        asn_org,
+        asn_tags,
+    }
+}
+
 /// GET /api/asns - List all ASNs.
 async fn list_asns(State(state): State<AppState>) -> Json<Vec<AsnResponse>> {
     let asns: Vec<crate::asn::AsnRecord> = state.db.get_asn_list_with_counts().await.unwrap_or_default();
@@ -402,6 +470,7 @@ async fn list_asns(State(state): State<AppState>) -> Json<Vec<AsnResponse>> {
                 category: category.to_string(),
                 country: asn.country,
                 server_count: asn.server_count,
+                tags: asn.tags,
             }
         })
         .collect();
@@ -412,25 +481,28 @@ async fn list_asns(State(state): State<AppState>) -> Json<Vec<AsnResponse>> {
 /// GET /api/asns/{asn} - Get ASN details.
 async fn get_asn(
     State(state): State<AppState>,
-    Path(asn): Path<String>,
+    Path(asn_num): Path<String>,
 ) -> Result<Json<AsnResponse>, StatusCode> {
     let all_asns: Vec<crate::asn::AsnRecord> = state.db.get_all_asns().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let asn_record = all_asns
-        .into_iter()
-        .find(|a| a.asn == asn)
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    // Count servers in this ASN
-    let server_count = state.db.get_server_count_by_asn(&asn).await.unwrap_or(0);
-
-    Ok(Json(AsnResponse {
-        asn: asn_record.asn,
-        org: asn_record.org,
-        category: format!("{:?}", asn_record.category),
-        country: asn_record.country,
-        server_count,
-    }))
+    
+    if let Some(asn) = all_asns.into_iter().find(|a| a.asn == asn_num) {
+        let category = match asn.category {
+            crate::asn::AsnCategory::Hosting => "Hosting",
+            crate::asn::AsnCategory::Residential => "Residential",
+            crate::asn::AsnCategory::Excluded => "Excluded",
+            crate::asn::AsnCategory::Unknown => "Unknown",
+        };
+        Ok(Json(AsnResponse {
+            asn: asn.asn,
+            org: asn.org,
+            category: category.to_string(),
+            country: asn.country,
+            server_count: asn.server_count,
+            tags: asn.tags,
+        }))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 /// GET /api/exclude - Get current exclude list.

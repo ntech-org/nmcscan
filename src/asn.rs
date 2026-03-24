@@ -45,6 +45,8 @@ pub struct AsnRecord {
     pub country: Option<String>,
     pub last_updated: Option<DateTime<Utc>>,
     pub server_count: i64,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// IP range with associated ASN.
@@ -128,66 +130,93 @@ impl AsnManager {
         self.ranges.len()
     }
 
+    /// Get ASN record by ASN number (O(1)).
+    pub fn get_asn(&self, asn: &str) -> Option<&AsnRecord> {
+        self.asns.get(asn)
+    }
+
     /// Categorize an ASN based on organization name.
     /// SAFETY: This is the primary gatekeeper for the scanner.
-    pub fn categorize_by_org(org: &str) -> AsnCategory {
+    pub fn categorize_by_org(org: &str) -> (AsnCategory, Vec<String>) {
         let org_lower = org.to_lowercase();
+        let mut tags = Vec::new();
+        let mut category = AsnCategory::Unknown;
 
         // 1. CRITICAL SAFETY BLOCKLIST (Military, Gov, Edu, Infrastructure)
         let blocked_keywords = [
-            // Military & Defense
-            "military", "defense", "dod", "pentagon", "army", "navy", "air force", "marines",
-            "department of defense", "national security", "intelligence", "signal corps",
-            // Government
-            "government", "gov.", "ministry", "federal", "state of", "city of", "municipality",
-            "parliament", "congress", "senate", "white house", "official",
-            // Law Enforcement
-            "police", "law enforcement", "fbi", "cia", "nsa", "justice", "sheriff", "interpol",
-            // Education (Universities/Schools)
-            "university", "college", "school", "academy", "institute of technology", ".edu", 
-            "higher education", "campus", "district",
-            // Critical Infrastructure
-            "hospital", "medical center", "healthcare", "clinic", "emergency", "911", "ambulance",
-            "nuclear", "atomic", "energy department", "power plant", "water works",
-            "bank", "financial", "securities", "reserve", "exchange", "investment",
+            ("military", "Defense"), ("defense", "Defense"), ("dod", "Defense"), ("pentagon", "Defense"),
+            ("army", "Defense"), ("navy", "Defense"), ("air force", "Defense"), ("marines", "Defense"),
+            ("national security", "Security"), ("intelligence", "Intelligence"),
+            ("government", "Government"), ("gov.", "Government"), ("ministry", "Government"), ("federal", "Government"),
+            ("police", "Law Enforcement"), ("fbi", "Law Enforcement"), ("cia", "Intelligence"), ("nsa", "Intelligence"),
+            ("university", "Education"), ("college", "Education"), ("school", "Education"), ("academy", "Education"),
+            ("hospital", "Healthcare"), ("medical", "Healthcare"), ("clinic", "Healthcare"),
+            ("nuclear", "Infrastructure"), ("atomic", "Infrastructure"), ("power plant", "Infrastructure"),
+            ("bank", "Financial"), ("financial", "Financial"), ("securities", "Financial"), ("reserve", "Financial"),
         ];
 
-        for keyword in &blocked_keywords {
+        for (keyword, tag) in &blocked_keywords {
             if org_lower.contains(keyword) {
-                return AsnCategory::Excluded;
+                category = AsnCategory::Excluded;
+                tags.push(tag.to_string());
             }
         }
+        if category == AsnCategory::Excluded {
+            tags.dedup();
+            return (category, tags);
+        }
 
-        // 2. Hosting providers
+        // 2. Capabilities & Technology Tags
+        let ddos_keywords = ["ddos", "shield", "protect", "scrub", "mitigation", "voxility", "path.net", "stormwall", "cloudefense"];
+        for k in &ddos_keywords {
+            if org_lower.contains(k) { tags.push("DDoS-Protected".to_string()); break; }
+        }
+
+        let cloud_keywords = ["amazon", "aws", "google", "microsoft", "azure", "cloud", "compute", "instance", "stack", "lambda"];
+        for k in &cloud_keywords {
+            if org_lower.contains(k) { tags.push("Cloud".to_string()); break; }
+        }
+
+        let cdn_keywords = ["cloudflare", "akamai", "fastly", "cdn", "edgecast", "limelight", "bunny"];
+        for k in &cdn_keywords {
+            if org_lower.contains(k) { tags.push("CDN".to_string()); break; }
+        }
+
+        // 3. Category Determination
         let hosting_keywords = [
-            "amazon", "aws", "google", "microsoft", "azure", "hetzner", "ovh",
-            "digitalocean", "linode", "vultr", "cloudflare", "scaleway", "online.net",
-            "leaseweb", "contabo", "ionos", "rackspace", "oracle", "cloud", "hosting",
-            "datacenter", "server", "vps", "dedicated", "colo", "compute", "instance",
-            "stack", "packet", "infrastructure", "liquid web", "choopa", "akamai",
+            "hetzner", "ovh", "digitalocean", "linode", "vultr", "scaleway", "online.net",
+            "leaseweb", "contabo", "ionos", "rackspace", "hosting", "datacenter", "server", 
+            "vps", "dedicated", "colo", "compute", "packet", "infrastructure", "liquid web", 
+            "choopa", "iart", "hostinger", "porkbun", "namecheap", "godaddy",
         ];
 
         for keyword in &hosting_keywords {
             if org_lower.contains(keyword) {
-                return AsnCategory::Hosting;
+                category = AsnCategory::Hosting;
+                tags.push("Hosting".to_string());
+                break;
             }
         }
 
-        //  residential providers
         let residential_keywords = [
             "comcast", "verizon", "at&t", "spectrum", "cox", "telekom", "bt ", "orange",
-            "kpn", "vodafone", "sky ", "t-mobile", "jcom", "ntt ", "telstra",
-            "broadband", "cable", "fiber", "isp", "residential", "consumer",
-            "home", "dsl", "wireless", "mobile", "lte", "5g", "customer",
+            "kpn", "vodafone", "sky ", "t-mobile", "jcom", "ntt ", "telstra", "rogers", "bell",
+            "broadband", "cable", "fiber", "isp", "residential", "consumer", "home", "dsl", 
+            "wireless", "mobile", "lte", "5g", "customer", "communications", "telecom",
         ];
 
-        for keyword in &residential_keywords {
-            if org_lower.contains(keyword) {
-                return AsnCategory::Residential;
+        if category == AsnCategory::Unknown {
+            for keyword in &residential_keywords {
+                if org_lower.contains(keyword) {
+                    category = AsnCategory::Residential;
+                    tags.push("Residential".to_string());
+                    break;
+                }
             }
         }
 
-        AsnCategory::Unknown
+        tags.dedup();
+        (category, tags)
     }
 }
 

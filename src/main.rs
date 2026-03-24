@@ -132,6 +132,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         asn_fetcher.asn_manager().read().await.range_count()
     );
 
+    // GLOBAL DISCOVERY SYNC: If we have very few ASNs, trigger a full import from iptoasn.com
+    // to discover all hosting providers globally.
+    if asn_fetcher.asn_manager().read().await.asn_count() < 100 {
+        let fetcher = Arc::clone(&asn_fetcher);
+        tokio::spawn(async move {
+            let _ = fetcher.import_full_database().await;
+        });
+    }
+
+    // BACKFILL: Fetch ASNs for existing servers that don't have them
+    {
+        let db_clone = Arc::clone(&db);
+        let asn_clone = Arc::clone(&asn_fetcher);
+        tokio::spawn(async move {
+            // Small delay to let the full database import start first if needed
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            if let Ok(servers) = sqlx::query_as::<_, db::Server>("SELECT * FROM servers WHERE asn IS NULL AND status != 'ignored' LIMIT 5000")
+                .fetch_all(db_clone.pool())
+                .await 
+            {
+                if !servers.is_empty() {
+                    tracing::info!("Backfilling ASN data for {} servers...", servers.len());
+                    for server in servers {
+                        let _ = asn_clone.fetch_asn_for_ip(&server.ip).await;
+                    }
+                    tracing::info!("Backfill complete.");
+                }
+            }
+        });
+    }
+
     // 4. Create scanner and scheduler
     let exclude_manager = Arc::new(exclude::ExcludeManager::new(&args.exclude_file));
     
@@ -195,11 +226,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let scheduler = Arc::new(scheduler);
+    let scanner = Arc::new(scanner);
 
     // 5. Start background scanner task
     let scanner_handle = {
         let scheduler = Arc::clone(&scheduler);
-        let scanner = Arc::new(scanner);
+        let scanner = Arc::clone(&scanner);
+        
+        // Background filler task
+        let scheduler_filler = Arc::clone(&scheduler);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if !scheduler_filler.test_mode {
+                    scheduler_filler.fill_warm_queue_if_needed().await;
+                    scheduler_filler.fill_cold_queue_if_needed().await;
+                }
+            }
+        });
+
         tokio::spawn(async move {
             run_scanner_loop(scanner, scheduler).await;
         })
@@ -218,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db: Arc::clone(&db),
         scheduler: Arc::clone(&scheduler),
         exclude_list: Arc::clone(&exclude_manager),
+        asn_manager: asn_fetcher.asn_manager(),
         api_key: args.api_key.clone(),
         contact_email: args.contact_email.clone(),
         discord_link: args.discord_link.clone(),
@@ -257,7 +304,6 @@ async fn run_scanner_loop(
     let discoveries_buffer = Arc::new(AtomicU32::new(0));
 
     let mut status_interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-    let mut fill_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
     let mut stats_flush_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
     loop {
@@ -282,19 +328,10 @@ async fn run_scanner_loop(
                     let _ = scheduler.db.increment_batch_stats(h as i32, w as i32, c as i32, d as i32).await;
                 }
             }
-            _ = fill_interval.tick() => {
-                if !scheduler.test_mode {
-                    scheduler.fill_warm_queue_if_needed().await;
-                    scheduler.fill_cold_queue_if_needed().await;
-                }
-            }
             server_opt = scheduler.next_server() => {
                 if let Some(server) = server_opt {
-                    // BACKPRESSURE: If we have too many active tasks, wait before spawning more.
-                    // This is critical to prevent the task queue from ballooning while tasks
-                    // are waiting for the rate limiter.
-                    while active_tasks.load(Ordering::Relaxed) >= 1000 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    if active_tasks.load(Ordering::Relaxed) >= 2500 {
+                        continue;
                     }
 
                     let scanner = Arc::clone(&scanner);
@@ -302,15 +339,13 @@ async fn run_scanner_loop(
                     let hot_count = Arc::clone(&hot_count);
                     let warm_count = Arc::clone(&warm_count);
                     let cold_count = Arc::clone(&cold_count);
-                    let active_tasks = Arc::clone(&active_tasks);
+                    let active_tasks_clone = Arc::clone(&active_tasks);
                     
                     let hot_buffer = Arc::clone(&hot_buffer);
                     let warm_buffer = Arc::clone(&warm_buffer);
                     let cold_buffer = Arc::clone(&cold_buffer);
                     let discoveries_buffer = Arc::clone(&discoveries_buffer);
 
-                    let active_tasks_inner = Arc::clone(&active_tasks);
-                    
                     active_tasks.fetch_add(1, Ordering::SeqCst);
                     
                     tokio::spawn(async move {
@@ -345,7 +380,7 @@ async fn run_scanner_loop(
                             discoveries_buffer.fetch_add(1, Ordering::Relaxed);
                         }
                         
-                        active_tasks_inner.fetch_sub(1, Ordering::SeqCst);
+                        active_tasks_clone.fetch_sub(1, Ordering::SeqCst);
                     });
                 } else {
                     // No servers ready, sleep a bit to avoid CPU spin

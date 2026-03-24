@@ -12,8 +12,9 @@ use crate::db::Database;
 use crate::asn::AsnCategory;
 use rand::prelude::*;
 use rand::seq::SliceRandom;
+use sqlx::Row;
 
-/// A target server for scanning.
+/// Target server for scanning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerTarget {
     pub ip: String,
@@ -24,9 +25,11 @@ pub struct ServerTarget {
     pub last_scanned: Option<DateTime<Utc>>,
     pub next_scan_at: Option<DateTime<Utc>>,
     pub consecutive_failures: i32,
-    pub scan_count: u32,
-    pub success_rate: f32,
     pub server_type: String,
+    #[serde(default)]
+    pub is_discovery: bool,
+    pub scan_count: i32,
+    pub success_rate: f32,
     pub direction: i8,
 }
 
@@ -45,6 +48,7 @@ impl ServerTarget {
             success_rate: 0.0,
             server_type,
             direction: 0,
+            is_discovery: false,
         }
     }
 
@@ -147,23 +151,23 @@ impl Scheduler {
 
     pub async fn fill_warm_queue_if_needed(&self) {
         let warm_len = self.warm_queue.lock().await.len();
-        if warm_len > 2000 { return; } 
+        if warm_len > 10000 { return; } 
 
-        // INTERLEAVED DISCOVERY: Fetch up to 100 hosting ranges
-        if let Ok(ranges) = self.db.get_ranges_to_scan("hosting", 100).await {
+        // INTERLEAVED DISCOVERY: Fetch up to 500 hosting ranges
+        if let Ok(ranges) = self.db.get_ranges_to_scan("hosting", 500).await {
             if ranges.is_empty() { return; }
             tracing::info!("Discovery: Filling Warm queue by interleaving {} hosting ranges", ranges.len());
-            let _ = self.fill_discovery_queue(ranges, 2, 20).await;
+            let _ = self.fill_discovery_queue(ranges, 2, 50).await;
         }
     }
 
     pub async fn fill_cold_queue_if_needed(&self) {
         let cold_len = self.cold_queue.lock().await.len();
-        if cold_len > 1000 { return; }
+        if cold_len > 5000 { return; }
 
-        // 1. Try to recycle dead servers
+        // 1. Try to recycle dead/ignored servers
         if let Ok(dead_servers) = sqlx::query_as::<_, crate::db::Server>(
-            "SELECT * FROM servers WHERE priority = 3 ORDER BY last_seen ASC LIMIT 100",
+            "SELECT * FROM servers WHERE priority = 3 ORDER BY last_seen ASC LIMIT 1000",
         )
         .fetch_all(self.db.pool())
         .await {
@@ -177,15 +181,15 @@ impl Scheduler {
             }
         }
 
-        // 2. INTERLEAVED DISCOVERY: Fetch up to 50 residential/unknown ranges
-        let mut ranges = self.db.get_ranges_to_scan("residential", 50).await.unwrap_or_default();
+        // 2. INTERLEAVED DISCOVERY: Fetch up to 200 residential/unknown ranges
+        let mut ranges = self.db.get_ranges_to_scan("residential", 200).await.unwrap_or_default();
         if ranges.is_empty() {
-            ranges = self.db.get_ranges_to_scan("unknown", 50).await.unwrap_or_default();
+            ranges = self.db.get_ranges_to_scan("unknown", 200).await.unwrap_or_default();
         }
 
         if !ranges.is_empty() {
             tracing::info!("Discovery: Filling Cold queue by interleaving {} ranges", ranges.len());
-            let _ = self.fill_discovery_queue(ranges, 3, 10).await;
+            let _ = self.fill_discovery_queue(ranges, 3, 50).await;
         }
     }
 
@@ -198,46 +202,88 @@ impl Scheduler {
         ips_per_range: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use ipnetwork::Ipv4Network;
-        let mut all_targets = Vec::new();
+        use std::collections::HashSet;
+        
+        let mut all_candidates = Vec::new();
+        let mut updates = Vec::new();
 
         for range in ranges {
-            let network: Ipv4Network = range.cidr.parse()?;
+            let network: Ipv4Network = match range.cidr.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
             let total_ips = network.size() as i64;
             let mut current_offset = range.scan_offset;
             let mut added = 0;
 
             while added < ips_per_range && current_offset < total_ips {
                 if let Some(ip) = network.nth(current_offset as u32) {
-                    let mut java_target = ServerTarget::new(ip.to_string(), 25565, "java".to_string());
-                    java_target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
-                    java_target.priority = priority;
-                    all_targets.push(java_target);
-                    
-                    let mut bedrock_target = ServerTarget::new(ip.to_string(), 19132, "bedrock".to_string());
-                    bedrock_target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
-                    bedrock_target.priority = priority;
-                    all_targets.push(bedrock_target);
-                    
+                    all_candidates.push(ip.to_string());
                     added += 1;
                 }
                 current_offset += 1;
             }
 
-            // Update database with new offset for THIS range
-            let is_done = current_offset >= total_ips;
-            self.db.update_range_progress(&range.cidr, current_offset, is_done).await?;
-            self.record_asn_scan(&range.asn).await;
+            if added > 0 {
+                let is_done = current_offset >= total_ips;
+                updates.push((range.cidr.clone(), current_offset, is_done));
+                self.record_asn_scan(&range.asn).await;
+            }
         }
 
-        // GLOBAL SHUFFLE: Randomize the order of all collected IPs
-        {
-            let mut rng = rand::thread_rng();
-            all_targets.shuffle(&mut rng);
-        } // rng is dropped here, before any awaits
+        if all_candidates.is_empty() { return Ok(()); }
 
-        // Add all to the queue
-        for target in all_targets {
-            self.add_server(target, true).await;
+        // BATCH CHECK: Find which IPs are already in our database in one go
+        let mut known_ips = HashSet::new();
+        // SQLite has a limit on variables, so we check in chunks of 500
+        for chunk in all_candidates.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let query = format!("SELECT DISTINCT ip FROM servers WHERE ip IN ({})", placeholders);
+            
+            let mut sql_query = sqlx::query(&query);
+            for ip in chunk {
+                sql_query = sql_query.bind(ip);
+            }
+
+            if let Ok(rows) = sql_query.fetch_all(self.db.pool()).await {
+                for row in rows {
+                    if let Ok(ip) = row.try_get::<String, _>(0) {
+                        known_ips.insert(ip);
+                    }
+                }
+            }
+        }
+
+        let mut all_targets = Vec::new();
+        for ip_str in all_candidates {
+            if !known_ips.contains(&ip_str) {
+                let mut java_target = ServerTarget::new(ip_str.clone(), 25565, "java".to_string());
+                java_target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
+                java_target.priority = priority;
+                java_target.is_discovery = true;
+                all_targets.push(java_target);
+                
+                let mut bedrock_target = ServerTarget::new(ip_str, 19132, "bedrock".to_string());
+                bedrock_target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
+                bedrock_target.priority = priority;
+                bedrock_target.is_discovery = true;
+                all_targets.push(bedrock_target);
+            }
+        }
+
+        // Batch update progress in DB
+        self.db.update_batch_range_progress(updates).await?;
+
+        // GLOBAL SHUFFLE & ADD
+        if !all_targets.is_empty() {
+            {
+                let mut rng = rand::thread_rng();
+                all_targets.shuffle(&mut rng);
+            }
+            
+            for target in all_targets {
+                self.add_server(target, true).await;
+            }
         }
 
         Ok(())

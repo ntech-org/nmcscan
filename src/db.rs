@@ -5,7 +5,6 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
-use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -46,6 +45,7 @@ pub struct AsnRow {
     pub category: String,
     pub country: Option<String>,
     pub last_updated: Option<DateTime<Utc>>,
+    pub tags: Option<String>,
     #[sqlx(default)]
     pub server_count: i64,
 }
@@ -154,6 +154,7 @@ impl Database {
         let _ = sqlx::query("ALTER TABLE servers ADD COLUMN country TEXT;").execute(pool).await;
         let _ = sqlx::query("ALTER TABLE servers ADD COLUMN favicon TEXT;").execute(pool).await;
         let _ = sqlx::query("ALTER TABLE servers ADD COLUMN brand TEXT;").execute(pool).await;
+        let _ = sqlx::query("ALTER TABLE asns ADD COLUMN tags TEXT;").execute(pool).await;
         let _ = sqlx::query("ALTER TABLE asn_ranges ADD COLUMN scan_offset INTEGER DEFAULT 0;").execute(pool).await;
         let _ = sqlx::query("ALTER TABLE asn_ranges ADD COLUMN last_scanned_at TIMESTAMP;").execute(pool).await;
 
@@ -233,6 +234,7 @@ impl Database {
                 org TEXT NOT NULL,
                 category TEXT NOT NULL DEFAULT 'unknown',
                 country TEXT,
+                tags TEXT,
                 last_updated TIMESTAMP
             )
             "#
@@ -270,15 +272,16 @@ impl Database {
         .execute(pool)
         .await?;
 
-        // Indexes for performance
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_priority ON servers(priority)").execute(pool).await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_status ON servers(status)").execute(pool).await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_last_seen ON servers(last_seen)").execute(pool).await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_asn_category ON asns(category)").execute(pool).await?;
+        // PERFORMANCE INDEXES
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_status ON servers(status)").execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_priority ON servers(priority, last_seen)").execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_asn ON servers(asn)").execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_players ON servers(players_online)").execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_asns_category ON asns(category)").execute(pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_asn_ranges_asn ON asn_ranges(asn)").execute(pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_player_name ON server_players(player_name)").execute(pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_server_history_ip_port ON server_history(ip, port)").execute(pool).await?;
-        
+
         Ok(())
     }
 
@@ -379,11 +382,14 @@ impl Database {
         cursor_players: Option<i32>,
         cursor_ip: Option<&str>,
         cursor_last_seen: Option<NaiveDateTime>,
+        asn_filter: Option<&str>,
     ) -> Result<Vec<Server>, DatabaseError> {
-        let mut query = String::from("SELECT * FROM servers WHERE 1=1");
+        let mut query = String::from("SELECT * FROM servers WHERE status != 'ignored'");
         
         if let Some(status) = status_filter {
-            query.push_str(&format!(" AND status = '{}'", status));
+            if status != "all" {
+                query.push_str(&format!(" AND status = '{}'", status));
+            }
         }
 
         if let Some(st) = server_type_filter {
@@ -416,6 +422,11 @@ impl Database {
         if let Some(cat) = asn_category {
             let safe_cat = cat.replace("'", "''");
             query.push_str(&format!(" AND asn IN (SELECT asn FROM asns WHERE category = '{}')", safe_cat));
+        }
+
+        if let Some(asn) = asn_filter {
+            let safe_asn = asn.replace("'", "''");
+            query.push_str(&format!(" AND asn = '{}'", safe_asn));
         }
         
         if let Some(c) = country {
@@ -522,7 +533,7 @@ impl Database {
 
     /// Get server count.
     pub async fn get_server_count(&self) -> Result<i64, DatabaseError> {
-        let (count,) = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM servers").fetch_one(&self.pool).await?;
+        let (count,) = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM servers WHERE status != 'ignored'").fetch_one(&self.pool).await?;
         Ok(count)
     }
 
@@ -551,11 +562,11 @@ impl Database {
         players_sample: Option<Vec<crate::slp::PlayerSample>>,
         favicon: Option<String>,
         brand: Option<String>,
-        asn_manager: Option<Arc<tokio::sync::RwLock<crate::asn::AsnManager>>>,
+        asn_record: Option<crate::asn::AsnRecord>,
     ) -> Result<bool, DatabaseError> {
         let mut retries = 3;
         while retries > 0 {
-            match self.mark_online_inner(ip, port, server_type, players_online, players_max, motd.clone(), version.clone(), players_sample.clone(), favicon.clone(), brand.clone(), asn_manager.clone()).await {
+            match self.mark_online_inner(ip, port, server_type, players_online, players_max, motd.clone(), version.clone(), players_sample.clone(), favicon.clone(), brand.clone(), asn_record.clone()).await {
                 Ok(is_new) => return Ok(is_new),
                 Err(_e) if retries > 1 => {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -579,18 +590,13 @@ impl Database {
         players_sample: Option<Vec<crate::slp::PlayerSample>>,
         favicon: Option<String>,
         brand: Option<String>,
-        asn_manager: Option<Arc<tokio::sync::RwLock<crate::asn::AsnManager>>>,
+        asn_record: Option<crate::asn::AsnRecord>,
     ) -> Result<bool, DatabaseError> {
         let existing = self.get_server(ip, port).await?;
         let is_new = existing.is_none();
 
-        let (asn, country) = if let (Some(manager_lock), Ok(ip_addr)) = (asn_manager, ip.parse::<std::net::Ipv4Addr>()) {
-            let manager: tokio::sync::RwLockReadGuard<'_, crate::asn::AsnManager> = manager_lock.read().await;
-            if let Some(record) = manager.get_asn_for_ip(ip_addr) {
-                (Some(record.asn.clone()), record.country.clone())
-            } else {
-                (None, None)
-            }
+        let (asn, country) = if let Some(record) = asn_record {
+            (Some(record.asn), record.country)
         } else {
             (None, None)
         };
@@ -645,18 +651,42 @@ impl Database {
         Ok(is_new)
     }
 
-    pub async fn mark_offline(&self, ip: &str, port: i32) -> Result<(), DatabaseError> {
+    pub async fn mark_offline(
+        &self,
+        ip: &str,
+        port: i32,
+        server_type: Option<&str>,
+        asn_record: Option<crate::asn::AsnRecord>,
+    ) -> Result<(), DatabaseError> {
+        let (asn, country) = if let Some(record) = asn_record {
+            (Some(record.asn), record.country)
+        } else {
+            (None, None)
+        };
+
         sqlx::query(
             r#"
-            UPDATE servers SET
-                status = 'offline',
-                consecutive_failures = consecutive_failures + 1,
+            INSERT INTO servers (ip, port, server_type, status, priority, last_seen, consecutive_failures, asn, country)
+            VALUES (?, ?, ?, 'ignored', 3, CURRENT_TIMESTAMP, 1, ?, ?)
+            ON CONFLICT(ip, port) DO UPDATE SET
+                status = CASE 
+                    WHEN servers.motd IS NOT NULL OR servers.status = 'online' THEN 'offline' 
+                    ELSE 'ignored' 
+                END,
+                consecutive_failures = servers.consecutive_failures + 1,
                 last_seen = CURRENT_TIMESTAMP,
-                priority = CASE WHEN consecutive_failures >= 5 THEN 3 ELSE priority END
-            WHERE ip = ? AND port = ?
+                priority = CASE WHEN servers.consecutive_failures >= 5 THEN 3 ELSE servers.priority END,
+                asn = COALESCE(servers.asn, excluded.asn),
+                country = COALESCE(servers.country, excluded.country)
             "#,
         )
-        .bind(ip).bind(port).execute(&self.pool).await?;
+        .bind(ip)
+        .bind(port)
+        .bind(server_type.unwrap_or("java"))
+        .bind(asn)
+        .bind(country)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -665,15 +695,20 @@ impl Database {
         Ok(())
     }
 
-    pub async fn upsert_asn(&self, asn: &str, org: &str, category: &str, country: Option<&str>) -> Result<(), DatabaseError> {
+    pub async fn upsert_asn(&self, asn: &str, org: &str, category: &str, country: Option<&str>, tags: Option<Vec<String>>) -> Result<(), DatabaseError> {
+        let tags_str = tags.map(|t| t.join(","));
         sqlx::query(
             r#"
-            INSERT INTO asns (asn, org, category, country, last_updated)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO asns (asn, org, category, country, tags, last_updated)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(asn) DO UPDATE SET
-                org = excluded.org, category = excluded.category, country = COALESCE(excluded.country, asns.country), last_updated = CURRENT_TIMESTAMP
+                org = excluded.org, 
+                category = excluded.category, 
+                country = COALESCE(excluded.country, asns.country), 
+                tags = COALESCE(excluded.tags, asns.tags),
+                last_updated = CURRENT_TIMESTAMP
             "#,
-        ).bind(asn).bind(org).bind(category).bind(country).execute(&self.pool).await?;
+        ).bind(asn).bind(org).bind(category).bind(country).bind(tags_str).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -682,13 +717,26 @@ impl Database {
         Ok(())
     }
 
+    fn map_asn_row(&self, row: AsnRow) -> AsnRecord {
+        AsnRecord {
+            asn: row.asn,
+            org: row.org,
+            category: match row.category.as_str() {
+                "hosting" => AsnCategory::Hosting,
+                "residential" => AsnCategory::Residential,
+                "excluded" => AsnCategory::Excluded,
+                _ => AsnCategory::Unknown,
+            },
+            country: row.country,
+            last_updated: row.last_updated,
+            server_count: row.server_count,
+            tags: row.tags.map(|t| t.split(',').map(|s| s.to_string()).collect()).unwrap_or_default(),
+        }
+    }
+
     pub async fn get_all_asns(&self) -> Result<Vec<AsnRecord>, DatabaseError> {
         let rows = sqlx::query_as::<_, AsnRow>("SELECT * FROM asns").fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|row| AsnRecord {
-            asn: row.asn, org: row.org,
-            category: match row.category.as_str() { "hosting" => AsnCategory::Hosting, "residential" => AsnCategory::Residential, "excluded" => AsnCategory::Excluded, _ => AsnCategory::Unknown },
-            country: row.country, last_updated: row.last_updated, server_count: row.server_count,
-        }).collect())
+        Ok(rows.into_iter().map(|row| self.map_asn_row(row)).collect())
     }
 
     pub async fn get_all_asn_ranges(&self) -> Result<Vec<AsnRangeRow>, DatabaseError> {
@@ -697,33 +745,31 @@ impl Database {
 
     pub async fn get_asns_by_category(&self, category: &str) -> Result<Vec<AsnRecord>, DatabaseError> {
         let rows = sqlx::query_as::<_, AsnRow>("SELECT * FROM asns WHERE category = ? ORDER BY org").bind(category).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|row| AsnRecord {
-            asn: row.asn, org: row.org,
-            category: match row.category.as_str() { "hosting" => AsnCategory::Hosting, "residential" => AsnCategory::Residential, "excluded" => AsnCategory::Excluded, _ => AsnCategory::Unknown },
-            country: row.country, last_updated: row.last_updated, server_count: row.server_count,
-        }).collect())
+        Ok(rows.into_iter().map(|row| self.map_asn_row(row)).collect())
     }
 
     pub async fn get_stale_asns(&self, days: i64) -> Result<Vec<AsnRecord>, DatabaseError> {
         let rows = sqlx::query_as::<_, AsnRow>("SELECT * FROM asns WHERE last_updated IS NULL OR last_updated < datetime('now', ?) ORDER BY last_updated ASC").bind(&format!("-{} days", days)).fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|row| AsnRecord {
-            asn: row.asn, org: row.org,
-            category: match row.category.as_str() { "hosting" => AsnCategory::Hosting, "residential" => AsnCategory::Residential, "excluded" => AsnCategory::Excluded, _ => AsnCategory::Unknown },
-            country: row.country, last_updated: row.last_updated, server_count: row.server_count,
-        }).collect())
+        Ok(rows.into_iter().map(|row| self.map_asn_row(row)).collect())
     }
 
     pub async fn get_asn_list_with_counts(&self) -> Result<Vec<AsnRecord>, DatabaseError> {
-        let rows = sqlx::query_as::<_, AsnRow>("SELECT a.*, (SELECT COUNT(*) FROM servers s WHERE s.asn = a.asn) as server_count FROM asns a ORDER BY server_count DESC, a.org ASC").fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|row| AsnRecord {
-            asn: row.asn, org: row.org,
-            category: match row.category.as_str() { "hosting" => AsnCategory::Hosting, "residential" => AsnCategory::Residential, "excluded" => AsnCategory::Excluded, _ => AsnCategory::Unknown },
-            country: row.country, last_updated: row.last_updated, server_count: row.server_count,
-        }).collect())
+        let rows = sqlx::query_as::<_, AsnRow>(
+            r#"
+            SELECT a.asn, a.org, a.category, a.country, a.tags, a.last_updated, COUNT(s.ip) as server_count
+            FROM asns a
+            JOIN servers s ON s.asn = a.asn
+            WHERE s.status != 'ignored'
+            GROUP BY a.asn
+            ORDER BY server_count DESC, a.org ASC
+            "#
+        ).fetch_all(&self.pool).await?;
+        
+        Ok(rows.into_iter().map(|row| self.map_asn_row(row)).collect())
     }
 
     pub async fn get_server_count_by_asn(&self, asn: &str) -> Result<i64, DatabaseError> {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM servers WHERE asn = ?").bind(asn).fetch_one(&self.pool).await.map_err(DatabaseError::from)
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM servers WHERE asn = ? AND status != 'ignored'").bind(asn).fetch_one(&self.pool).await.map_err(DatabaseError::from)
     }
 
     pub async fn get_asn_stats_v2(&self) -> Result<(i64, i64, i64, i64), DatabaseError> {
