@@ -1,10 +1,23 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nmcscan_postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=nmcscan
+      - POSTGRES_PASSWORD=nmcscan_secret
+      - POSTGRES_DB=nmcscan
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   nmcscan:
     build: .
     container_name: nmcscan
     restart: unless-stopped
-    ports:
-      - "${PORT:-3000}:3000"
+    depends_on:
+      - postgres
     environment:
       - RUST_LOG=${RUST_LOG:-info}
       - API_KEY=${API_KEY}
@@ -12,6 +25,7 @@ services:
       - CONTACT_EMAIL=${CONTACT_EMAIL}
       - DISCORD_LINK=${DISCORD_LINK}
       - TARGET_RPS=${TARGET_RPS:-100}
+      - DATABASE_URL=postgres://nmcscan:nmcscan_secret@postgres:5432/nmcscan
     volumes:
       - ./data:/app/data
       - ./exclude.conf:/app/exclude.conf
@@ -22,9 +36,34 @@ services:
       "--log-level", "${RUST_LOG:-info}",
       "--contact-email", "${CONTACT_EMAIL}",
       "--discord-link", "${DISCORD_LINK}",
-      "--database", "/app/data/nmcscan.db",
+      "--database", "postgres://nmcscan:nmcscan_secret@postgres:5432/nmcscan",
       "--exclude-file", "/app/exclude.conf"
     ]
 
+  dashboard:
+    build: ./dashboard
+    container_name: nmcscan_dashboard
+    restart: unless-stopped
+    depends_on:
+      - nmcscan
+    ports:
+      - "${PORT:-3000}:5173"
+    environment:
+      - NODE_ENV=production
+      - PORT=5173
+      - BACKEND_URL=http://nmcscan:3000
+      - DATABASE_URL=postgres://nmcscan:nmcscan_secret@postgres:5432/nmcscan
+      - AUTH_SECRET=${AUTH_SECRET}
+      - AUTH_TRUST_HOST=true
+      - API_KEY=${API_KEY}
+      - ALLOWED_USERS=${ALLOWED_USERS}
+      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID}
+      - DISCORD_CLIENT_SECRET=${DISCORD_CLIENT_SECRET}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
+      - PUBLIC_API_URL=${PUBLIC_API_URL:-}
+
+
 volumes:
   data:
+  postgres_data:

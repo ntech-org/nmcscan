@@ -28,6 +28,20 @@ use std::sync::Arc;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 
+#[derive(Deserialize)]
+pub struct PaginationQuery {
+    pub page: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct PaginatedResponse<T> {
+    pub items: Vec<T>,
+    pub total: i64,
+    pub page: u64,
+    pub limit: u64,
+}
+
 #[derive(Serialize)]
 pub struct ServerResponse {
     pub ip: String,
@@ -188,7 +202,7 @@ pub struct AsnResponse {
 }
 
 /// Exclude list entry.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ExcludeEntry {
     pub network: String,
     pub comment: Option<String>,
@@ -452,8 +466,14 @@ fn enrich_server_response_sync(manager: &crate::asn::AsnManager, server: Server)
 }
 
 /// GET /api/asns - List all ASNs.
-async fn list_asns(State(state): State<AppState>) -> Json<Vec<AsnResponse>> {
-    let asns: Vec<crate::asn::AsnRecord> = state.db.get_asn_list_with_counts().await.unwrap_or_default();
+async fn list_asns(
+    State(state): State<AppState>,
+    Query(query): Query<PaginationQuery>,
+) -> Json<PaginatedResponse<AsnResponse>> {
+    let page = query.page.unwrap_or(0);
+    let limit = query.limit.unwrap_or(50);
+
+    let (asns, total) = state.db.get_asn_list_paginated(page, limit).await.unwrap_or_else(|_| (Vec::new(), 0));
 
     let responses: Vec<AsnResponse> = asns
         .into_iter()
@@ -475,7 +495,12 @@ async fn list_asns(State(state): State<AppState>) -> Json<Vec<AsnResponse>> {
         })
         .collect();
 
-    Json(responses)
+    Json(PaginatedResponse {
+        items: responses,
+        total,
+        page,
+        limit,
+    })
 }
 
 /// GET /api/asns/{asn} - Get ASN details.
@@ -506,9 +531,14 @@ async fn get_asn(
 }
 
 /// GET /api/exclude - Get current exclude list.
-async fn get_exclude_list() -> Json<Vec<ExcludeEntry>> {
+async fn get_exclude_list(
+    Query(query): Query<PaginationQuery>,
+) -> Json<PaginatedResponse<ExcludeEntry>> {
+    let page = query.page.unwrap_or(0);
+    let limit = query.limit.unwrap_or(50);
+
     let content = std::fs::read_to_string("exclude.conf").unwrap_or_default();
-    let entries: Vec<ExcludeEntry> = content
+    let mut all_entries: Vec<ExcludeEntry> = content
         .lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -533,7 +563,24 @@ async fn get_exclude_list() -> Json<Vec<ExcludeEntry>> {
         })
         .collect();
 
-    Json(entries)
+    all_entries.reverse();
+
+    let total = all_entries.len() as i64;
+    let start = (page * limit) as usize;
+    let end = std::cmp::min(start + limit as usize, all_entries.len());
+
+    let items = if start < all_entries.len() {
+        all_entries[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    Json(PaginatedResponse {
+        items,
+        total,
+        page,
+        limit,
+    })
 }
 
 /// POST /api/exclude - Add a new exclusion.

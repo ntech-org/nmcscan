@@ -18,6 +18,7 @@ mod api;
 mod asn;
 mod asn_fetcher;
 mod db;
+pub mod entities;
 mod exclude;
 mod raknet;
 mod scheduler;
@@ -70,8 +71,8 @@ struct Args {
     #[arg(long, env = "DISCORD_LINK")]
     discord_link: Option<String>,
 
-    /// Path to SQLite database file
-    #[arg(short, long, env = "DATABASE_URL", default_value = "data/nmcscan.db")]
+    /// PostgreSQL database URL
+    #[arg(short, long, env = "DATABASE_URL", default_value = "postgres://nmcscan:nmcscan_secret@localhost:5432/nmcscan")]
     database: String,
 
     /// Path to exclude.conf file
@@ -133,12 +134,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // GLOBAL DISCOVERY SYNC: If we have very few ASNs, trigger a full import from iptoasn.com
-    // to discover all hosting providers globally.
+    // to discover all hosting providers globally. Must complete before scheduler starts.
     if asn_fetcher.asn_manager().read().await.asn_count() < 100 {
-        let fetcher = Arc::clone(&asn_fetcher);
-        tokio::spawn(async move {
-            let _ = fetcher.import_full_database().await;
-        });
+        tracing::info!("Few ASNs cached, running full database import...");
+        match asn_fetcher.import_full_database().await {
+            Ok(()) => tracing::info!("Full ASN import completed successfully."),
+            Err(e) => tracing::error!("Full ASN import failed: {}", e),
+        }
     }
 
     // BACKFILL: Fetch ASNs for existing servers that don't have them
@@ -146,8 +148,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let db_clone = Arc::clone(&db);
         let asn_clone = Arc::clone(&asn_fetcher);
         tokio::spawn(async move {
-            // Small delay to let the full database import start first if needed
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             if let Ok(servers) = sqlx::query_as::<_, db::Server>("SELECT * FROM servers WHERE asn IS NULL AND status != 'ignored' LIMIT 5000")
                 .fetch_all(db_clone.pool())
                 .await 
@@ -236,12 +236,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Background filler task
         let scheduler_filler = Arc::clone(&scheduler);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
                 if !scheduler_filler.test_mode {
                     scheduler_filler.fill_warm_queue_if_needed().await;
                     scheduler_filler.fill_cold_queue_if_needed().await;
+                    scheduler_filler.try_refill_queues().await;
                 }
             }
         });
@@ -256,6 +257,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let asn_fetcher = Arc::clone(&asn_fetcher);
         tokio::spawn(async move {
             asn_fetcher.run_background_refresh().await;
+        })
+    };
+
+    // 6.5. Start Materialized View refresh task
+    let mv_refresh_handle = {
+        let db_ref = Arc::clone(&db);
+        tokio::spawn(async move {
+            // Give it an initial delay so it doesn't run right at startup
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            
+            // Initial refresh
+            if let Err(e) = db_ref.refresh_materialized_views().await {
+                tracing::error!("Failed initial refresh of materialized views: {}", e);
+            }
+
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // Every 5 minutes
+            loop {
+                interval.tick().await;
+                if let Err(e) = db_ref.refresh_materialized_views().await {
+                    tracing::error!("Failed to refresh materialized views: {}", e);
+                }
+            }
         })
     };
 
@@ -277,6 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         _ = scanner_handle => tracing::info!("Scanner stopped"),
         _ = asn_refresh_handle => tracing::info!("ASN refresh stopped"),
+        _ = mv_refresh_handle => tracing::info!("MV refresh stopped"),
         _ = api_handle => tracing::info!("API stopped"),
     }
 

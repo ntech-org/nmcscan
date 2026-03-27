@@ -178,7 +178,7 @@ impl AsnFetcher {
         
         // Group entries by ASN to reduce categorization calls
         let mut asn_map: std::collections::HashMap<String, (String, String, Vec<String>)> = std::collections::HashMap::new();
-        let mut ranges = Vec::new();
+        let mut range_dedup: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
         for line in tsv_content.lines() {
             let parts: Vec<&str> = line.split('\t').collect();
@@ -203,59 +203,77 @@ impl AsnFetcher {
                 
                 // Add first /24 of the range
                 let cidr = format!("{}.{}.{}.0/24", start_octets[0], start_octets[1], start_octets[2]);
-                ranges.push((cidr, asn.clone()));
+                range_dedup.insert(cidr, asn.clone());
 
                 // If range is large (e.g. /16), add a middle /24 too to increase coverage
                 if start_octets[1] != end_octets[1] || (end_octets[2] as i16 - start_octets[2] as i16) > 10 {
                     let mid_cidr = format!("{}.{}.{}.0/24", start_octets[0], start_octets[1], start_octets[2] + 5);
-                    ranges.push((mid_cidr, asn));
+                    range_dedup.insert(mid_cidr, asn);
                 }
             }
         }
 
+        let ranges: Vec<(String, String)> = range_dedup.into_iter().collect();
         tracing::info!("Importing {} ASNs and {} discovery ranges into database...", asn_map.len(), ranges.len());
         
         let mut tx = self.db.pool().begin().await.map_err(|e| AsnError::MaxMindError(format!("Transaction start error: {}", e)))?;
 
-        // Bulk upsert ASNs
+        // Prepare ASN rows with categorization
+        let mut asn_rows: Vec<(String, String, String, String, String)> = Vec::with_capacity(asn_map.len());
         for (asn, (org, country, _)) in asn_map {
             let (category, tags) = AsnManager::categorize_by_org(&org);
             let tags_str = tags.join(",");
-            sqlx::query(
-                r#"
-                INSERT INTO asns (asn, org, category, country, tags, last_updated)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(asn) DO UPDATE SET
-                    org = excluded.org, 
-                    category = excluded.category, 
-                    country = COALESCE(excluded.country, asns.country), 
-                    tags = COALESCE(excluded.tags, asns.tags),
-                    last_updated = CURRENT_TIMESTAMP
-                "#,
-            )
-            .bind(asn)
-            .bind(org)
-            .bind(match category {
+            let cat_str = match category {
                 AsnCategory::Hosting => "hosting",
                 AsnCategory::Residential => "residential",
                 AsnCategory::Excluded => "excluded",
                 AsnCategory::Unknown => "unknown",
-            })
-            .bind(country)
-            .bind(tags_str)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AsnError::MaxMindError(format!("ASN bulk error: {}", e)))?;
+            }.to_string();
+            asn_rows.push((asn, org, cat_str, country, tags_str));
         }
 
-        // Bulk upsert ranges
-        for (cidr, asn) in ranges {
-            sqlx::query("INSERT INTO asn_ranges (cidr, asn) VALUES (?, ?) ON CONFLICT(cidr) DO UPDATE SET asn = excluded.asn")
-                .bind(cidr)
-                .bind(asn)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| AsnError::MaxMindError(format!("Range bulk error: {}", e)))?;
+        // Batch upsert ASNs (5 params per row, ~200 rows per batch)
+        for chunk in asn_rows.chunks(200) {
+            let mut values = String::new();
+            let mut param_idx = 1;
+            for (i, _) in chunk.iter().enumerate() {
+                if i > 0 { values.push_str(", "); }
+                values.push_str(&format!("(${}, ${}, ${}, ${}, ${}, CURRENT_TIMESTAMP)",
+                    param_idx, param_idx+1, param_idx+2, param_idx+3, param_idx+4));
+                param_idx += 5;
+            }
+            let query = format!(
+                "INSERT INTO asns (asn, org, category, country, tags, last_updated) VALUES {}
+                 ON CONFLICT(asn) DO UPDATE SET org = excluded.org, category = excluded.category,
+                 country = COALESCE(excluded.country, asns.country),
+                 tags = COALESCE(excluded.tags, asns.tags), last_updated = CURRENT_TIMESTAMP",
+                values
+            );
+            let mut q = sqlx::query(&query);
+            for (asn, org, cat, country, tags) in chunk {
+                q = q.bind(asn).bind(org).bind(cat).bind(country).bind(tags);
+            }
+            q.execute(&mut *tx).await
+                .map_err(|e| AsnError::MaxMindError(format!("ASN batch error: {}", e)))?;
+        }
+
+        // Batch upsert ranges (2 params per row, ~500 rows per batch)
+        for chunk in ranges.chunks(500) {
+            let mut values = String::new();
+            for (i, _) in chunk.iter().enumerate() {
+                if i > 0 { values.push_str(", "); }
+                values.push_str(&format!("(${}, ${})", i*2+1, i*2+2));
+            }
+            let query = format!(
+                "INSERT INTO asn_ranges (cidr, asn) VALUES {} ON CONFLICT(cidr) DO UPDATE SET asn = excluded.asn",
+                values
+            );
+            let mut q = sqlx::query(&query);
+            for (cidr, asn) in chunk {
+                q = q.bind(cidr).bind(asn);
+            }
+            q.execute(&mut *tx).await
+                .map_err(|e| AsnError::MaxMindError(format!("Range batch error: {}", e)))?;
         }
 
         tx.commit().await.map_err(|e| AsnError::MaxMindError(format!("Transaction commit error: {}", e)))?;

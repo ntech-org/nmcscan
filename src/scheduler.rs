@@ -387,6 +387,59 @@ impl Scheduler {
         )
     }
 
+    /// Periodically refill queues from DB with servers whose scan interval has elapsed.
+    /// Prevents scanner from stalling when in-memory queues drain after initial batch.
+    pub async fn try_refill_queues(&self) {
+        let now = Utc::now();
+
+        struct QueueCheck {
+            queue: Arc<Mutex<VecDeque<ServerTarget>>>,
+            priority: i32,
+            interval_hours: i64,
+            threshold: usize,
+            limit: i64,
+        }
+
+        let checks = vec![
+            QueueCheck { queue: Arc::clone(&self.hot_queue), priority: 1, interval_hours: 4, threshold: 1000, limit: 500 },
+            QueueCheck { queue: Arc::clone(&self.warm_queue), priority: 2, interval_hours: 24, threshold: 500, limit: 300 },
+            QueueCheck { queue: Arc::clone(&self.cold_queue), priority: 3, interval_hours: 168, threshold: 500, limit: 200 },
+        ];
+
+        for check in checks {
+            if check.queue.lock().await.len() >= check.threshold { continue; }
+
+            let interval_str = format!("{} hours", check.interval_hours);
+            let ready_servers = match sqlx::query_as::<_, crate::db::Server>(
+                "SELECT * FROM servers WHERE priority = $1 \
+                 AND (last_seen IS NULL OR last_seen < NOW() - CAST($2 AS INTERVAL)) \
+                 AND status != 'ignored' \
+                 ORDER BY last_seen ASC NULLS FIRST LIMIT $3"
+            )
+            .bind(check.priority)
+            .bind(&interval_str)
+            .bind(check.limit)
+            .fetch_all(self.db.pool())
+            .await
+            {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            if ready_servers.is_empty() { continue; }
+
+            tracing::info!("Queue refill: adding {} priority={} servers from DB", ready_servers.len(), check.priority);
+            let mut q = check.queue.lock().await;
+            for server in ready_servers {
+                let mut target = ServerTarget::new(server.ip, server.port as u16, server.server_type);
+                target.priority = check.priority;
+                target.last_scanned = server.last_seen.map(|t| t.and_utc());
+                target.next_scan_at = None; // Ready to scan now
+                q.push_back(target);
+            }
+        }
+    }
+
     pub async fn load_from_database(&self) -> Result<(), crate::db::DatabaseError> {
         // Only load servers that are currently online or have been online in the past.
         // We filter out 'unknown' status servers which were likely just potential discovery targets.

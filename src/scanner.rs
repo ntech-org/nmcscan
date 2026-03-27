@@ -231,6 +231,7 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    #[ignore = "Requires postgres db"]
     async fn test_scanner_build() {
         let db = Arc::new(Database::new(":memory:").await.unwrap());
         // Since test_excluded_server_skipped was using ExcludeList, we need to adapt it

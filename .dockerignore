@@ -1,0 +1,8 @@
+target
+dashboard/node_modules
+dashboard/build
+dashboard/.svelte-kit
+.git
+.env
+data/*.db
+data/maxmind/*

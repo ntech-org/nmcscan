@@ -5,6 +5,7 @@
 
     interface PlayerResponse {
         ip: string;
+        port: number;
         player_name: string;
         last_seen: string;
     }

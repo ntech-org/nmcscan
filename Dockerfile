@@ -1,33 +1,37 @@
 # Build stage
-FROM rust:1.85-slim-bookworm as builder
+FROM rust:1.94.0-slim-bookworm as builder
 
-# Install build tools (sqlite3 only for CLI/testing if needed, gcc/make for other C deps)
+# Install build tools and lld linker for faster linking
 RUN apt-get update && apt-get install -y \
-    sqlite3 \
-    gcc \
+    clang \
+    lld \
+    pkg-config \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/nmcscan
 
-# Copy dependency manifest and build a dummy main.rs for caching
+# Set RUSTFLAGS to use lld linker
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+
+# Copy dependency manifest and build dependencies separately for caching
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
 RUN rm -f target/release/deps/nmcscan*
 
-# Copy the real source code and build it
+# Copy the real source code and build the application
 COPY src ./src
 RUN cargo build --release
 
-# Final runtime stage (using a very small distroless-like image for security and speed)
+# Final runtime stage
 FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install runtime dependencies (sqlite3 if needed for the db)
+# Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from the builder stage

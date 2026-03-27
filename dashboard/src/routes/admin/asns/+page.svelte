@@ -1,121 +1,181 @@
 <script lang="ts">
-    import { onMount } from 'svelte';
-    import { fetchWithAuth, authState } from '$lib/state.svelte';
+  import { onMount } from 'svelte';
+  import { fetchWithAuth } from '$lib/state.svelte';
+  import * as Card from "$lib/components/ui/card";
+  import * as Table from "$lib/components/ui/table";
+  import { Button } from "$lib/components/ui/button";
+  import { Badge } from "$lib/components/ui/badge";
+  import Network from "@lucide/svelte/icons/network";
+  import RefreshCcw from "@lucide/svelte/icons/refresh-ccw";
+  import Globe2 from "@lucide/svelte/icons/globe-2";
+  import ExternalLink from "@lucide/svelte/icons/external-link";
 
-    interface Asn {
-        asn: string;
-        org: string;
-        category: string;
-        country: string | null;
-        server_count: number;
-        tags: string[];
+  interface Asn {
+    asn: string;
+    org: string;
+    category: string;
+    country: string | null;
+    server_count: number;
+    tags: string[];
+  }
+
+  let asns = $state<Asn[]>([]);
+  let total = $state(0);
+  let page = $state(0);
+  let limit = $state(50);
+  let loading = $state(true);
+  let error = $state<string | null>(null);
+
+  async function loadAsns() {
+    loading = true;
+    try {
+      const res = await fetchWithAuth(`/api/asns?page=${page}&limit=${limit}`);
+      const data = await res.json();
+      asns = data.items;
+      total = data.total;
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to load ASNs';
+    } finally {
+      loading = false;
     }
+  }
 
-    let asns = $state<Asn[]>([]);
-    let loading = $state(true);
-    let error = $state<string | null>(null);
-
-    async function loadAsns() {
-        if (!authState.isAuthenticated) return;
-        loading = true;
-        try {
-            const res = await fetchWithAuth('/api/asns');
-            asns = await res.json();
-        } catch (e) {
-            error = e instanceof Error ? e.message : 'Failed to load ASNs';
-        } finally {
-            loading = false;
-        }
+  function nextPage() {
+    if ((page + 1) * limit < total) {
+      page += 1;
+      loadAsns();
     }
+  }
 
-    function getCategoryColor(category: string): string {
-        const cat = category.toLowerCase();
-        if (cat.includes('hosting')) return 'text-blue-400 bg-blue-400/10 border-blue-500/20';
-        if (cat.includes('residential')) return 'text-orange-400 bg-orange-400/10 border-orange-500/20';
-        return 'text-gray-400 bg-gray-400/10 border-gray-500/20';
+  function prevPage() {
+    if (page > 0) {
+      page -= 1;
+      loadAsns();
     }
+  }
 
-    function getTagColor(tag: string): string {
-        const t = tag.toLowerCase();
-        if (t.includes('ddos')) return 'text-red-400 bg-red-400/10 border-red-500/20';
-        if (t.includes('cloud')) return 'text-purple-400 bg-purple-400/10 border-purple-500/20';
-        if (t.includes('cdn')) return 'text-teal-400 bg-teal-400/10 border-teal-500/20';
-        if (t.includes('vpn') || t.includes('proxy')) return 'text-yellow-400 bg-yellow-400/10 border-yellow-500/20';
-        if (t.includes('defense') || t.includes('security')) return 'text-red-500 bg-red-500/10 border-red-600/20';
-        return 'text-gray-400 bg-gray-400/10 border-gray-500/20';
-    }
-
-    onMount(() => {
-        loadAsns();
-    });
+  onMount(() => {
+    loadAsns();
+  });
 </script>
 
 <div class="space-y-6">
-    <div class="flex items-center justify-between">
-        <h1 class="text-2xl font-bold text-white tracking-tight">Network Topology Map</h1>
-        <button onclick={loadAsns} aria-label="Refresh ASNs" class="p-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-gray-300 transition-colors shadow-sm">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-        </button>
+  <div class="flex items-center justify-between">
+    <div class="space-y-1">
+      <h2 class="text-3xl font-bold tracking-tight italic flex items-center gap-3">
+        <Network class="text-primary" />
+        Network Topology
+      </h2>
+      <p class="text-muted-foreground italic text-sm">Explore the infrastructure of discovered Minecraft networks.</p>
     </div>
+    <div class="flex items-center gap-2">
+      <div class="flex items-center gap-1 bg-muted/30 px-3 py-1.5 rounded-full border border-muted text-xs font-mono italic mr-2 shadow-sm">
+        <span class="text-primary font-bold">{page * limit + 1}-{Math.min((page + 1) * limit, total)}</span>
+        <span class="text-muted-foreground">of</span>
+        <span class="text-foreground font-bold">{total.toLocaleString()}</span>
+      </div>
+      <Button 
+        variant="outline" 
+        size="icon" 
+        onclick={loadAsns} 
+        disabled={loading}
+        class="rounded-full h-10 w-10 shadow-sm"
+      >
+        <RefreshCcw class="h-4 w-4 {loading ? 'animate-spin' : ''}" />
+      </Button>
+    </div>
+  </div>
 
-    {#if error}
-        <div class="p-4 bg-red-500/10 border border-red-500/20 text-red-400 rounded-xl">
-            {error}
-        </div>
-    {/if}
+  {#if error}
+    <div class="p-4 bg-destructive/10 border border-destructive/20 text-destructive rounded-xl italic text-sm">
+      {error}
+    </div>
+  {/if}
 
-    <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden shadow-sm">
-        <div class="overflow-x-auto">
-            <table class="w-full text-left border-collapse">
-                <thead>
-                    <tr class="bg-gray-950/50 text-gray-400 text-xs uppercase tracking-wider">
-                        <th class="p-4 font-medium">ASN</th>
-                        <th class="p-4 font-medium">Organization</th>
-                        <th class="p-4 font-medium">Classification</th>
-                        <th class="p-4 font-medium text-center">Servers</th>
-                        <th class="p-4 font-medium text-center">Country</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-gray-800/50">
-                    {#if loading && asns.length === 0}
-                        <tr><td colspan="5" class="p-8 text-center text-gray-500"><svg class="animate-spin h-6 w-6 mx-auto text-blue-500" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg></td></tr>
-                    {/if}
-                    {#each asns as asn}
-                        <tr class="hover:bg-gray-800/20 transition-colors">
-                            <td class="p-4 font-mono text-sm">
-                                <a href={`/admin/servers?asn=${asn.asn}`} class="text-blue-400 hover:text-blue-300 hover:underline">
-                                    {asn.asn}
-                                </a>
-                            </td>
-                            <td class="p-4 text-sm text-gray-200">
-                                <div class="font-medium">{asn.org}</div>
-                                <div class="flex flex-wrap gap-1 mt-1">
-                                    {#each asn.tags as tag}
-                                        <span class="px-1.5 py-0.5 rounded-md border {getTagColor(tag)} text-[10px] font-bold uppercase tracking-tight">
-                                            {tag}
-                                        </span>
-                                    {/each}
-                                </div>
-                            </td>
-                            <td class="p-4">
-                                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full border {getCategoryColor(asn.category)} text-xs font-medium">
-                                    {asn.category}
-                                </span>
-                            </td>
-                            <td class="p-4 text-center text-sm text-gray-400">
-                                {asn.server_count.toLocaleString()}
-                            </td>
-                            <td class="p-4 text-center">
-                                {#if asn.country}
-                                    <img src={`https://flagcdn.com/24x18/${asn.country.toLowerCase()}.png`} alt={asn.country} title={asn.country} class="inline-block rounded shadow-sm opacity-80" />
-                                {:else}
-                                    <span class="text-gray-500">-</span>
-                                {/if}
-                            </td>
-                        </tr>
+  <Card.Root class="bg-card shadow-lg border-muted overflow-hidden">
+    <Card.Content class="p-0">
+      <Table.Root>
+        <Table.Header>
+          <Table.Row class="bg-muted/30 hover:bg-muted/30 uppercase tracking-widest text-[10px] font-bold">
+            <Table.Head>ASN</Table.Head>
+            <Table.Head>Organization</Table.Head>
+            <Table.Head>Classification</Table.Head>
+            <Table.Head class="text-center">Servers</Table.Head>
+            <Table.Head class="text-right pr-6">Region</Table.Head>
+          </Table.Row>
+        </Table.Header>
+        <Table.Body>
+          {#if loading}
+            <Table.Row>
+              <Table.Cell colspan={5} class="h-24 text-center italic text-muted-foreground">
+                Mapping network infrastructure...
+              </Table.Cell>
+            </Table.Row>
+          {:else if asns.length === 0}
+            <Table.Row>
+              <Table.Cell colspan={5} class="h-24 text-center italic text-muted-foreground">
+                No network data available.
+              </Table.Cell>
+            </Table.Row>
+          {/if}
+          
+          {#each asns as asn}
+            <Table.Row class="group">
+              <Table.Cell class="font-mono text-sm font-semibold text-primary">
+                <a href={`/admin/servers?asn=${asn.asn}`} class="hover:underline">
+                  {asn.asn}
+                </a>
+              </Table.Cell>
+              <Table.Cell>
+                <div class="flex flex-col gap-1">
+                  <span class="font-bold text-sm tracking-tight">{asn.org}</span>
+                  <div class="flex flex-wrap gap-1">
+                    {#each asn.tags as tag}
+                      <Badge variant="outline" class="text-[9px] px-1.5 py-0 uppercase font-bold tracking-tighter italic">
+                        {tag}
+                      </Badge>
                     {/each}
-                </tbody>
-            </table>
-        </div>
+                  </div>
+                </div>
+              </Table.Cell>
+              <Table.Cell>
+                <Badge variant={asn.category === 'Hosting' ? 'default' : 'outline'} class="text-[10px] uppercase font-bold py-0 italic">
+                  {asn.category}
+                </Badge>
+              </Table.Cell>
+              <Table.Cell class="text-center font-mono text-sm">
+                {asn.server_count.toLocaleString()}
+              </Table.Cell>
+              <Table.Cell class="text-right pr-6">
+                {#if asn.country}
+                  <div class="flex items-center justify-end gap-2">
+                    <span class="text-xs font-bold uppercase text-muted-foreground">{asn.country}</span>
+                    <img 
+                      src={`https://flagcdn.com/24x18/${asn.country.toLowerCase()}.png`} 
+                      alt={asn.country} 
+                      class="rounded shadow-sm opacity-80" 
+                    />
+                  </div>
+                {:else}
+                  <Globe2 class="w-4 h-4 ml-auto text-muted-foreground/30" />
+                {/if}
+              </Table.Cell>
+            </Table.Row>
+          {/each}
+        </Table.Body>
+      </Table.Root>
+    </Card.Content>
+  </Card.Root>
+
+  <div class="flex items-center justify-center gap-4">
+    <Button variant="outline" size="sm" onclick={prevPage} disabled={page === 0 || loading}>
+      Previous
+    </Button>
+    <div class="text-xs font-bold italic text-muted-foreground uppercase tracking-wider">
+      Page {page + 1}
     </div>
+    <Button variant="outline" size="sm" onclick={nextPage} disabled={(page + 1) * limit >= total || loading}>
+      Next
+    </Button>
+  </div>
 </div>

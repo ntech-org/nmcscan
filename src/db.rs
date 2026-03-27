@@ -1,10 +1,11 @@
-//! Database module with SQLite and WAL mode.
+//! Database module with PostgreSQL.
 //!
 //! Stores server information with priority-based scheduling support.
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sea_orm::{DatabaseConnection, SqlxPostgresConnector};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -14,6 +15,8 @@ use crate::asn::{AsnCategory, AsnRecord};
 pub enum DatabaseError {
     #[error("Database error: {0}")]
     SqlxError(#[from] sqlx::Error),
+    #[error("SeaORM error: {0}")]
+    SeaOrmError(#[from] sea_orm::DbErr),
 }
 
 /// Server status record from database.
@@ -61,113 +64,36 @@ pub struct AsnRangeRow {
 
 /// Database wrapper with connection pool.
 pub struct Database {
-    pool: SqlitePool,
+    pool: PgPool,
+    sea_db: DatabaseConnection,
 }
 
 impl Database {
-    /// Create a new database connection with WAL mode enabled.
-    pub async fn new(db_path: &str) -> Result<Self, DatabaseError> {
-        // Ensure proper SQLite URL format
-        let mut url = if db_path.starts_with("sqlite:") || db_path.starts_with("file:") {
-            db_path.to_string()
-        } else if db_path == ":memory:" {
-            "sqlite::memory:".to_string()
-        } else {
-            format!("sqlite:{}", db_path)
-        };
-
-        // Ensure the file is created if it doesn't exist
-        if !url.contains('?') {
-            url.push_str("?mode=rwc");
-        } else if !url.contains("mode=rwc") {
-            url.push_str("&mode=rwc");
-        }
-        
-        let pool = SqlitePoolOptions::new()
-            .max_connections(10)
+    /// Create a new database connection
+    pub async fn new(db_url: &str) -> Result<Self, DatabaseError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(20)
             .acquire_timeout(Duration::from_secs(30))
-            .connect(&url)
+            .connect(db_url)
             .await?;
 
-        // Enable WAL mode and optimize settings
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous = NORMAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA cache_size = -64000") // 64MB cache
-            .execute(&pool)
-            .await?;
-
-        // Create tables
         Self::init_schema(&pool).await?;
+        let sea_db = SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone());
 
-        tracing::info!("Database initialized at {}", db_path);
-        Ok(Self { pool })
+        tracing::info!("Database initialized connected to postgres");
+        Ok(Self { pool, sea_db })
     }
 
     /// Initialize database schema and run migrations if needed.
-    async fn init_schema(pool: &SqlitePool) -> Result<(), DatabaseError> {
-        // Check if migration is needed (old schema has 'ip TEXT PRIMARY KEY')
-        let schema_sql: Option<String> = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='servers'")
-            .fetch_optional(pool)
-            .await?;
-
-        if let Some(sql) = schema_sql {
-            if sql.contains("ip TEXT PRIMARY KEY") {
-                tracing::info!("Migrating database schema to support composite keys and server_type...");
-                
-                // 1. Rename old tables
-                sqlx::query("ALTER TABLE servers RENAME TO servers_old").execute(pool).await?;
-                sqlx::query("ALTER TABLE server_players RENAME TO server_players_old").execute(pool).await?;
-                sqlx::query("ALTER TABLE server_history RENAME TO server_history_old").execute(pool).await?;
-                
-                // 2. Create new tables
-                Self::create_tables(pool).await?;
-                
-                // 3. Copy data
-                tracing::info!("Copying server data...");
-                sqlx::query("INSERT INTO servers (ip, port, server_type, status, players_online, players_max, motd, version, priority, last_seen, consecutive_failures, whitelist_prob, asn, country, favicon, brand) SELECT ip, port, 'java', status, players_online, players_max, motd, version, priority, last_seen, consecutive_failures, whitelist_prob, asn, country, favicon, brand FROM servers_old").execute(pool).await?;
-                
-                tracing::info!("Copying player data...");
-                sqlx::query("INSERT INTO server_players (ip, port, player_name, player_uuid, last_seen) SELECT p.ip, COALESCE(s.port, 25565), p.player_name, p.player_uuid, p.last_seen FROM server_players_old p LEFT JOIN servers_old s ON p.ip = s.ip").execute(pool).await?;
-                
-                tracing::info!("Copying history data...");
-                sqlx::query("INSERT INTO server_history (ip, port, timestamp, players_online) SELECT h.ip, COALESCE(s.port, 25565), h.timestamp, h.players_online FROM server_history_old h LEFT JOIN servers_old s ON h.ip = s.ip").execute(pool).await?;
-                
-                // 4. Drop old tables
-                sqlx::query("DROP TABLE servers_old").execute(pool).await?;
-                sqlx::query("DROP TABLE server_players_old").execute(pool).await?;
-                sqlx::query("DROP TABLE server_history_old").execute(pool).await?;
-                
-                tracing::info!("Database migration completed successfully.");
-            } else {
-                Self::create_tables(pool).await?;
-            }
-        } else {
-            Self::create_tables(pool).await?;
-        }
-
-        // Attempt to add new columns if table already exists
-        let _ = sqlx::query("ALTER TABLE servers ADD COLUMN asn TEXT;").execute(pool).await;
-        let _ = sqlx::query("ALTER TABLE servers ADD COLUMN country TEXT;").execute(pool).await;
-        let _ = sqlx::query("ALTER TABLE servers ADD COLUMN favicon TEXT;").execute(pool).await;
-        let _ = sqlx::query("ALTER TABLE servers ADD COLUMN brand TEXT;").execute(pool).await;
-        let _ = sqlx::query("ALTER TABLE asns ADD COLUMN tags TEXT;").execute(pool).await;
-        let _ = sqlx::query("ALTER TABLE asn_ranges ADD COLUMN scan_offset INTEGER DEFAULT 0;").execute(pool).await;
-        let _ = sqlx::query("ALTER TABLE asn_ranges ADD COLUMN last_scanned_at TIMESTAMP;").execute(pool).await;
-
-        // Cleanup: Remove 'unknown' status servers
-        sqlx::query("DELETE FROM servers WHERE status = 'unknown'").execute(pool).await?;
-
-        // Cleanup: Remove any IPv6 ranges
-        let _ = sqlx::query("DELETE FROM asn_ranges WHERE cidr LIKE '%:%'").execute(pool).await;
-
+    async fn init_schema(pool: &PgPool) -> Result<(), DatabaseError> {
+        Self::create_tables(pool).await?;
         Ok(())
     }
 
-    async fn create_tables(pool: &SqlitePool) -> Result<(), DatabaseError> {
+    async fn create_tables(pool: &PgPool) -> Result<(), DatabaseError> {
+        // Trigram extension for fast text search
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_trgm").execute(pool).await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS servers (
@@ -182,7 +108,7 @@ impl Database {
                 priority INTEGER DEFAULT 2,
                 last_seen TIMESTAMP,
                 consecutive_failures INTEGER DEFAULT 0,
-                whitelist_prob REAL DEFAULT 0.0,
+                whitelist_prob DOUBLE PRECISION DEFAULT 0.0,
                 asn TEXT,
                 country TEXT,
                 favicon TEXT,
@@ -204,7 +130,7 @@ impl Database {
                 player_uuid TEXT,
                 last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (ip, port, player_name),
-                FOREIGN KEY (ip, port) REFERENCES servers(ip, port)
+                FOREIGN KEY (ip, port) REFERENCES servers(ip, port) ON DELETE CASCADE
             )
             "#
         )
@@ -219,7 +145,7 @@ impl Database {
                 port INTEGER DEFAULT 25565,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 players_online INTEGER,
-                FOREIGN KEY (ip, port) REFERENCES servers(ip, port)
+                FOREIGN KEY (ip, port) REFERENCES servers(ip, port) ON DELETE CASCADE
             )
             "#
         )
@@ -235,7 +161,7 @@ impl Database {
                 category TEXT NOT NULL DEFAULT 'unknown',
                 country TEXT,
                 tags TEXT,
-                last_updated TIMESTAMP
+                last_updated TIMESTAMPTZ
             )
             "#
         )
@@ -247,9 +173,9 @@ impl Database {
             CREATE TABLE IF NOT EXISTS asn_ranges (
                 cidr TEXT PRIMARY KEY,
                 asn TEXT NOT NULL,
-                scan_offset INTEGER DEFAULT 0,
+                scan_offset BIGINT DEFAULT 0,
                 last_scanned_at TIMESTAMP,
-                FOREIGN KEY (asn) REFERENCES asns(asn)
+                FOREIGN KEY (asn) REFERENCES asns(asn) ON DELETE CASCADE
             )
             "#
         )
@@ -276,17 +202,114 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_status ON servers(status)").execute(pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_priority ON servers(priority, last_seen)").execute(pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_asn ON servers(asn)").execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_asn_status ON servers(asn, status) INCLUDE (ip)").execute(pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_servers_players ON servers(players_online)").execute(pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_asns_category ON asns(category)").execute(pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_asn_ranges_asn ON asn_ranges(asn)").execute(pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_player_name ON server_players(player_name)").execute(pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_server_history_ip_port ON server_history(ip, port)").execute(pool).await?;
 
+        // Trigram indexes for fast search
+        sqlx::query("CREATE INDEX IF NOT EXISTS trgm_idx_servers_ip ON servers USING GIN (ip gin_trgm_ops)").execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS trgm_idx_servers_motd ON servers USING GIN (motd gin_trgm_ops)").execute(pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS trgm_idx_servers_version ON servers USING GIN (version gin_trgm_ops)").execute(pool).await?;
+
+        // Auth.js Tables
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                name TEXT,
+                email TEXT UNIQUE,
+                "emailVerified" TIMESTAMPTZ,
+                image TEXT,
+                role TEXT NOT NULL DEFAULT 'user'
+            )
+            "#
+        ).execute(pool).await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS accounts (
+                id SERIAL PRIMARY KEY,
+                "userId" INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                type TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                "providerAccountId" TEXT NOT NULL,
+                refresh_token TEXT,
+                access_token TEXT,
+                expires_at BIGINT,
+                token_type TEXT,
+                scope TEXT,
+                id_token TEXT,
+                session_state TEXT,
+                UNIQUE(provider, "providerAccountId")
+            )
+            "#
+        ).execute(pool).await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS sessions (
+                id SERIAL PRIMARY KEY,
+                "sessionToken" TEXT NOT NULL UNIQUE,
+                "userId" INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                expires TIMESTAMPTZ NOT NULL
+            )
+            "#
+        ).execute(pool).await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS verification_token (
+                identifier TEXT NOT NULL,
+                token TEXT NOT NULL,
+                expires TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (identifier, token)
+            )
+            "#
+        ).execute(pool).await?;
+
+        // Create Materialized View for fast ASN stats
+        sqlx::query(
+            r#"
+            CREATE MATERIALIZED VIEW IF NOT EXISTS asn_stats AS
+            SELECT a.asn, a.org, a.category, a.country, a.tags, a.last_updated,
+                   COUNT(s.ip)::bigint as server_count
+            FROM asns a
+            LEFT JOIN servers s ON s.asn = a.asn AND s.status != 'ignored'
+            GROUP BY a.asn
+            "#
+        ).execute(pool).await?;
+
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_asn_stats_asn ON asn_stats(asn)").execute(pool).await?;
+
+        // Create Materialized View for fast global stats
+        sqlx::query(
+            r#"
+            CREATE MATERIALIZED VIEW IF NOT EXISTS global_stats AS
+            SELECT 
+                (SELECT COUNT(*)::bigint FROM servers WHERE status != 'ignored') as server_count,
+                (SELECT COUNT(*)::bigint FROM servers WHERE status = 'online') as online_count,
+                (SELECT COALESCE(SUM(players_online), 0)::bigint FROM servers WHERE status = 'online') as total_players,
+                1 as id
+            "#
+        ).execute(pool).await?;
+        
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_global_stats_id ON global_stats(id)").execute(pool).await?;
+
+        Ok(())
+    }
+
+    /// Refresh materialized views
+    pub async fn refresh_materialized_views(&self) -> Result<(), DatabaseError> {
+        sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY asn_stats").execute(&self.pool).await?;
+        sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY global_stats").execute(&self.pool).await?;
         Ok(())
     }
 
     /// Get the connection pool.
-    pub fn pool(&self) -> &SqlitePool {
+    pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
@@ -296,7 +319,7 @@ impl Database {
             r#"
             INSERT INTO servers (ip, port, server_type, status, players_online, players_max, motd, version, 
                                 priority, last_seen, consecutive_failures, whitelist_prob, asn, country, favicon, brand)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT(ip, port) DO UPDATE SET
                 server_type = excluded.server_type,
                 status = excluded.status,
@@ -338,7 +361,7 @@ impl Database {
 
     /// Get a server by IP and port.
     pub async fn get_server(&self, ip: &str, port: i32) -> Result<Option<Server>, DatabaseError> {
-        let server = sqlx::query_as::<_, Server>("SELECT * FROM servers WHERE ip = ? AND port = ?")
+        let server = sqlx::query_as::<_, Server>("SELECT * FROM servers WHERE ip = $1 AND port = $2")
             .bind(ip)
             .bind(port)
             .fetch_optional(&self.pool)
@@ -348,8 +371,8 @@ impl Database {
 
     /// Get servers ordered by priority (for scheduler).
     pub async fn get_servers_by_priority(&self, limit: i32) -> Result<Vec<Server>, DatabaseError> {
-        let servers = sqlx::query_as::<_, Server>("SELECT * FROM servers ORDER BY priority ASC, last_seen ASC LIMIT ?")
-            .bind(limit)
+        let servers = sqlx::query_as::<_, Server>("SELECT * FROM servers ORDER BY priority ASC, last_seen ASC LIMIT $1")
+            .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?;
         Ok(servers)
@@ -357,8 +380,8 @@ impl Database {
 
     /// Get online servers ordered by player count (for API).
     pub async fn get_online_servers(&self, limit: i32) -> Result<Vec<Server>, DatabaseError> {
-        let servers = sqlx::query_as::<_, Server>("SELECT * FROM servers WHERE status = 'online' ORDER BY players_online DESC LIMIT ?")
-            .bind(limit)
+        let servers = sqlx::query_as::<_, Server>("SELECT * FROM servers WHERE status = 'online' ORDER BY players_online DESC LIMIT $1")
+            .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?;
         Ok(servers)
@@ -388,7 +411,8 @@ impl Database {
         
         if let Some(status) = status_filter {
             if status != "all" {
-                query.push_str(&format!(" AND status = '{}'", status));
+                let safe_status = status.replace("'", "''");
+                query.push_str(&format!(" AND status = '{}'", safe_status));
             }
         }
 
@@ -399,7 +423,7 @@ impl Database {
 
         if let Some(search) = search_query {
             let safe_search = search.replace("'", "''");
-            query.push_str(&format!(" AND (ip LIKE '%{}%' OR motd LIKE '%{}%' OR version LIKE '%{}%')", safe_search, safe_search, safe_search));
+            query.push_str(&format!(" AND (ip ILIKE '%{}%' OR motd ILIKE '%{}%' OR version ILIKE '%{}%')", safe_search, safe_search, safe_search));
         }
         
         if let Some(min_p) = min_players {
@@ -412,7 +436,7 @@ impl Database {
         
         if let Some(ver) = version {
             let safe_ver = ver.replace("'", "''");
-            query.push_str(&format!(" AND version LIKE '%{}%'", safe_ver));
+            query.push_str(&format!(" AND version ILIKE '%{}%'", safe_ver));
         }
         
         if let Some(prob) = whitelist_prob_min {
@@ -496,7 +520,7 @@ impl Database {
     /// Get players for a specific server
     pub async fn get_server_players(&self, ip: &str, port: i32) -> Result<Vec<(String, String, NaiveDateTime)>, DatabaseError> {
         let rows = sqlx::query_as::<_, (String, String, NaiveDateTime)>(
-            "SELECT player_name, player_uuid, last_seen FROM server_players WHERE ip = ? AND port = ? ORDER BY last_seen DESC LIMIT 100"
+            "SELECT player_name, player_uuid, last_seen FROM server_players WHERE ip = $1 AND port = $2 ORDER BY last_seen DESC LIMIT 100"
         )
         .bind(ip)
         .bind(port)
@@ -508,11 +532,11 @@ impl Database {
     /// Get player count history for a server
     pub async fn get_server_history(&self, ip: &str, port: i32, limit: i32) -> Result<Vec<(NaiveDateTime, i32)>, DatabaseError> {
         let rows = sqlx::query_as::<_, (NaiveDateTime, i32)>(
-            "SELECT timestamp, players_online FROM server_history WHERE ip = ? AND port = ? ORDER BY timestamp DESC LIMIT ?"
+            "SELECT timestamp, players_online FROM server_history WHERE ip = $1 AND port = $2 ORDER BY timestamp DESC LIMIT $3"
         )
         .bind(ip)
         .bind(port)
-        .bind(limit)
+        .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().rev().collect()) // Return in chronological order
@@ -522,7 +546,7 @@ impl Database {
     pub async fn search_players(&self, name: &str) -> Result<Vec<(String, i32, String, NaiveDateTime)>, DatabaseError> {
         let safe_name = name.replace("'", "''");
         let query = format!(
-            "SELECT ip, port, player_name, last_seen FROM server_players WHERE player_name LIKE '%{}%' COLLATE NOCASE ORDER BY last_seen DESC LIMIT 50",
+            "SELECT ip, port, player_name, last_seen FROM server_players WHERE player_name ILIKE '%{}%' ORDER BY last_seen DESC LIMIT 50",
             safe_name
         );
         let rows = sqlx::query_as::<_, (String, i32, String, NaiveDateTime)>(&query)
@@ -533,20 +557,20 @@ impl Database {
 
     /// Get server count.
     pub async fn get_server_count(&self) -> Result<i64, DatabaseError> {
-        let (count,) = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM servers WHERE status != 'ignored'").fetch_one(&self.pool).await?;
-        Ok(count)
+        let count: Option<i64> = sqlx::query_scalar("SELECT server_count FROM global_stats WHERE id = 1").fetch_one(&self.pool).await?;
+        Ok(count.unwrap_or(0))
     }
 
     /// Get online server count.
     pub async fn get_online_count(&self) -> Result<i64, DatabaseError> {
-        let (count,) = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM servers WHERE status = 'online'").fetch_one(&self.pool).await?;
-        Ok(count)
+        let count: Option<i64> = sqlx::query_scalar("SELECT online_count FROM global_stats WHERE id = 1").fetch_one(&self.pool).await?;
+        Ok(count.unwrap_or(0))
     }
 
     /// Get total players online.
     pub async fn get_total_players(&self) -> Result<i64, DatabaseError> {
-        let (count,) = sqlx::query_as::<_, (i64,)>("SELECT COALESCE(SUM(players_online), 0) FROM servers WHERE status = 'online'").fetch_one(&self.pool).await?;
-        Ok(count)
+        let count: Option<i64> = sqlx::query_scalar("SELECT total_players FROM global_stats WHERE id = 1").fetch_one(&self.pool).await?;
+        Ok(count.unwrap_or(0))
     }
 
     /// Update server status to online with priority reset. Returns whether it was a new discovery.
@@ -609,7 +633,7 @@ impl Database {
                 ip, port, server_type, status, players_online, players_max, motd, version, 
                 priority, last_seen, consecutive_failures, asn, country, favicon, brand
             )
-            VALUES (?, ?, ?, 'online', ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, 0, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, 'online', $4, $5, $6, $7, 1, CURRENT_TIMESTAMP, 0, $8, $9, $10, $11)
             ON CONFLICT(ip, port) DO UPDATE SET
                 server_type = excluded.server_type,
                 status = 'online',
@@ -629,7 +653,7 @@ impl Database {
         .bind(ip).bind(port).bind(server_type).bind(players_online).bind(players_max).bind(&motd).bind(&version).bind(asn).bind(country).bind(favicon).bind(brand)
         .execute(&mut *tx).await?;
 
-        sqlx::query("INSERT INTO server_history (ip, port, players_online) VALUES (?, ?, ?)").bind(ip).bind(port).bind(players_online).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO server_history (ip, port, players_online) VALUES ($1, $2, $3)").bind(ip).bind(port).bind(players_online).execute(&mut *tx).await?;
 
         if let Some(sample) = players_sample {
             for player in sample {
@@ -638,7 +662,7 @@ impl Database {
                     sqlx::query(
                         r#"
                         INSERT INTO server_players (ip, port, player_name, player_uuid, last_seen)
-                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
                         ON CONFLICT(ip, port, player_name) DO UPDATE SET
                             player_uuid = excluded.player_uuid,
                             last_seen = CURRENT_TIMESTAMP
@@ -667,7 +691,7 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO servers (ip, port, server_type, status, priority, last_seen, consecutive_failures, asn, country)
-            VALUES (?, ?, ?, 'ignored', 3, CURRENT_TIMESTAMP, 1, ?, ?)
+            VALUES ($1, $2, $3, 'ignored', 3, CURRENT_TIMESTAMP, 1, $4, $5)
             ON CONFLICT(ip, port) DO UPDATE SET
                 status = CASE 
                     WHEN servers.motd IS NOT NULL OR servers.status = 'online' THEN 'offline' 
@@ -691,7 +715,7 @@ impl Database {
     }
 
     pub async fn insert_server_if_new(&self, ip: &str, port: i32, server_type: &str) -> Result<(), DatabaseError> {
-        sqlx::query("INSERT OR IGNORE INTO servers (ip, port, server_type) VALUES (?, ?, ?)").bind(ip).bind(port).bind(server_type).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO servers (ip, port, server_type) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING").bind(ip).bind(port).bind(server_type).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -700,7 +724,7 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO asns (asn, org, category, country, tags, last_updated)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
             ON CONFLICT(asn) DO UPDATE SET
                 org = excluded.org, 
                 category = excluded.category, 
@@ -713,7 +737,7 @@ impl Database {
     }
 
     pub async fn upsert_asn_range(&self, cidr: &str, asn: &str) -> Result<(), DatabaseError> {
-        sqlx::query("INSERT INTO asn_ranges (cidr, asn) VALUES (?, ?) ON CONFLICT(cidr) DO UPDATE SET asn = excluded.asn").bind(cidr).bind(asn).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO asn_ranges (cidr, asn) VALUES ($1, $2) ON CONFLICT(cidr) DO UPDATE SET asn = excluded.asn").bind(cidr).bind(asn).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -744,44 +768,65 @@ impl Database {
     }
 
     pub async fn get_asns_by_category(&self, category: &str) -> Result<Vec<AsnRecord>, DatabaseError> {
-        let rows = sqlx::query_as::<_, AsnRow>("SELECT * FROM asns WHERE category = ? ORDER BY org").bind(category).fetch_all(&self.pool).await?;
+        let rows = sqlx::query_as::<_, AsnRow>("SELECT * FROM asns WHERE category = $1 ORDER BY org").bind(category).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|row| self.map_asn_row(row)).collect())
     }
 
     pub async fn get_stale_asns(&self, days: i64) -> Result<Vec<AsnRecord>, DatabaseError> {
-        let rows = sqlx::query_as::<_, AsnRow>("SELECT * FROM asns WHERE last_updated IS NULL OR last_updated < datetime('now', ?) ORDER BY last_updated ASC").bind(&format!("-{} days", days)).fetch_all(&self.pool).await?;
+        let interval_str = format!("{} days", days);
+        let rows = sqlx::query_as::<_, AsnRow>("SELECT * FROM asns WHERE last_updated IS NULL OR last_updated < NOW() - CAST($1 AS INTERVAL) ORDER BY last_updated ASC").bind(interval_str).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|row| self.map_asn_row(row)).collect())
     }
 
     pub async fn get_asn_list_with_counts(&self) -> Result<Vec<AsnRecord>, DatabaseError> {
         let rows = sqlx::query_as::<_, AsnRow>(
             r#"
-            SELECT a.asn, a.org, a.category, a.country, a.tags, a.last_updated, COUNT(s.ip) as server_count
-            FROM asns a
-            JOIN servers s ON s.asn = a.asn
-            WHERE s.status != 'ignored'
-            GROUP BY a.asn
-            ORDER BY server_count DESC, a.org ASC
+            SELECT asn, org, category, country, tags, last_updated, server_count
+            FROM asn_stats
+            ORDER BY server_count DESC, org ASC
             "#
         ).fetch_all(&self.pool).await?;
-        
+
         Ok(rows.into_iter().map(|row| self.map_asn_row(row)).collect())
     }
 
+    pub async fn get_asn_list_paginated(&self, page: u64, limit: u64) -> Result<(Vec<AsnRecord>, i64), DatabaseError> {
+        let offset = page * limit;
+        
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM asn_stats")
+            .fetch_one(&self.pool).await?;
+
+        let rows = sqlx::query_as::<_, AsnRow>(
+            r#"
+            SELECT asn, org, category, country, tags, last_updated, server_count
+            FROM asn_stats
+            ORDER BY server_count DESC, org ASC
+            LIMIT $1 OFFSET $2
+            "#
+        )
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool).await?;
+
+        Ok((rows.into_iter().map(|row| self.map_asn_row(row)).collect(), total))
+    }
+
     pub async fn get_server_count_by_asn(&self, asn: &str) -> Result<i64, DatabaseError> {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM servers WHERE asn = ? AND status != 'ignored'").bind(asn).fetch_one(&self.pool).await.map_err(DatabaseError::from)
+        let count: Option<i64> = sqlx::query_scalar("SELECT server_count FROM asn_stats WHERE asn = $1").bind(asn).fetch_one(&self.pool).await?;
+        Ok(count.unwrap_or(0))
     }
 
     pub async fn get_asn_stats_v2(&self) -> Result<(i64, i64, i64, i64), DatabaseError> {
-        let hosting = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asns WHERE category = 'hosting'").fetch_one(&self.pool).await?;
-        let residential = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asns WHERE category = 'residential'").fetch_one(&self.pool).await?;
-        let excluded = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asns WHERE category = 'excluded'").fetch_one(&self.pool).await?;
-        let unknown = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asns WHERE category = 'unknown'").fetch_one(&self.pool).await?;
-        Ok((hosting, residential, excluded, unknown))
+        let hosting: Option<i64> = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM asns WHERE category = 'hosting'").fetch_one(&self.pool).await?;
+        let residential: Option<i64> = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM asns WHERE category = 'residential'").fetch_one(&self.pool).await?;
+        let excluded: Option<i64> = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM asns WHERE category = 'excluded'").fetch_one(&self.pool).await?;
+        let unknown: Option<i64> = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM asns WHERE category = 'unknown'").fetch_one(&self.pool).await?;
+        Ok((hosting.unwrap_or(0), residential.unwrap_or(0), excluded.unwrap_or(0), unknown.unwrap_or(0)))
     }
 
     pub async fn get_asn_count(&self) -> Result<i64, DatabaseError> {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asns").fetch_one(&self.pool).await.map_err(DatabaseError::from)
+        let count: Option<i64> = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM asns").fetch_one(&self.pool).await?;
+        Ok(count.unwrap_or(0))
     }
 
     pub async fn get_hosting_ranges(&self) -> Result<Vec<(String, String)>, DatabaseError> {
@@ -789,42 +834,43 @@ impl Database {
     }
 
     pub async fn get_next_range_to_scan(&self, category: &str) -> Result<Option<AsnRangeRow>, DatabaseError> {
-        sqlx::query_as::<_, AsnRangeRow>("SELECT r.* FROM asn_ranges r JOIN asns a ON r.asn = a.asn WHERE a.category = ? ORDER BY r.last_scanned_at ASC, r.scan_offset ASC LIMIT 1").bind(category).fetch_optional(&self.pool).await.map_err(DatabaseError::from)
+        sqlx::query_as::<_, AsnRangeRow>("SELECT r.* FROM asn_ranges r JOIN asns a ON r.asn = a.asn WHERE a.category = $1 ORDER BY r.last_scanned_at ASC NULLS FIRST, r.scan_offset ASC LIMIT 1").bind(category).fetch_optional(&self.pool).await.map_err(DatabaseError::from)
     }
 
     pub async fn get_ranges_to_scan(&self, category: &str, limit: i32) -> Result<Vec<AsnRangeRow>, DatabaseError> {
-        sqlx::query_as::<_, AsnRangeRow>("SELECT r.* FROM asn_ranges r JOIN asns a ON r.asn = a.asn WHERE a.category = ? ORDER BY r.last_scanned_at ASC, r.scan_offset ASC LIMIT ?").bind(category).bind(limit).fetch_all(&self.pool).await.map_err(DatabaseError::from)
+        sqlx::query_as::<_, AsnRangeRow>("SELECT r.* FROM asn_ranges r JOIN asns a ON r.asn = a.asn WHERE a.category = $1 ORDER BY r.last_scanned_at ASC NULLS FIRST, r.scan_offset ASC LIMIT $2").bind(category).bind(limit as i64).fetch_all(&self.pool).await.map_err(DatabaseError::from)
     }
 
     pub async fn update_range_progress(&self, cidr: &str, new_offset: i64, reset: bool) -> Result<(), DatabaseError> {
-        if reset { sqlx::query("UPDATE asn_ranges SET scan_offset = 0, last_scanned_at = CURRENT_TIMESTAMP WHERE cidr = ?").bind(cidr).execute(&self.pool).await?; }
-        else { sqlx::query("UPDATE asn_ranges SET scan_offset = ? WHERE cidr = ?").bind(new_offset).bind(cidr).execute(&self.pool).await?; }
+        if reset { sqlx::query("UPDATE asn_ranges SET scan_offset = 0, last_scanned_at = CURRENT_TIMESTAMP WHERE cidr = $1").bind(cidr).execute(&self.pool).await?; }
+        else { sqlx::query("UPDATE asn_ranges SET scan_offset = $1 WHERE cidr = $2").bind(new_offset).bind(cidr).execute(&self.pool).await?; }
         Ok(())
     }
 
     pub async fn update_batch_range_progress(&self, updates: Vec<(String, i64, bool)>) -> Result<(), DatabaseError> {
         let mut tx = self.pool.begin().await?;
         for (cidr, offset, reset) in updates {
-            if reset { sqlx::query("UPDATE asn_ranges SET scan_offset = 0, last_scanned_at = CURRENT_TIMESTAMP WHERE cidr = ?").bind(&cidr).execute(&mut *tx).await?; }
-            else { sqlx::query("UPDATE asn_ranges SET scan_offset = ? WHERE cidr = ?").bind(offset).bind(&cidr).execute(&mut *tx).await?; }
+            if reset { sqlx::query("UPDATE asn_ranges SET scan_offset = 0, last_scanned_at = CURRENT_TIMESTAMP WHERE cidr = $1").bind(&cidr).execute(&mut *tx).await?; }
+            else { sqlx::query("UPDATE asn_ranges SET scan_offset = $1 WHERE cidr = $2").bind(offset).bind(&cidr).execute(&mut *tx).await?; }
         }
         tx.commit().await?;
         Ok(())
     }
 
     pub async fn increment_stats(&self, tier: i32, found_new: bool) -> Result<(), DatabaseError> {
-        let date = Utc::now().date_naive().to_string();
+        let date = Utc::now().date_naive();
         let tier_col = match tier { 1 => "scans_hot", 2 => "scans_warm", _ => "scans_cold" };
-        let query = format!("INSERT INTO daily_stats (date, scans_total, {}, discoveries) VALUES (?, 1, 1, ?) ON CONFLICT(date) DO UPDATE SET scans_total = scans_total + 1, {} = {} + 1, discoveries = discoveries + ?", tier_col, tier_col, tier_col);
-        sqlx::query(&query).bind(&date).bind(if found_new { 1 } else { 0 }).bind(if found_new { 1 } else { 0 }).execute(&self.pool).await?;
+        let found_val = if found_new { 1 } else { 0 };
+        let query = format!("INSERT INTO daily_stats (date, scans_total, {}, discoveries) VALUES ($1, 1, 1, $2) ON CONFLICT(date) DO UPDATE SET scans_total = daily_stats.scans_total + 1, {} = daily_stats.{} + 1, discoveries = daily_stats.discoveries + $3", tier_col, tier_col, tier_col);
+        sqlx::query(&query).bind(date).bind(found_val).bind(found_val).execute(&self.pool).await?;
         Ok(())
     }
 
     pub async fn increment_batch_stats(&self, hot: i32, warm: i32, cold: i32, discoveries: i32) -> Result<(), DatabaseError> {
         if hot == 0 && warm == 0 && cold == 0 && discoveries == 0 { return Ok(()); }
-        let date = Utc::now().date_naive().to_string();
+        let date = Utc::now().date_naive();
         let total = hot + warm + cold;
-        sqlx::query("INSERT INTO daily_stats (date, scans_total, scans_hot, scans_warm, scans_cold, discoveries) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(date) DO UPDATE SET scans_total = scans_total + excluded.scans_total, scans_hot = scans_hot + excluded.scans_hot, scans_warm = scans_warm + excluded.scans_warm, scans_cold = scans_cold + excluded.scans_cold, discoveries = discoveries + excluded.discoveries").bind(&date).bind(total).bind(hot).bind(warm).bind(cold).bind(discoveries).execute(&self.pool).await?;
+        sqlx::query("INSERT INTO daily_stats (date, scans_total, scans_hot, scans_warm, scans_cold, discoveries) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT(date) DO UPDATE SET scans_total = daily_stats.scans_total + EXCLUDED.scans_total, scans_hot = daily_stats.scans_hot + EXCLUDED.scans_hot, scans_warm = daily_stats.scans_warm + EXCLUDED.scans_warm, scans_cold = daily_stats.scans_cold + EXCLUDED.scans_cold, discoveries = daily_stats.discoveries + EXCLUDED.discoveries").bind(date).bind(total).bind(hot).bind(warm).bind(cold).bind(discoveries).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -835,7 +881,8 @@ impl Database {
         let mut linked = 0;
         for range in ranges {
             if let Some((_org, country)) = asn_map.get(&range.asn) {
-                let result = sqlx::query("UPDATE servers SET asn = ?, country = COALESCE(country, ?) WHERE asn IS NULL AND ip LIKE ?").bind(&range.asn).bind(country).bind(range.cidr.replace("/32", "").replace("/24", "%").replace("/16", ".%")).execute(&self.pool).await?;
+                let like_str = range.cidr.replace("/32", "").replace("/24", "%").replace("/16", ".%");
+                let result = sqlx::query("UPDATE servers SET asn = $1, country = COALESCE(country, $2) WHERE asn IS NULL AND ip LIKE $3").bind(&range.asn).bind(country).bind(like_str).execute(&self.pool).await?;
                 linked += result.rows_affected();
             }
         }
