@@ -25,6 +25,7 @@ pub enum SlpError {
     InvalidResponse(String),
     #[error("JSON parse error: {0}")]
     JsonError(#[from] serde_json::Error),
+    #[allow(dead_code)]
     #[error("Server returned an error: {0}")]
     ServerError(String),
 }
@@ -83,6 +84,7 @@ pub fn write_varint(buf: &mut Vec<u8>, mut value: u32) {
 }
 
 /// Read a VarInt from a reader.
+#[allow(dead_code)]
 pub fn read_varint<R: Read>(reader: &mut R) -> io::Result<u32> {
     let mut result = 0u32;
     let mut shift = 0;

@@ -2,7 +2,7 @@
 //!
 //! Implements the RakNet unconnected ping and pong parsing.
 
-use crate::slp::{Players, ServerStatus, Version};
+use crate::network::slp::{Players, ServerStatus, Version};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::time::Duration;

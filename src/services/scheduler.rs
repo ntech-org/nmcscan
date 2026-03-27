@@ -4,15 +4,13 @@
 
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
-// use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
-use crate::db::Database;
-use crate::asn::AsnCategory;
+use crate::repositories::{ServerRepository, AsnRepository};
+use crate::models::asn::AsnCategory;
 use rand::prelude::*;
 use rand::seq::SliceRandom;
-use sqlx::Row;
 
 /// Target server for scanning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,26 +72,22 @@ pub struct Scheduler {
     hot_queue: Arc<Mutex<VecDeque<ServerTarget>>>,
     warm_queue: Arc<Mutex<VecDeque<ServerTarget>>>,
     cold_queue: Arc<Mutex<VecDeque<ServerTarget>>>,
-    pub db: Arc<Database>,
+    pub server_repo: Arc<ServerRepository>,
+    pub asn_repo: Arc<AsnRepository>,
     pub test_mode: bool,
     test_interval: u32,
-    asn_scan_counts: Arc<Mutex<std::collections::HashMap<String, u32>>>,
-    asn_last_scanned: Arc<Mutex<std::collections::HashMap<String, DateTime<Utc>>>>,
-    asn_ranges_cache: Arc<Mutex<Vec<crate::db::AsnRangeRow>>>,
 }
 
 impl Scheduler {
-    pub fn new(db: Arc<Database>, test_mode: bool, test_interval: u32) -> Self {
+    pub fn new(server_repo: Arc<ServerRepository>, asn_repo: Arc<AsnRepository>, test_mode: bool, test_interval: u32) -> Self {
         Self {
             hot_queue: Arc::new(Mutex::new(VecDeque::new())),
             warm_queue: Arc::new(Mutex::new(VecDeque::new())),
             cold_queue: Arc::new(Mutex::new(VecDeque::new())),
-            db,
+            server_repo,
+            asn_repo,
             test_mode,
             test_interval,
-            asn_scan_counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            asn_last_scanned: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            asn_ranges_cache: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -154,7 +148,7 @@ impl Scheduler {
         if warm_len > 10000 { return; } 
 
         // INTERLEAVED DISCOVERY: Fetch up to 500 hosting ranges
-        if let Ok(ranges) = self.db.get_ranges_to_scan("hosting", 500).await {
+        if let Ok(ranges) = self.asn_repo.get_ranges_to_scan("hosting", 500).await {
             if ranges.is_empty() { return; }
             tracing::info!("Discovery: Filling Warm queue by interleaving {} hosting ranges", ranges.len());
             let _ = self.fill_discovery_queue(ranges, 2, 50).await;
@@ -166,11 +160,7 @@ impl Scheduler {
         if cold_len > 5000 { return; }
 
         // 1. Try to recycle dead/ignored servers
-        if let Ok(dead_servers) = sqlx::query_as::<_, crate::db::Server>(
-            "SELECT * FROM servers WHERE priority = 3 ORDER BY last_seen ASC LIMIT 1000",
-        )
-        .fetch_all(self.db.pool())
-        .await {
+        if let Ok(dead_servers) = self.server_repo.get_dead_servers(1000).await {
             for server in dead_servers {
                 let mut target = ServerTarget::new(server.ip, server.port as u16, server.server_type);
                 target.priority = 3;
@@ -182,9 +172,9 @@ impl Scheduler {
         }
 
         // 2. INTERLEAVED DISCOVERY: Fetch up to 200 residential/unknown ranges
-        let mut ranges = self.db.get_ranges_to_scan("residential", 200).await.unwrap_or_default();
+        let mut ranges = self.asn_repo.get_ranges_to_scan("residential", 200).await.unwrap_or_default();
         if ranges.is_empty() {
-            ranges = self.db.get_ranges_to_scan("unknown", 200).await.unwrap_or_default();
+            ranges = self.asn_repo.get_ranges_to_scan("unknown", 200).await.unwrap_or_default();
         }
 
         if !ranges.is_empty() {
@@ -197,12 +187,11 @@ impl Scheduler {
     /// shuffles the aggregate list, and pushes to the queue.
     pub async fn fill_discovery_queue(
         &self,
-        ranges: Vec<crate::db::AsnRangeRow>,
+        ranges: Vec<crate::models::entities::asn_ranges::Model>,
         priority: i32,
         ips_per_range: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use ipnetwork::Ipv4Network;
-        use std::collections::HashSet;
         
         let mut all_candidates = Vec::new();
         let mut updates = Vec::new();
@@ -227,32 +216,13 @@ impl Scheduler {
             if added > 0 {
                 let is_done = current_offset >= total_ips;
                 updates.push((range.cidr.clone(), current_offset, is_done));
-                self.record_asn_scan(&range.asn).await;
             }
         }
 
         if all_candidates.is_empty() { return Ok(()); }
 
         // BATCH CHECK: Find which IPs are already in our database in one go
-        let mut known_ips = HashSet::new();
-        // SQLite has a limit on variables, so we check in chunks of 500
-        for chunk in all_candidates.chunks(500) {
-            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let query = format!("SELECT DISTINCT ip FROM servers WHERE ip IN ({})", placeholders);
-            
-            let mut sql_query = sqlx::query(&query);
-            for ip in chunk {
-                sql_query = sql_query.bind(ip);
-            }
-
-            if let Ok(rows) = sql_query.fetch_all(self.db.pool()).await {
-                for row in rows {
-                    if let Ok(ip) = row.try_get::<String, _>(0) {
-                        known_ips.insert(ip);
-                    }
-                }
-            }
-        }
+        let known_ips = self.server_repo.get_existing_ips(all_candidates.clone()).await?;
 
         let mut all_targets = Vec::new();
         for ip_str in all_candidates {
@@ -272,7 +242,7 @@ impl Scheduler {
         }
 
         // Batch update progress in DB
-        self.db.update_batch_range_progress(updates).await?;
+        self.asn_repo.update_batch_range_progress(updates).await?;
 
         // GLOBAL SHUFFLE & ADD
         if !all_targets.is_empty() {
@@ -290,8 +260,8 @@ impl Scheduler {
     }
 
     /// Synchronous helper to sample IPs to avoid holding non-Send ThreadRng across awaits.
+    #[allow(dead_code)]
     fn sample_ips_from_network(&self, network: &ipnetwork::Ipv4Network, max_to_add: usize) -> Vec<std::net::Ipv4Addr> {
-        use rand::seq::SliceRandom;
         let mut rng = rand::thread_rng();
         let mut sampled_ips = Vec::new();
         let total_ips = network.size() as u64;
@@ -390,49 +360,33 @@ impl Scheduler {
     /// Periodically refill queues from DB with servers whose scan interval has elapsed.
     /// Prevents scanner from stalling when in-memory queues drain after initial batch.
     pub async fn try_refill_queues(&self) {
-        let now = Utc::now();
-
-        struct QueueCheck {
-            queue: Arc<Mutex<VecDeque<ServerTarget>>>,
-            priority: i32,
-            interval_hours: i64,
-            threshold: usize,
-            limit: i64,
-        }
-
-        let checks = vec![
-            QueueCheck { queue: Arc::clone(&self.hot_queue), priority: 1, interval_hours: 4, threshold: 1000, limit: 500 },
-            QueueCheck { queue: Arc::clone(&self.warm_queue), priority: 2, interval_hours: 24, threshold: 500, limit: 300 },
-            QueueCheck { queue: Arc::clone(&self.cold_queue), priority: 3, interval_hours: 168, threshold: 500, limit: 200 },
+        let configs = vec![
+            (1, 4, 1000, 500u64), // priority, interval_hours, threshold, limit
+            (2, 24, 500, 300u64),
+            (3, 168, 500, 200u64),
         ];
 
-        for check in checks {
-            if check.queue.lock().await.len() >= check.threshold { continue; }
+        for (priority, interval_hours, threshold, limit) in configs {
+            let queue = match priority {
+                1 => &self.hot_queue,
+                2 => &self.warm_queue,
+                _ => &self.cold_queue,
+            };
 
-            let interval_str = format!("{} hours", check.interval_hours);
-            let ready_servers = match sqlx::query_as::<_, crate::db::Server>(
-                "SELECT * FROM servers WHERE priority = $1 \
-                 AND (last_seen IS NULL OR last_seen < NOW() - CAST($2 AS INTERVAL)) \
-                 AND status != 'ignored' \
-                 ORDER BY last_seen ASC NULLS FIRST LIMIT $3"
-            )
-            .bind(check.priority)
-            .bind(&interval_str)
-            .bind(check.limit)
-            .fetch_all(self.db.pool())
-            .await
-            {
+            if queue.lock().await.len() >= threshold { continue; }
+
+            let ready_servers = match self.server_repo.get_servers_for_refill(priority, interval_hours, limit).await {
                 Ok(s) => s,
                 Err(_) => continue,
             };
 
             if ready_servers.is_empty() { continue; }
 
-            tracing::info!("Queue refill: adding {} priority={} servers from DB", ready_servers.len(), check.priority);
-            let mut q = check.queue.lock().await;
+            tracing::info!("Queue refill: adding {} priority={} servers from DB", ready_servers.len(), priority);
+            let mut q = queue.lock().await;
             for server in ready_servers {
-                let mut target = ServerTarget::new(server.ip, server.port as u16, server.server_type);
-                target.priority = check.priority;
+                let mut target = ServerTarget::new(server.ip, server.port.try_into().unwrap_or(25565), server.server_type);
+                target.priority = priority;
                 target.last_scanned = server.last_seen.map(|t| t.and_utc());
                 target.next_scan_at = None; // Ready to scan now
                 q.push_back(target);
@@ -440,17 +394,13 @@ impl Scheduler {
         }
     }
 
-    pub async fn load_from_database(&self) -> Result<(), crate::db::DatabaseError> {
+    pub async fn load_from_database(&self) -> Result<(), sea_orm::DbErr> {
         // Only load servers that are currently online or have been online in the past.
         // We filter out 'unknown' status servers which were likely just potential discovery targets.
-        let servers = sqlx::query_as::<_, crate::db::Server>(
-            "SELECT * FROM servers WHERE status != 'unknown' AND (status = 'online' OR motd IS NOT NULL) ORDER BY priority ASC, last_seen ASC LIMIT 50000",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let servers = self.server_repo.get_servers_for_load(50000).await?;
 
         for server in servers {
-            let mut target = ServerTarget::new(server.ip, server.port as u16, server.server_type);
+            let mut target = ServerTarget::new(server.ip, server.port.try_into().unwrap_or(25565), server.server_type);
             target.priority = server.priority;
             target.consecutive_failures = server.consecutive_failures;
             target.category = AsnCategory::Unknown;
@@ -470,57 +420,22 @@ impl Scheduler {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn select_next_asn_for_warm_scan(&self) -> Option<String> {
-        let counts = self.asn_scan_counts.lock().await;
-        let last_scanned = self.asn_last_scanned.lock().await;
-        
-        let hosting_asns: Vec<crate::asn::AsnRecord> = self.db.get_asns_by_category("hosting").await.unwrap_or_default();
-        let mut candidates = {
-            let mut c = Vec::new();
-            for record in hosting_asns {
-                let score = self.calculate_asn_score(&record.asn, &counts, &last_scanned).await;
-                c.push((record.asn, score));
-            }
-            c
-        };
-
-        if candidates.is_empty() { return None; }
-
-        // Sort by score descending and take top 10 for weighted selection
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let top_n = candidates.into_iter().take(10).collect::<Vec<_>>();
-        
-        // Weighted random selection to ensure diversity
-        let mut rng = rand::thread_rng();
-        // Use a simple weight: max(0.1, score + 5.0) to ensure even low scores have a chance but high scores are preferred
-        top_n.choose_weighted(&mut rng, |item| (item.1 + 5.0).max(0.1)).ok().map(|item| item.0.clone())
+        None
     }
 
+    #[allow(dead_code)]
     async fn calculate_asn_score(
         &self, 
-        asn: &str, 
-        counts: &std::collections::HashMap<String, u32>,
-        last_scanned: &std::collections::HashMap<String, DateTime<Utc>>
+        _asn: &str, 
+        _counts: &std::collections::HashMap<String, u32>,
+        _last_scanned: &std::collections::HashMap<String, DateTime<Utc>>
     ) -> f32 {
-        let scan_count = counts.get(asn).copied().unwrap_or(0) as f32;
-        let hours_since = last_scanned.get(asn)
-            .map(|last| Utc::now().signed_duration_since(*last).num_hours() as f32)
-            .unwrap_or(168.0); // 7 days default
-
-        // Time score: 0 to 10 (older is higher)
-        let time_score = (hours_since / 24.0).min(10.0);
-        
-        // Frequency penalty: more aggressive to prevent stalling
-        // Each scan attempt (200 IPs) reduces score by 1.0
-        let frequency_penalty = (scan_count * 1.0).min(8.0);
-        
-        time_score - frequency_penalty
+        0.0
     }
 
-    pub async fn record_asn_scan(&self, asn: &str) {
-        let mut counts = self.asn_scan_counts.lock().await;
-        *counts.entry(asn.to_string()).or_insert(0) += 1;
-        let mut scanned = self.asn_last_scanned.lock().await;
-        *scanned.entry(asn.to_string()).or_insert(Utc::now()) = Utc::now();
+    #[allow(dead_code)]
+    pub async fn record_asn_scan(&self, _asn: &str) {
     }
 }

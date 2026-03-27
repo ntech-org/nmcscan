@@ -56,6 +56,7 @@ impl Default for TestConfig {
 
 impl TestConfig {
     /// Create a new test config from environment variables.
+    #[allow(dead_code)]
     pub fn from_env() -> Self {
         Self {
             enabled: std::env::var("TEST_MODE")

@@ -14,20 +14,24 @@
 //! - **Warm**: Known hosting ASN ranges, not scanned in 7 days - ran 2-3 times/week
 //! - **Cold**: Residential IPs, high-failure servers - ran 1-2 times/month
 
-mod api;
-mod asn;
-mod asn_fetcher;
-mod db;
-pub mod entities;
-mod exclude;
-mod raknet;
-mod scheduler;
-mod scanner;
-mod slp;
-mod test_mode;
+mod handlers;
+mod services;
+mod models;
+pub mod repositories;
+mod network;
+mod utils;
 
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use sea_orm::{Database, ConnectOptions, EntityTrait, QueryFilter, ColumnTrait, QuerySelect};
+use migration::{Migrator, MigratorTrait};
+use crate::repositories::{ServerRepository, AsnRepository, StatsRepository};
+use crate::services::asn_fetcher::AsnFetcher;
+use crate::services::scheduler::{Scheduler, ServerTarget};
+use crate::network::scanner::Scanner;
+use crate::utils::exclude::{ExcludeList, ExcludeManager};
+use crate::utils::test_mode;
+use crate::models::asn::AsnCategory;
 
 use clap::Parser;
 
@@ -82,6 +86,14 @@ struct Args {
     /// Target scans per second (Connections Per Second)
     #[arg(long, env = "TARGET_RPS", default_value = "100")]
     target_rps: u64,
+
+    /// Target concurrent scan tasks
+    #[arg(long, env = "TARGET_CONCURRENCY", default_value = "2500")]
+    target_concurrency: u32,
+
+    /// Target scans per second for cold/residential IPs
+    #[arg(long, env = "TARGET_COLD_RPS")]
+    target_cold_rps: Option<u64>,
 }
 
 #[tokio::main]
@@ -110,22 +122,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Load exclude list
     tracing::info!("Loading exclude list from {}...", args.exclude_file);
-    let exclude_list = exclude::ExcludeList::from_file(&args.exclude_file)
+    let exclude_list = ExcludeList::from_file(&args.exclude_file)
         .unwrap_or_else(|e| {
             tracing::warn!("Could not load {}: {}", args.exclude_file, e);
             tracing::warn!("Using empty exclude list - BE CAREFUL!");
-            exclude::ExcludeList::from_str("").unwrap()
+            ExcludeList::from_str("").unwrap()
         });
     tracing::info!("Loaded {} exclude networks", exclude_list.len());
 
     // 2. Initialize database
     tracing::info!("Initializing database at {}...", args.database);
-    let db = db::Database::new(&args.database).await?;
+    let mut opt = ConnectOptions::new(&args.database);
+    opt.max_connections(20)
+       .acquire_timeout(std::time::Duration::from_secs(30));
+    
+    let db = Database::connect(opt).await?;
+    
+    // Run migrations
+    tracing::info!("Running migrations...");
+    Migrator::up(&db, None).await?;
+    
     let db = Arc::new(db);
+    
+    // Initialize repositories
+    let server_repo = Arc::new(ServerRepository::new((*db).clone()));
+    let asn_repo = Arc::new(AsnRepository::new((*db).clone()));
+    let stats_repo = Arc::new(StatsRepository::new((*db).clone()));
 
     // 3. Initialize ASN fetcher
     tracing::info!("Initializing ASN fetcher...");
-    let asn_fetcher = Arc::new(asn_fetcher::AsnFetcher::new(Arc::clone(&db)));
+    let asn_fetcher = Arc::new(AsnFetcher::new(Arc::clone(&db), Arc::clone(&asn_repo)));
     asn_fetcher.initialize().await?;
     tracing::info!(
         "ASN fetcher initialized: {} ASNs, {} ranges",
@@ -148,10 +174,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let db_clone = Arc::clone(&db);
         let asn_clone = Arc::clone(&asn_fetcher);
         tokio::spawn(async move {
-            if let Ok(servers) = sqlx::query_as::<_, db::Server>("SELECT * FROM servers WHERE asn IS NULL AND status != 'ignored' LIMIT 5000")
-                .fetch_all(db_clone.pool())
-                .await 
-            {
+            let servers_res: Result<Vec<models::entities::servers::Model>, sea_orm::DbErr> = models::entities::servers::Entity::find()
+                .filter(models::entities::servers::Column::Asn.is_null())
+                .filter(models::entities::servers::Column::Status.ne("ignored"))
+                .limit(5000)
+                .all(&*db_clone)
+                .await;
+            if let Ok(servers) = servers_res {
                 if !servers.is_empty() {
                     tracing::info!("Backfilling ASN data for {} servers...", servers.len());
                     for server in servers {
@@ -164,15 +193,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 4. Create scanner and scheduler
-    let exclude_manager = Arc::new(exclude::ExcludeManager::new(&args.exclude_file));
+    let exclude_manager = Arc::new(ExcludeManager::new(&args.exclude_file));
     
-    let scanner = scanner::Scanner::new(
+    let scanner = Scanner::new(
         Arc::clone(&exclude_manager),
-        Arc::clone(&db),
+        Arc::clone(&server_repo),
         Arc::clone(&asn_fetcher),
         args.target_rps,
+        args.target_concurrency,
+        args.target_cold_rps,
     );
-    let scheduler = scheduler::Scheduler::new(Arc::clone(&db), args.test_mode || args.quick_test, args.test_interval as u32);
+    let scheduler = Scheduler::new(Arc::clone(&server_repo), Arc::clone(&asn_repo), args.test_mode || args.quick_test, args.test_interval as u32);
 
     // Load servers based on mode
     if args.test_mode || args.quick_test {
@@ -193,12 +224,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Loading {} test servers...", test_servers.len());
         for (ip, port, name, host) in &test_servers {
             let server_type = if *port == 19132 { "bedrock".to_string() } else { "java".to_string() };
-            let mut target = scheduler::ServerTarget::new(ip.clone(), *port, server_type.clone());
-            target.category = asn::AsnCategory::Hosting;
+            let mut target = ServerTarget::new(ip.clone(), *port, server_type.clone());
+            target.category = AsnCategory::Hosting;
             target.priority = 1; // Hot priority for test servers
             target.hostname = Some(host.clone());
             
-            let _ = db.insert_server_if_new(ip, *port as i32, &server_type).await;
+            let _ = server_repo.insert_server_if_new(ip, *port as i32, &server_type).await;
             
             scheduler.add_server(target, false).await;
             tracing::debug!("  Added test server: {} ({}:{} as {})", name, ip, port, host);
@@ -212,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         // BACKFILL: Link existing servers to ASNs if data is missing
-        match db.link_servers_to_asns().await {
+        match server_repo.link_servers_to_asns().await {
             Ok(count) if count > 0 => tracing::info!("Backfilled ASN data for {} servers", count),
             _ => {}
         }
@@ -232,6 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scanner_handle = {
         let scheduler = Arc::clone(&scheduler);
         let scanner = Arc::clone(&scanner);
+        let stats_repo = Arc::clone(&stats_repo);
         
         // Background filler task
         let scheduler_filler = Arc::clone(&scheduler);
@@ -248,7 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         tokio::spawn(async move {
-            run_scanner_loop(scanner, scheduler).await;
+            run_scanner_loop(scanner, scheduler, stats_repo, args.target_concurrency).await;
         })
     };
 
@@ -262,20 +294,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 6.5. Start Materialized View refresh task
     let mv_refresh_handle = {
-        let db_ref = Arc::clone(&db);
+        let stats_repo_ref = Arc::clone(&stats_repo);
         tokio::spawn(async move {
             // Give it an initial delay so it doesn't run right at startup
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             
             // Initial refresh
-            if let Err(e) = db_ref.refresh_materialized_views().await {
+            if let Err(e) = stats_repo_ref.refresh_materialized_views().await {
                 tracing::error!("Failed initial refresh of materialized views: {}", e);
             }
 
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // Every 5 minutes
             loop {
                 interval.tick().await;
-                if let Err(e) = db_ref.refresh_materialized_views().await {
+                if let Err(e) = stats_repo_ref.refresh_materialized_views().await {
                     tracing::error!("Failed to refresh materialized views: {}", e);
                 }
             }
@@ -283,17 +315,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 7. Start web API
-    let api_state = api::AppState {
-        db: Arc::clone(&db),
+    let api_state = handlers::AppState {
+        db: (*db).clone(),
+        server_repo: Arc::clone(&server_repo),
+        asn_repo: Arc::clone(&asn_repo),
+        stats_repo: Arc::clone(&stats_repo),
         scheduler: Arc::clone(&scheduler),
         exclude_list: Arc::clone(&exclude_manager),
-        asn_manager: asn_fetcher.asn_manager(),
         api_key: args.api_key.clone(),
         contact_email: args.contact_email.clone(),
         discord_link: args.discord_link.clone(),
     };
     let api_handle = tokio::spawn(async move {
-        api::run_server(api_state, "0.0.0.0:3000").await.unwrap();
+        handlers::run_server(api_state, "0.0.0.0:3000").await.unwrap();
     });
 
     // Wait for tasks
@@ -311,10 +345,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Background scanner loop with tiered rate limiting and concurrency.
 async fn run_scanner_loop(
-    scanner: Arc<scanner::Scanner>,
-    scheduler: Arc<scheduler::Scheduler>,
+    scanner: Arc<Scanner>,
+    scheduler: Arc<Scheduler>,
+    stats_repo: Arc<StatsRepository>,
+    max_concurrency: u32,
 ) {
-    tracing::info!("Scanner loop started");
+    tracing::info!("Scanner loop started (max concurrency: {})", max_concurrency);
 
     let hot_count = Arc::new(AtomicU32::new(0));
     let warm_count = Arc::new(AtomicU32::new(0));
@@ -349,12 +385,12 @@ async fn run_scanner_loop(
                 let d = discoveries_buffer.swap(0, Ordering::SeqCst);
                 
                 if h > 0 || w > 0 || c > 0 || d > 0 {
-                    let _ = scheduler.db.increment_batch_stats(h as i32, w as i32, c as i32, d as i32).await;
+                    let _ = stats_repo.increment_batch_stats(h as i32, w as i32, c as i32, d as i32).await;
                 }
             }
             server_opt = scheduler.next_server() => {
                 if let Some(server) = server_opt {
-                    if active_tasks.load(Ordering::Relaxed) >= 2500 {
+                    if active_tasks.load(Ordering::Relaxed) >= max_concurrency {
                         continue;
                     }
 

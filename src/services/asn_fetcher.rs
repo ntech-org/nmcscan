@@ -3,8 +3,10 @@
 //! Downloads and maintains GeoLite2-ASN and GeoLite2-Country databases
 //! for fast, local, and limit-free IP categorization.
 
-use crate::asn::{AsnCategory, AsnError, AsnManager, AsnRecord};
-use crate::db::Database;
+use crate::models::asn::{AsnCategory, AsnError, AsnManager, AsnRecord};
+use crate::repositories::asns::AsnRepository;
+use sea_orm::{DatabaseConnection, EntityTrait, Set, TransactionTrait};
+use crate::models::entities::{asns, asn_ranges};
 use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -34,8 +36,10 @@ const COUNTRY_DB_URL: &str = "https://raw.githubusercontent.com/P3TERX/GeoLite.m
 pub struct AsnFetcher {
     /// HTTP client for downloading updates.
     client: reqwest::Client,
-    /// Database for caching extra metadata.
-    db: Arc<Database>,
+    /// Database connection.
+    db: Arc<DatabaseConnection>,
+    /// ASN repository.
+    asn_repo: Arc<AsnRepository>,
     /// In-memory ASN manager.
     asn_manager: Arc<RwLock<AsnManager>>,
     /// Local MaxMind readers.
@@ -45,7 +49,7 @@ pub struct AsnFetcher {
 
 impl AsnFetcher {
     /// Create a new ASN fetcher.
-    pub fn new(db: Arc<Database>) -> Self {
+    pub fn new(db: Arc<DatabaseConnection>, asn_repo: Arc<AsnRepository>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(time::Duration::from_secs(30))
             .user_agent("NMCScan/1.0")
@@ -55,6 +59,7 @@ impl AsnFetcher {
         Self {
             client,
             db,
+            asn_repo,
             asn_manager: Arc::new(RwLock::new(AsnManager::new())),
             maxmind_asn: Arc::new(RwLock::new(None)),
             maxmind_country: Arc::new(RwLock::new(None)),
@@ -150,12 +155,31 @@ impl AsnFetcher {
 
     /// Load ASN data from database cache (extra mappings not in MaxMind).
     async fn load_from_database(&self) -> Result<(), AsnError> {
-        let asns: Vec<crate::asn::AsnRecord> = self.db.get_all_asns().await.unwrap_or_default();
-        let ranges = self.db.get_all_asn_ranges().await.unwrap_or_default();
+        let asns_models = self.asn_repo.get_all_asns().await.unwrap_or_default();
+        let ranges_models = self.asn_repo.get_all_asn_ranges().await.unwrap_or_default();
 
         let mut manager = self.asn_manager.write().await;
-        for asn in asns { manager.add_asn(asn); }
-        for range in ranges { manager.add_range(range.cidr, range.asn); }
+        for asn_model in asns_models {
+            let category = match asn_model.category.as_str() {
+                "hosting" => AsnCategory::Hosting,
+                "residential" => AsnCategory::Residential,
+                "excluded" => AsnCategory::Excluded,
+                _ => AsnCategory::Unknown,
+            };
+            let tags = asn_model.tags.clone().unwrap_or_default().split(',').map(|s| s.to_string()).filter(|s| !s.is_empty()).collect();
+            manager.add_asn(AsnRecord {
+                asn: asn_model.asn,
+                org: asn_model.org,
+                category,
+                country: asn_model.country,
+                last_updated: asn_model.last_updated.map(|dt| dt.into()),
+                server_count: 0,
+                tags,
+            });
+        }
+        for range in ranges_models {
+            manager.add_range(range.cidr, range.asn);
+        }
 
         Ok(())
     }
@@ -196,16 +220,12 @@ impl AsnFetcher {
             
             // Try to convert range to CIDR
             if let (Ok(start), Ok(end)) = (range_start.parse::<std::net::Ipv4Addr>(), range_end.parse::<std::net::Ipv4Addr>()) {
-                // Approximate with /24 if it's large enough, or just use the start IP
-                // A better approach would be CIDR decomposition, but /24 is our discovery unit.
                 let start_octets = start.octets();
                 let end_octets = end.octets();
                 
-                // Add first /24 of the range
                 let cidr = format!("{}.{}.{}.0/24", start_octets[0], start_octets[1], start_octets[2]);
                 range_dedup.insert(cidr, asn.clone());
 
-                // If range is large (e.g. /16), add a middle /24 too to increase coverage
                 if start_octets[1] != end_octets[1] || (end_octets[2] as i16 - start_octets[2] as i16) > 10 {
                     let mid_cidr = format!("{}.{}.{}.0/24", start_octets[0], start_octets[1], start_octets[2] + 5);
                     range_dedup.insert(mid_cidr, asn);
@@ -216,10 +236,10 @@ impl AsnFetcher {
         let ranges: Vec<(String, String)> = range_dedup.into_iter().collect();
         tracing::info!("Importing {} ASNs and {} discovery ranges into database...", asn_map.len(), ranges.len());
         
-        let mut tx = self.db.pool().begin().await.map_err(|e| AsnError::MaxMindError(format!("Transaction start error: {}", e)))?;
+        let tx = self.db.begin().await.map_err(|e| AsnError::MaxMindError(format!("Transaction start error: {}", e)))?;
 
-        // Prepare ASN rows with categorization
-        let mut asn_rows: Vec<(String, String, String, String, String)> = Vec::with_capacity(asn_map.len());
+        // Prepare ASN models with categorization
+        let mut asn_models: Vec<asns::ActiveModel> = Vec::with_capacity(asn_map.len());
         for (asn, (org, country, _)) in asn_map {
             let (category, tags) = AsnManager::categorize_by_org(&org);
             let tags_str = tags.join(",");
@@ -229,50 +249,51 @@ impl AsnFetcher {
                 AsnCategory::Excluded => "excluded",
                 AsnCategory::Unknown => "unknown",
             }.to_string();
-            asn_rows.push((asn, org, cat_str, country, tags_str));
+            
+            asn_models.push(asns::ActiveModel {
+                asn: Set(asn),
+                org: Set(org),
+                category: Set(cat_str),
+                country: Set(Some(country)),
+                tags: Set(Some(tags_str)),
+                last_updated: Set(Some(Utc::now().into())),
+            });
         }
 
-        // Batch upsert ASNs (5 params per row, ~200 rows per batch)
-        for chunk in asn_rows.chunks(200) {
-            let mut values = String::new();
-            let mut param_idx = 1;
-            for (i, _) in chunk.iter().enumerate() {
-                if i > 0 { values.push_str(", "); }
-                values.push_str(&format!("(${}, ${}, ${}, ${}, ${}, CURRENT_TIMESTAMP)",
-                    param_idx, param_idx+1, param_idx+2, param_idx+3, param_idx+4));
-                param_idx += 5;
-            }
-            let query = format!(
-                "INSERT INTO asns (asn, org, category, country, tags, last_updated) VALUES {}
-                 ON CONFLICT(asn) DO UPDATE SET org = excluded.org, category = excluded.category,
-                 country = COALESCE(excluded.country, asns.country),
-                 tags = COALESCE(excluded.tags, asns.tags), last_updated = CURRENT_TIMESTAMP",
-                values
-            );
-            let mut q = sqlx::query(&query);
-            for (asn, org, cat, country, tags) in chunk {
-                q = q.bind(asn).bind(org).bind(cat).bind(country).bind(tags);
-            }
-            q.execute(&mut *tx).await
+        // Batch upsert ASNs
+        for chunk in asn_models.chunks(200) {
+            asns::Entity::insert_many(chunk.to_vec())
+                .on_conflict(
+                    sea_orm::sea_query::OnConflict::column(asns::Column::Asn)
+                        .update_columns([asns::Column::Org, asns::Column::Category])
+                        .value(asns::Column::Country, sea_orm::sea_query::Expr::cust("COALESCE(excluded.country, asns.country)"))
+                        .value(asns::Column::Tags, sea_orm::sea_query::Expr::cust("COALESCE(excluded.tags, asns.tags)"))
+                        .value(asns::Column::LastUpdated, sea_orm::sea_query::Expr::cust("CURRENT_TIMESTAMP"))
+                        .to_owned()
+                )
+                .exec(&tx).await
                 .map_err(|e| AsnError::MaxMindError(format!("ASN batch error: {}", e)))?;
         }
 
-        // Batch upsert ranges (2 params per row, ~500 rows per batch)
-        for chunk in ranges.chunks(500) {
-            let mut values = String::new();
-            for (i, _) in chunk.iter().enumerate() {
-                if i > 0 { values.push_str(", "); }
-                values.push_str(&format!("(${}, ${})", i*2+1, i*2+2));
-            }
-            let query = format!(
-                "INSERT INTO asn_ranges (cidr, asn) VALUES {} ON CONFLICT(cidr) DO UPDATE SET asn = excluded.asn",
-                values
-            );
-            let mut q = sqlx::query(&query);
-            for (cidr, asn) in chunk {
-                q = q.bind(cidr).bind(asn);
-            }
-            q.execute(&mut *tx).await
+        // Prepare range models
+        let mut range_models: Vec<asn_ranges::ActiveModel> = Vec::with_capacity(ranges.len());
+        for (cidr, asn) in ranges {
+            range_models.push(asn_ranges::ActiveModel {
+                cidr: Set(cidr),
+                asn: Set(asn),
+                ..Default::default()
+            });
+        }
+
+        // Batch upsert ranges
+        for chunk in range_models.chunks(500) {
+            asn_ranges::Entity::insert_many(chunk.to_vec())
+                .on_conflict(
+                    sea_orm::sea_query::OnConflict::column(asn_ranges::Column::Cidr)
+                        .update_column(asn_ranges::Column::Asn)
+                        .to_owned()
+                )
+                .exec(&tx).await
                 .map_err(|e| AsnError::MaxMindError(format!("Range batch error: {}", e)))?;
         }
 
@@ -328,8 +349,8 @@ impl AsnFetcher {
             tags: tags.clone(),
         };
 
-        // Save to SQLite cache for fast dashboard listing
-        let _ = self.db.upsert_asn(
+        // Save to cache for fast dashboard listing
+        let _ = self.asn_repo.upsert_asn(
             &asn,
             &org,
             match record.category {
@@ -346,13 +367,11 @@ impl AsnFetcher {
         // Since lookup_prefix is missing in this context, we jumpstart by adding a /24 range.
         if let std::net::IpAddr::V4(v4) = ip_addr {
             let octets = v4.octets();
-            if let Ok(network) = ipnetwork::Ipv4Network::new(std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], 0), 24) {
-                let cidr = network.to_string();
-                let mut manager = self.asn_manager.write().await;
-                manager.add_range(cidr.clone(), asn.clone());
-                // Also save range to DB
-                let _ = self.db.upsert_asn_range(&cidr, &asn).await;
-            }
+            let cidr = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+            let mut manager = self.asn_manager.write().await;
+            manager.add_range(cidr.clone(), asn.clone());
+            // Also save range to DB
+            let _ = self.asn_repo.upsert_asn_range(&cidr, &asn).await;
         }
 
         // Add to in-memory manager

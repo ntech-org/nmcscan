@@ -10,8 +10,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 /// ASN category for scan prioritization.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
-#[sqlx(type_name = "TEXT")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AsnCategory {
     /// VPS/Cloud providers - scanned frequently (2-4 times/day)
@@ -26,6 +25,7 @@ pub enum AsnCategory {
 
 impl AsnCategory {
     /// Get category priority (lower = higher priority).
+    #[allow(dead_code)]
     pub fn priority(&self) -> i32 {
         match self {
             AsnCategory::Hosting => 1,
@@ -60,11 +60,7 @@ pub struct AsnRange {
 impl AsnRange {
     pub fn new(cidr: String, asn: String) -> Result<Self, ipnetwork::IpNetworkError> {
         let network = cidr.parse::<Ipv4Network>()?;
-        Ok(Self {
-            cidr,
-            asn,
-            network,
-        })
+        Ok(Self { cidr, asn, network })
     }
 
     /// Check if an IP is in this range.
@@ -96,7 +92,9 @@ impl AsnManager {
 
     /// Add an IP range for an ASN.
     pub fn add_range(&mut self, cidr: String, asn: String) {
-        if cidr.contains(':') { return; } // Skip IPv6
+        if cidr.contains(':') {
+            return;
+        } // Skip IPv6
         if let Ok(range) = AsnRange::new(cidr, asn) {
             self.ranges.push(range);
         }
@@ -113,6 +111,7 @@ impl AsnManager {
     }
 
     /// Get category for an ASN.
+    #[allow(dead_code)]
     pub fn get_category(&self, asn: &str) -> AsnCategory {
         if let Some(record) = self.asns.get(asn) {
             return record.category.clone();
@@ -131,6 +130,7 @@ impl AsnManager {
     }
 
     /// Get ASN record by ASN number (O(1)).
+    #[allow(dead_code)]
     pub fn get_asn(&self, asn: &str) -> Option<&AsnRecord> {
         self.asns.get(asn)
     }
@@ -144,15 +144,38 @@ impl AsnManager {
 
         // 1. CRITICAL SAFETY BLOCKLIST (Military, Gov, Edu, Infrastructure)
         let blocked_keywords = [
-            ("military", "Defense"), ("defense", "Defense"), ("dod", "Defense"), ("pentagon", "Defense"),
-            ("army", "Defense"), ("navy", "Defense"), ("air force", "Defense"), ("marines", "Defense"),
-            ("national security", "Security"), ("intelligence", "Intelligence"),
-            ("government", "Government"), ("gov.", "Government"), ("ministry", "Government"), ("federal", "Government"),
-            ("police", "Law Enforcement"), ("fbi", "Law Enforcement"), ("cia", "Intelligence"), ("nsa", "Intelligence"),
-            ("university", "Education"), ("college", "Education"), ("school", "Education"), ("academy", "Education"),
-            ("hospital", "Healthcare"), ("medical", "Healthcare"), ("clinic", "Healthcare"),
-            ("nuclear", "Infrastructure"), ("atomic", "Infrastructure"), ("power plant", "Infrastructure"),
-            ("bank", "Financial"), ("financial", "Financial"), ("securities", "Financial"), ("reserve", "Financial"),
+            ("military", "Defense"),
+            ("defense", "Defense"),
+            ("dod", "Defense"),
+            ("pentagon", "Defense"),
+            ("army", "Defense"),
+            ("navy", "Defense"),
+            ("air force", "Defense"),
+            ("marines", "Defense"),
+            ("national security", "Security"),
+            ("intelligence", "Intelligence"),
+            ("government", "Government"),
+            ("gov.", "Government"),
+            ("ministry", "Government"),
+            ("federal", "Government"),
+            ("police", "Law Enforcement"),
+            ("fbi", "Law Enforcement"),
+            ("cia", "Intelligence"),
+            ("nsa", "Intelligence"),
+            ("university", "Education"),
+            ("college", "Education"),
+            ("school", "Education"),
+            ("academy", "Education"),
+            ("hospital", "Healthcare"),
+            ("medical", "Healthcare"),
+            ("clinic", "Healthcare"),
+            ("nuclear", "Infrastructure"),
+            ("atomic", "Infrastructure"),
+            ("power plant", "Infrastructure"),
+            ("bank", "Financial"),
+            ("financial", "Financial"),
+            ("securities", "Financial"),
+            ("reserve", "Financial"),
         ];
 
         for (keyword, tag) in &blocked_keywords {
@@ -167,27 +190,88 @@ impl AsnManager {
         }
 
         // 2. Capabilities & Technology Tags
-        let ddos_keywords = ["ddos", "shield", "protect", "scrub", "mitigation", "voxility", "path.net", "stormwall", "cloudefense"];
+        let ddos_keywords = [
+            "ddos",
+            "shield",
+            "protect",
+            "scrub",
+            "mitigation",
+            "voxility",
+            "path.net",
+            "stormwall",
+            "cloudefense",
+        ];
         for k in &ddos_keywords {
-            if org_lower.contains(k) { tags.push("DDoS-Protected".to_string()); break; }
+            if org_lower.contains(k) {
+                tags.push("DDoS-Protected".to_string());
+                break;
+            }
         }
 
-        let cloud_keywords = ["amazon", "aws", "google", "microsoft", "azure", "cloud", "compute", "instance", "stack", "lambda"];
+        let cloud_keywords = [
+            "amazon",
+            "aws",
+            "google",
+            "microsoft",
+            "azure",
+            "cloud",
+            "compute",
+            "instance",
+            "stack",
+            "lambda",
+        ];
         for k in &cloud_keywords {
-            if org_lower.contains(k) { tags.push("Cloud".to_string()); break; }
+            if org_lower.contains(k) {
+                tags.push("Cloud".to_string());
+                break;
+            }
         }
 
-        let cdn_keywords = ["cloudflare", "akamai", "fastly", "cdn", "edgecast", "limelight", "bunny"];
+        let cdn_keywords = [
+            "cloudflare",
+            "akamai",
+            "fastly",
+            "cdn",
+            "edgecast",
+            "limelight",
+            "bunny",
+        ];
         for k in &cdn_keywords {
-            if org_lower.contains(k) { tags.push("CDN".to_string()); break; }
+            if org_lower.contains(k) {
+                tags.push("CDN".to_string());
+                break;
+            }
         }
 
         // 3. Category Determination
         let hosting_keywords = [
-            "hetzner", "ovh", "digitalocean", "linode", "vultr", "scaleway", "online.net",
-            "leaseweb", "contabo", "ionos", "rackspace", "hosting", "datacenter", "server", 
-            "vps", "dedicated", "colo", "compute", "packet", "infrastructure", "liquid web", 
-            "choopa", "iart", "hostinger", "porkbun", "namecheap", "godaddy",
+            "hetzner",
+            "ovh",
+            "digitalocean",
+            "linode",
+            "vultr",
+            "scaleway",
+            "online.net",
+            "leaseweb",
+            "contabo",
+            "ionos",
+            "rackspace",
+            "hosting",
+            "datacenter",
+            "server",
+            "vps",
+            "dedicated",
+            "colo",
+            "compute",
+            "packet",
+            "infrastructure",
+            "liquid web",
+            "choopa",
+            "iart",
+            "hostinger",
+            "porkbun",
+            "namecheap",
+            "godaddy",
         ];
 
         for keyword in &hosting_keywords {
@@ -199,10 +283,38 @@ impl AsnManager {
         }
 
         let residential_keywords = [
-            "comcast", "verizon", "at&t", "spectrum", "cox", "telekom", "bt ", "orange",
-            "kpn", "vodafone", "sky ", "t-mobile", "jcom", "ntt ", "telstra", "rogers", "bell",
-            "broadband", "cable", "fiber", "isp", "residential", "consumer", "home", "dsl", 
-            "wireless", "mobile", "lte", "5g", "customer", "communications", "telecom",
+            "comcast",
+            "verizon",
+            "at&t",
+            "spectrum",
+            "cox",
+            "telekom",
+            "bt ",
+            "orange",
+            "kpn",
+            "vodafone",
+            "sky ",
+            "t-mobile",
+            "jcom",
+            "ntt ",
+            "telstra",
+            "rogers",
+            "bell",
+            "broadband",
+            "cable",
+            "fiber",
+            "isp",
+            "residential",
+            "consumer",
+            "home",
+            "dsl",
+            "wireless",
+            "mobile",
+            "lte",
+            "5g",
+            "customer",
+            "communications",
+            "telecom",
         ];
 
         if category == AsnCategory::Unknown {

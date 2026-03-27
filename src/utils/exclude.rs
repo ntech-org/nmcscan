@@ -195,6 +195,7 @@ impl ExcludeManager {
     }
 
     /// Get current list count.
+    #[allow(dead_code)]
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
     }

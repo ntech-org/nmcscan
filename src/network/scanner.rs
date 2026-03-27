@@ -5,24 +5,15 @@
 //! - ~100 new connections per second
 //! - 3 second timeout per connection
 
-use crate::db::Database;
-use crate::exclude::ExcludeManager;
+use crate::repositories::ServerRepository;
+use crate::utils::exclude::ExcludeManager;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::{self, Duration};
 use tracing;
 
-use crate::asn_fetcher::AsnFetcher;
-
-/// Maximum concurrent scan tasks.
-const MAX_CONCURRENCY: usize = 2500;
-
-/// Connections per second limit.
-const RATE_LIMIT_PER_SEC: u64 = 100;
-
-/// Stricter rate limit for residential/unknown IPs to avoid abuse.
-const COLD_RATE_LIMIT_PER_SEC: u64 = 10;
+use crate::services::asn_fetcher::AsnFetcher;
 
 /// Scanner with rate limiting and concurrency control.
 pub struct Scanner {
@@ -30,7 +21,7 @@ pub struct Scanner {
     rate_limiter: Arc<RateLimiter>,
     cold_rate_limiter: Arc<RateLimiter>,
     exclude_list: Arc<ExcludeManager>,
-    db: Arc<Database>,
+    server_repo: Arc<ServerRepository>,
     asn_fetcher: Arc<AsnFetcher>,
 }
 
@@ -76,18 +67,19 @@ impl RateLimiter {
 impl Scanner {
     pub fn new(
         exclude_list: Arc<ExcludeManager>,
-        db: Arc<Database>,
+        server_repo: Arc<ServerRepository>,
         asn_fetcher: Arc<AsnFetcher>,
         rps: u64,
+        concurrency: u32,
+        cold_rps: Option<u64>,
     ) -> Self {
-        let cold_rps = (rps / 10).max(1);
-        let concurrency = 2500; 
+        let cold_rps = cold_rps.unwrap_or_else(|| (rps / 10).max(1));
         Self {
-            semaphore: Arc::new(Semaphore::new(concurrency)),
+            semaphore: Arc::new(Semaphore::new(concurrency as usize)),
             rate_limiter: RateLimiter::new(rps),
             cold_rate_limiter: RateLimiter::new(cold_rps),
             exclude_list,
-            db,
+            server_repo,
             asn_fetcher,
         }
     }
@@ -128,9 +120,9 @@ impl Scanner {
         let addr = SocketAddr::new(ip_addr, port);
         
         let ping_result = if server_type == "bedrock" {
-            crate::raknet::ping_server(addr).await.map_err(|e| e.to_string())
+            crate::network::raknet::ping_server(addr).await.map_err(|e| e.to_string())
         } else {
-            crate::slp::ping_server(addr, hostname).await.map_err(|e| e.to_string())
+            crate::network::slp::ping_server(addr, hostname).await.map_err(|e| e.to_string())
         };
         
         match ping_result {
@@ -139,10 +131,10 @@ impl Scanner {
                 let players_online = status.players.as_ref().map(|p| p.online).unwrap_or(0);
                 let players_max = status.players.as_ref().map(|p| p.max).unwrap_or(0);
                 let players_sample = status.players.as_ref().and_then(|p| p.sample.clone());
-                let motd = Some(crate::slp::extract_motd(&status));
+                let motd = Some(crate::network::slp::extract_motd(&status));
                 let version = status.version.as_ref().map(|v| v.name.clone());
                 let favicon = status.favicon.clone();
-                let brand = Some(crate::slp::extract_brand(&status));
+                let brand = Some(crate::network::slp::extract_brand(&status));
 
                 // DATA ENRICHMENT: If we don't have ASN info for this IP, fetch it now
                 let mut asn_record = {
@@ -162,7 +154,13 @@ impl Scanner {
                     }
                 }
 
-                let is_new = match self.db.mark_online(ip, port as i32, server_type, players_online, players_max, motd, version, players_sample, favicon, brand, asn_record).await {
+                let (asn, country) = if let Some(record) = asn_record {
+                    (Some(record.asn), record.country)
+                } else {
+                    (None, None)
+                };
+
+                let is_new = match self.server_repo.mark_online(ip, port as i32, server_type, players_online, players_max, motd, version, players_sample, favicon, brand, asn, country).await {
                     Ok(new) => new,
                     Err(e) => {
                         tracing::error!("Failed to update DB for {}:{}: {}", ip, port, e);
@@ -193,7 +191,13 @@ impl Scanner {
                     }
                 }
 
-                if let Err(e) = self.db.mark_offline(ip, port as i32, Some(server_type), asn_record).await {
+                let (asn, country) = if let Some(record) = asn_record {
+                    (Some(record.asn), record.country)
+                } else {
+                    (None, None)
+                };
+
+                if let Err(e) = self.server_repo.mark_offline(ip, port as i32, server_type, asn, country).await {
                     tracing::error!("Failed to update DB for {}:{}: {}", ip, port, e);
                 }
                 
@@ -201,29 +205,8 @@ impl Scanner {
             }
         }
     }
-
-    /// Scan multiple servers concurrently with rate limiting.
-    pub async fn scan_batch(this: Arc<Self>, servers: Vec<(String, u16)>) -> Vec<(String, bool)> {
-        let tasks: Vec<_> = servers
-            .into_iter()
-            .map(|(ip, port)| {
-                let scanner = Arc::clone(&this);
-                tokio::spawn(async move {
-                    let (online, _is_new) = scanner.scan_server(&ip, port, None, 2, false, "java").await;
-                    (ip, online)
-                })
-            })
-            .collect();
-
-        let mut results = Vec::new();
-        for task in tasks {
-            if let Ok(result) = task.await {
-                results.push(result);
-            }
-        }
-        results
     }
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -233,9 +216,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires postgres db"]
     async fn test_scanner_build() {
-        let db = Arc::new(Database::new(":memory:").await.unwrap());
-        // Since test_excluded_server_skipped was using ExcludeList, we need to adapt it
-        // This is a unit test so we don't need the file manager here really, 
-        // but for simplicity we'll just fix the call if we can.
+        // Test needs to be updated to use SeaORM and repositories
     }
 }

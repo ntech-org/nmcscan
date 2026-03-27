@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "migration"]
+
 [package]
 name = "nmcscan"
 version = "0.1.0"
@@ -8,9 +11,6 @@ license = "MIT"
 [dependencies]
 # Async runtime (minimal features for faster compilation)
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
-
-# Database (minimal features)
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono"] }
 
 # Web server
 axum = { version = "0.8", features = ["macros"] }
@@ -45,6 +45,7 @@ rand = "0.8"
 dotenvy = "0.15.7"
 sea-orm = { version = "1.1.19", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono"] }
 sea-orm-migration = "1.1.19"
+migration = { version = "0.1.0", path = "migration" }
 
 [profile.dev]
 opt-level = 0

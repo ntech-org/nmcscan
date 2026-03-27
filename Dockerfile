@@ -14,14 +14,26 @@ WORKDIR /usr/src/nmcscan
 # Set RUSTFLAGS to use lld linker
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
-# Copy dependency manifest and build dependencies separately for caching
+# Copy dependency manifests
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release
-RUN rm -f target/release/deps/nmcscan*
+COPY migration/Cargo.toml ./migration/
 
-# Copy the real source code and build the application
+# Create a minimal set of source files to satisfy Cargo for dependency caching
+RUN mkdir -p src migration/src && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "pub struct Migrator; impl sea_orm_migration::MigratorTrait for Migrator { fn migrations() -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> { vec![] } }" > migration/src/lib.rs
+
+# Cache dependencies
+RUN cargo build --release
+
+# Remove dummy artifacts before copying real source
+RUN rm -rf src migration target/release/deps/nmcscan* target/release/deps/migration*
+
+# Copy the real source code
 COPY src ./src
+COPY migration ./migration
+
+# Final build
 RUN cargo build --release
 
 # Final runtime stage
