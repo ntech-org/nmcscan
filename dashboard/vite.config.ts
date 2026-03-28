@@ -14,4 +14,16 @@ export default defineConfig({
       },
     },
   },
+  build: {
+    // Suppress warning about "this" keyword in CJS modules from @auth/core
+    rollupOptions: {
+      onwarn(warning, warn) {
+        if (warning.code === 'THIS_IS_UNDEFINED') return;
+        warn(warning);
+      }
+    },
+    // Performance: Disabling sourcemaps and assets inlining for faster build
+    sourcemap: false,
+    assetsInlineLimit: 0,
+  }
 });

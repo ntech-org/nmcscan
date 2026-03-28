@@ -7,7 +7,10 @@ const config = {
 	kit: {
 		adapter: adapter({
             out: 'build'
-        })
+        }),
+        prerender: {
+            entries: [] // Disable pre-rendering for all routes to speed up build
+        }
 	}
 };
 
