@@ -24,7 +24,8 @@ mod utils;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use sea_orm::{Database, ConnectOptions, EntityTrait, QueryFilter, ColumnTrait, QuerySelect};
-use migration::{Migrator, MigratorTrait};
+use migration::Migrator;
+use sea_orm_migration::MigratorTrait;
 use crate::repositories::{ServerRepository, AsnRepository, StatsRepository};
 use crate::services::asn_fetcher::AsnFetcher;
 use crate::services::scheduler::{Scheduler, ServerTarget};
@@ -94,6 +95,10 @@ struct Args {
     /// Target scans per second for cold/residential IPs
     #[arg(long, env = "TARGET_COLD_RPS")]
     target_cold_rps: Option<u64>,
+
+    /// API listen address
+    #[arg(long, env = "LISTEN_ADDR", default_value = "0.0.0.0:3000")]
+    listen_addr: String,
 }
 
 #[tokio::main]
@@ -133,14 +138,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Initialize database
     tracing::info!("Initializing database at {}...", args.database);
     let mut opt = ConnectOptions::new(&args.database);
-    opt.max_connections(20)
-       .acquire_timeout(std::time::Duration::from_secs(30));
+    opt.max_connections(args.target_concurrency.min(1000).max(100))
+       .acquire_timeout(std::time::Duration::from_secs(30))
+       .sqlx_logging(false);
     
     let db = Database::connect(opt).await?;
     
     // Run migrations
     tracing::info!("Running migrations...");
     Migrator::up(&db, None).await?;
+    tracing::info!("Migrations applied successfully.");
     
     let db = Arc::new(db);
     
@@ -153,6 +160,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Initializing ASN fetcher...");
     let asn_fetcher = Arc::new(AsnFetcher::new(Arc::clone(&db), Arc::clone(&asn_repo)));
     asn_fetcher.initialize().await?;
+    
+    // STARTUP SCRUB: Recategorize any existing "unknown" ASNs with latest heuristics
+    let _ = asn_fetcher.recategorize_all_asns().await;
+
     tracing::info!(
         "ASN fetcher initialized: {} ASNs, {} ranges",
         asn_fetcher.asn_manager().read().await.asn_count(),
@@ -326,8 +337,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         contact_email: args.contact_email.clone(),
         discord_link: args.discord_link.clone(),
     };
+    let listen_addr = args.listen_addr.clone();
     let api_handle = tokio::spawn(async move {
-        handlers::run_server(api_state, "0.0.0.0:3000").await.unwrap();
+        handlers::run_server(api_state, &listen_addr).await.unwrap();
     });
 
     // Wait for tasks
@@ -390,7 +402,10 @@ async fn run_scanner_loop(
             }
             server_opt = scheduler.next_server() => {
                 if let Some(server) = server_opt {
-                    if active_tasks.load(Ordering::Relaxed) >= max_concurrency {
+                    if active_tasks.load(Ordering::SeqCst) >= max_concurrency {
+                        // Re-queue immediately if we're at capacity to avoid losing the target
+                        scheduler.add_server(server, false).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                         continue;
                     }
 

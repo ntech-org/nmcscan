@@ -25,31 +25,43 @@ pub struct Scanner {
     asn_fetcher: Arc<AsnFetcher>,
 }
 
-/// Simple but efficient token bucket rate limiter using a Semaphore.
+/// Token bucket rate limiter.
 struct RateLimiter {
-    semaphore: Semaphore,
+    semaphore: Arc<Semaphore>,
+    target_rps: u64,
 }
 
 impl RateLimiter {
     fn new(rps: u64) -> Arc<Self> {
+        let semaphore = Arc::new(Semaphore::new(rps as usize));
         let limiter = Arc::new(Self {
-            semaphore: Semaphore::new(rps as usize),
+            semaphore: Arc::clone(&semaphore),
+            target_rps: rps,
         });
 
         // Background task to refill tokens frequently for smooth flow
-        let limiter_clone = Arc::clone(&limiter);
         tokio::spawn(async move {
-            // Refill every 50ms for smoother distribution
-            let mut interval = time::interval(Duration::from_millis(50));
-            let rps_per_tick = (rps as f64 / 20.0).max(1.0) as usize;
+            // Refill every 10ms for very smooth distribution
+            let mut interval = time::interval(Duration::from_millis(10));
+            let rps_per_tick = (rps as f64 / 100.0).max(1.0);
+            let mut fractional_permits = 0.0;
+
             loop {
                 interval.tick().await;
-                let current_permits = limiter_clone.semaphore.available_permits();
-                if current_permits < rps as usize {
-                    let to_add = std::cmp::min(rps_per_tick, rps as usize - current_permits);
-                    if to_add > 0 {
-                        limiter_clone.semaphore.add_permits(to_add);
+                
+                fractional_permits += rps_per_tick;
+                let to_add = fractional_permits.floor() as usize;
+                
+                if to_add > 0 {
+                    let current_permits = semaphore.available_permits();
+                    // Don't burst more than 1 second worth of permits
+                    if current_permits < rps as usize {
+                        let actual_add = std::cmp::min(to_add, rps as usize - current_permits);
+                        if actual_add > 0 {
+                            semaphore.add_permits(actual_add);
+                        }
                     }
+                    fractional_permits -= to_add as f64;
                 }
             }
         });
@@ -58,6 +70,10 @@ impl RateLimiter {
     }
 
     async fn acquire(&self) {
+        // If target RPS is 0, something is wrong, allow but log
+        if self.target_rps == 0 {
+            return;
+        }
         if let Ok(permit) = self.semaphore.acquire().await {
             permit.forget();
         }

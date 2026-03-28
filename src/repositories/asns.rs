@@ -132,7 +132,13 @@ impl AsnRepository {
 
     pub async fn get_ranges_to_scan(&self, category: &str, limit: u64) -> Result<Vec<asn_ranges::Model>, DbErr> {
         asn_ranges::Entity::find()
-            .join(JoinType::InnerJoin, asn_ranges::Relation::Asns.def())
+            .join_rev(
+                JoinType::InnerJoin,
+                asns::Entity::belongs_to(asn_ranges::Entity)
+                    .from(asns::Column::Asn)
+                    .to(asn_ranges::Column::Asn)
+                    .into()
+            )
             .filter(asns::Column::Category.eq(category))
             .order_by_asc(asn_ranges::Column::LastScannedAt)
             .order_by_asc(asn_ranges::Column::ScanOffset)

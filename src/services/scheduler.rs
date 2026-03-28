@@ -108,18 +108,28 @@ impl Scheduler {
     /// Get the next server to scan using weighted random selection to prevent tier starvation.
     pub async fn next_server(&self) -> Option<ServerTarget> {
         let now = Utc::now();
+        
+        // Tier sizes for dynamic priority
+        let hot_len = self.hot_queue.lock().await.len();
+        let warm_len = self.warm_queue.lock().await.len();
+
         let roll = {
             let mut rng = rand::thread_rng();
             rng.gen_range(0..100)
         };
 
-        // Define preferred order based on roll
-        let tiers = if roll < 70 {
-            vec![1, 2, 3] // 70% Hot
-        } else if roll < 90 {
-            vec![2, 1, 3] // 20% Warm
+        // If Hot or Warm have items, they get 90% of the priority.
+        // Hot gets first pick in that 90%.
+        let tiers = if (hot_len > 0 || warm_len > 0) && roll < 90 {
+            if hot_len > 0 {
+                vec![1, 2, 3]
+            } else {
+                vec![2, 1, 3]
+            }
+        } else if roll < 95 {
+            vec![2, 1, 3] // 5% dedicated to Warm
         } else {
-            vec![3, 1, 2] // 10% Cold
+            vec![3, 1, 2] // 5% dedicated to Cold
         };
 
         for tier in tiers {
@@ -145,13 +155,22 @@ impl Scheduler {
 
     pub async fn fill_warm_queue_if_needed(&self) {
         let warm_len = self.warm_queue.lock().await.len();
-        if warm_len > 10000 { return; } 
+        if warm_len > 5000 { return; } 
 
-        // INTERLEAVED DISCOVERY: Fetch up to 500 hosting ranges
-        if let Ok(ranges) = self.asn_repo.get_ranges_to_scan("hosting", 500).await {
-            if ranges.is_empty() { return; }
-            tracing::info!("Discovery: Filling Warm queue by interleaving {} hosting ranges", ranges.len());
-            let _ = self.fill_discovery_queue(ranges, 2, 50).await;
+        // INTERLEAVED DISCOVERY: Fetch hosting ranges
+        match self.asn_repo.get_ranges_to_scan("hosting", 100).await {
+            Ok(ranges) => {
+                if ranges.is_empty() {
+                    return;
+                }
+                let count = self.fill_discovery_queue(ranges, 2, 100).await.unwrap_or(0);
+                if count > 0 {
+                    tracing::info!("Discovery: Added {} new targets to Warm queue (from hosting)", count);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Discovery error: Failed to fetch hosting ranges: {}", e);
+            }
         }
     }
 
@@ -171,15 +190,21 @@ impl Scheduler {
             }
         }
 
-        // 2. INTERLEAVED DISCOVERY: Fetch up to 200 residential/unknown ranges
-        let mut ranges = self.asn_repo.get_ranges_to_scan("residential", 200).await.unwrap_or_default();
+        // 2. INTERLEAVED DISCOVERY: Fetch residential and unknown ranges
+        let mut ranges = self.asn_repo.get_ranges_to_scan("residential", 100).await.unwrap_or_default();
+        let mut source = "residential";
         if ranges.is_empty() {
-            ranges = self.asn_repo.get_ranges_to_scan("unknown", 200).await.unwrap_or_default();
+            if let Ok(r) = self.asn_repo.get_ranges_to_scan("unknown", 100).await {
+                ranges = r;
+                source = "unknown";
+            }
         }
 
         if !ranges.is_empty() {
-            tracing::info!("Discovery: Filling Cold queue by interleaving {} ranges", ranges.len());
-            let _ = self.fill_discovery_queue(ranges, 3, 50).await;
+            let count = self.fill_discovery_queue(ranges, 3, 100).await.unwrap_or(0);
+            if count > 0 {
+                tracing::info!("Discovery: Added {} new targets to Cold queue (from {})", count, source);
+            }
         }
     }
 
@@ -190,9 +215,9 @@ impl Scheduler {
         ranges: Vec<crate::models::entities::asn_ranges::Model>,
         priority: i32,
         ips_per_range: usize,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         use ipnetwork::Ipv4Network;
-        
+
         let mut all_candidates = Vec::new();
         let mut updates = Vec::new();
 
@@ -205,6 +230,13 @@ impl Scheduler {
             let mut current_offset = range.scan_offset;
             let mut added = 0;
 
+            // If the range is already exhausted, mark it for reset and skip
+            if current_offset >= total_ips {
+                updates.push((range.cidr.clone(), 0, true));
+                continue;
+            }
+
+            // Pull a batch of IPs from the range
             while added < ips_per_range && current_offset < total_ips {
                 if let Some(ip) = network.nth(current_offset as u32) {
                     all_candidates.push(ip.to_string());
@@ -213,13 +245,17 @@ impl Scheduler {
                 current_offset += 1;
             }
 
-            if added > 0 {
-                let is_done = current_offset >= total_ips;
-                updates.push((range.cidr.clone(), current_offset, is_done));
-            }
+            // Always record progress to move to the next set of IPs or next range
+            let is_done = current_offset >= total_ips;
+            updates.push((range.cidr.clone(), if is_done { 0 } else { current_offset }, is_done));
         }
 
-        if all_candidates.is_empty() { return Ok(()); }
+        // Batch update progress in DB
+        if !updates.is_empty() {
+            self.asn_repo.update_batch_range_progress(updates).await?;
+        }
+
+        if all_candidates.is_empty() { return Ok(0); }
 
         // BATCH CHECK: Find which IPs are already in our database in one go
         let known_ips = self.server_repo.get_existing_ips(all_candidates.clone()).await?;
@@ -232,7 +268,7 @@ impl Scheduler {
                 java_target.priority = priority;
                 java_target.is_discovery = true;
                 all_targets.push(java_target);
-                
+
                 let mut bedrock_target = ServerTarget::new(ip_str, 19132, "bedrock".to_string());
                 bedrock_target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
                 bedrock_target.priority = priority;
@@ -241,8 +277,7 @@ impl Scheduler {
             }
         }
 
-        // Batch update progress in DB
-        self.asn_repo.update_batch_range_progress(updates).await?;
+        let added_count = all_targets.len();
 
         // GLOBAL SHUFFLE & ADD
         if !all_targets.is_empty() {
@@ -250,15 +285,14 @@ impl Scheduler {
                 let mut rng = rand::thread_rng();
                 all_targets.shuffle(&mut rng);
             }
-            
+
             for target in all_targets {
                 self.add_server(target, true).await;
             }
         }
 
-        Ok(())
+        Ok(added_count)
     }
-
     /// Synchronous helper to sample IPs to avoid holding non-Send ThreadRng across awaits.
     #[allow(dead_code)]
     fn sample_ips_from_network(&self, network: &ipnetwork::Ipv4Network, max_to_add: usize) -> Vec<std::net::Ipv4Addr> {

@@ -5,7 +5,7 @@
 
 use crate::models::asn::{AsnCategory, AsnError, AsnManager, AsnRecord};
 use crate::repositories::asns::AsnRepository;
-use sea_orm::{DatabaseConnection, EntityTrait, Set, TransactionTrait};
+use sea_orm::{DatabaseConnection, EntityTrait, Set, ActiveModelTrait, QueryFilter, ColumnTrait, QuerySelect};
 use crate::models::entities::{asns, asn_ranges};
 use chrono::Utc;
 use std::sync::Arc;
@@ -234,10 +234,8 @@ impl AsnFetcher {
         }
 
         let ranges: Vec<(String, String)> = range_dedup.into_iter().collect();
-        tracing::info!("Importing {} ASNs and {} discovery ranges into database...", asn_map.len(), ranges.len());
+        tracing::info!("Importing {} ASNs and {} discovery ranges (throttled)...", asn_map.len(), ranges.len());
         
-        let tx = self.db.begin().await.map_err(|e| AsnError::MaxMindError(format!("Transaction start error: {}", e)))?;
-
         // Prepare ASN models with categorization
         let mut asn_models: Vec<asns::ActiveModel> = Vec::with_capacity(asn_map.len());
         for (asn, (org, country, _)) in asn_map {
@@ -260,7 +258,7 @@ impl AsnFetcher {
             });
         }
 
-        // Batch upsert ASNs
+        // Batch upsert ASNs with throttling
         for chunk in asn_models.chunks(200) {
             asns::Entity::insert_many(chunk.to_vec())
                 .on_conflict(
@@ -271,8 +269,11 @@ impl AsnFetcher {
                         .value(asns::Column::LastUpdated, sea_orm::sea_query::Expr::cust("CURRENT_TIMESTAMP"))
                         .to_owned()
                 )
-                .exec(&tx).await
+                .exec(&*self.db).await
                 .map_err(|e| AsnError::MaxMindError(format!("ASN batch error: {}", e)))?;
+            
+            // Artificial delay to prevent pegging CPU/DB
+            time::sleep(time::Duration::from_millis(50)).await;
         }
 
         // Prepare range models
@@ -285,7 +286,7 @@ impl AsnFetcher {
             });
         }
 
-        // Batch upsert ranges
+        // Batch upsert ranges with throttling
         for chunk in range_models.chunks(500) {
             asn_ranges::Entity::insert_many(chunk.to_vec())
                 .on_conflict(
@@ -293,14 +294,96 @@ impl AsnFetcher {
                         .update_column(asn_ranges::Column::Asn)
                         .to_owned()
                 )
-                .exec(&tx).await
+                .exec(&*self.db).await
                 .map_err(|e| AsnError::MaxMindError(format!("Range batch error: {}", e)))?;
+            
+            // Artificial delay
+            time::sleep(time::Duration::from_millis(50)).await;
         }
 
-        tx.commit().await.map_err(|e| AsnError::MaxMindError(format!("Transaction commit error: {}", e)))?;
-
         tracing::info!("Global ASN discovery sync complete.");
+        
+        // After full import, run a re-categorization pass
+        let _ = self.recategorize_all_asns().await;
+        
         Ok(())
+    }
+
+    /// Run a throttled batch re-categorization of "Unknown" ASNs in the database.
+    pub async fn recategorize_all_asns(&self) -> Result<usize, AsnError> {
+        tracing::info!("Recategorizing Unknown ASNs in database (throttled)...");
+        
+        let mut total_updated = 0;
+        let mut processed = 0;
+        let batch_size = 500;
+
+        loop {
+            // Fetch a chunk of unknown ASNs
+            let asns_models = asns::Entity::find()
+                .filter(asns::Column::Category.eq("unknown"))
+                .limit(batch_size)
+                .all(&*self.db)
+                .await
+                .map_err(|e| AsnError::MaxMindError(format!("DB error: {}", e)))?;
+            
+            if asns_models.is_empty() {
+                break;
+            }
+
+            let mut chunk_updated = 0;
+            
+            // Wrap the entire batch in a transaction for efficiency
+            use sea_orm::TransactionTrait;
+            let tx = self.db.begin().await.map_err(|e| AsnError::MaxMindError(format!("Tx error: {}", e)))?;
+
+            for model in asns_models {
+                processed += 1;
+                let (category, tags) = AsnManager::categorize_by_org(&model.org);
+                
+                let mut active: asns::ActiveModel = model.into();
+                let mut changed = false;
+
+                if category != AsnCategory::Unknown {
+                    let cat_str = match category {
+                        AsnCategory::Hosting => "hosting",
+                        AsnCategory::Residential => "residential",
+                        AsnCategory::Excluded => "excluded",
+                        _ => "unknown",
+                    };
+                    active.category = Set(cat_str.to_string());
+                    active.tags = Set(Some(tags.join(",")));
+                    changed = true;
+                }
+
+                active.last_updated = Set(Some(Utc::now().into()));
+                active.update(&tx).await.map_err(|e| AsnError::MaxMindError(format!("Update error: {}", e)))?;
+                
+                if changed {
+                    chunk_updated += 1;
+                }
+            }
+            
+            tx.commit().await.map_err(|e| AsnError::MaxMindError(format!("Commit error: {}", e)))?;
+
+            total_updated += chunk_updated;
+            
+            if processed % 5000 == 0 {
+                tracing::info!("Recategorization progress: processed {} ASNs...", processed);
+            }
+            
+            // Sleep to reduce CPU/DB pressure
+            time::sleep(time::Duration::from_millis(200)).await;
+            
+            if processed > 250000 { break; }
+        }
+
+        if processed > 0 {
+            tracing::info!("Recategorization complete: processed {} total, {} promoted from Unknown.", processed, total_updated);
+            // Refresh in-memory manager
+            let _ = self.load_from_database().await;
+        }
+        
+        Ok(total_updated)
     }
 
     /// Fetch ASN and Country data for a single IP using local MaxMind databases.
@@ -385,10 +468,31 @@ impl AsnFetcher {
     pub async fn run_background_refresh(self: Arc<Self>) {
         tracing::info!("Starting ASN intelligence background update task");
 
+        // Initial delay to let startup settle
+        time::sleep(time::Duration::from_secs(10)).await;
+
         let mut interval = time::interval(time::Duration::from_secs(86400 * 7)); // Weekly
+        
+        // Consume the first tick which happens immediately
+        interval.tick().await;
 
         loop {
             interval.tick().await;
+            
+            // Check if we already have fresh ASN data (updated within last 3 days)
+            // This is more reliable across restarts than just checking a flag.
+            let fresh_asns = asns::Entity::find()
+                .filter(asns::Column::LastUpdated.gt(Utc::now() - chrono::Duration::days(3)))
+                .limit(1)
+                .one(&*self.db)
+                .await
+                .unwrap_or_default();
+
+            if fresh_asns.is_some() {
+                tracing::info!("ASN data is fresh (updated within last 3 days), skipping background sync.");
+                continue;
+            }
+
             tracing::info!("Performing weekly ASN intelligence sync...");
             
             let mut updated = false;

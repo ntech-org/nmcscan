@@ -1,5 +1,5 @@
 pub use sea_orm_migration::prelude::*;
-pub use sea_orm_migration::prelude::MigratorTrait;
+pub use sea_orm_migration::MigratorTrait;
 
 mod m20220101_000001_create_table;
 

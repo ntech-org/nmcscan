@@ -215,6 +215,10 @@ impl MigrationTrait for Migration {
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_servers_players ON servers(players_online)").await?;
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_asns_category ON asns(category)").await?;
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_asn_ranges_asn ON asn_ranges(asn)").await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_asn_ranges_category_scan ON asn_ranges(asn) INCLUDE (last_scanned_at, scan_offset)").await?;
+        // Composite index for the main discovery query
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_asn_ranges_lookup ON asn_ranges(last_scanned_at, scan_offset)").await?;
+        
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_player_name ON server_players(player_name)").await?;
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_server_history_ip_port ON server_history(ip, port)").await?;
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS trgm_idx_servers_ip ON servers USING GIN (ip gin_trgm_ops)").await?;

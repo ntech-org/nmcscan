@@ -18,20 +18,21 @@ ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 COPY Cargo.toml Cargo.lock ./
 COPY migration/Cargo.toml ./migration/
 
-# Create a minimal set of source files to satisfy Cargo for dependency caching
+# Create a minimal set of source files to satisfy Cargo for dependency caching.
 RUN mkdir -p src migration/src && \
     echo "fn main() {}" > src/main.rs && \
-    echo "pub struct Migrator; impl sea_orm_migration::MigratorTrait for Migrator { fn migrations() -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> { vec![] } }" > migration/src/lib.rs
+    echo 'pub use sea_orm_migration::prelude::*; pub use sea_orm_migration::MigratorTrait; pub struct Migrator; #[async_trait::async_trait] impl MigratorTrait for Migrator { fn migrations() -> Vec<Box<dyn MigrationTrait>> { vec![] } }' > migration/src/lib.rs
 
-# Cache dependencies
+# Cache dependencies (this downloads and builds all external crates like sea-orm, axum, etc.)
 RUN cargo build --release
 
-# Remove dummy artifacts before copying real source
-RUN rm -rf src migration target/release/deps/nmcscan* target/release/deps/migration*
+# CRITICAL: Remove the dummy source AND all metadata/fingerprints for local crates
+# This forces Cargo to rebuild them from the real source we copy in the next step.
+RUN rm -rf src migration target/release/nmcscan* target/release/deps/nmcscan* target/release/deps/libmigration* target/release/.fingerprint/migration* target/release/.fingerprint/nmcscan*
 
 # Copy the real source code
-COPY src ./src
 COPY migration ./migration
+COPY src ./src
 
 # Final build
 RUN cargo build --release
