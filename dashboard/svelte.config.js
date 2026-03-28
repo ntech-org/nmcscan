@@ -7,7 +7,10 @@ const config = {
 	kit: {
 		adapter: adapter({
             out: 'build'
-        })
+        }),
+        prerender: {
+            entries: ['/'] // Prerender the information landing page
+        }
 	}
 };
 
