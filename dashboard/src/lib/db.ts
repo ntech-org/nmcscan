@@ -10,7 +10,10 @@ export function getPool() {
       console.warn('⚠️ DATABASE_URL is not set!');
     }
     pool = new pg.Pool({
-      connectionString: env.DATABASE_URL
+      connectionString: env.DATABASE_URL,
+      max: 20, // Limit dashboard to 20 connections
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 2000,
     });
     
     pool.on('error', (err) => {

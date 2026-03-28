@@ -54,6 +54,9 @@
     let countryFilter = $state(urlParams.get("country") || "");
     let minPlayers = $state(urlParams.get("min_players") || "");
     let maxPlayers = $state(urlParams.get("max_players") || "");
+    let minMaxPlayers = $state(urlParams.get("min_max_players") || "");
+    let maxMaxPlayers = $state(urlParams.get("max_max_players") || "");
+    let asnFilter = $state(urlParams.get("asn") || "");
     let asnCategory = $state(urlParams.get("asn_category") || "all");
     
     let sortBy = $state(urlParams.get("sort_by") || "players");
@@ -71,7 +74,9 @@
         if (statusFilter !== "all") parts.push(`status:${statusFilter}`);
         if (serverTypeFilter !== "all") parts.push(`type:${serverTypeFilter}`);
         if (asnCategory !== "all") parts.push(`category:${asnCategory}`);
+        if (asnFilter) parts.push(`asn:${asnFilter}`);
         
+        // Players Online
         if (minPlayers && maxPlayers && minPlayers === maxPlayers) {
             parts.push(`players:${minPlayers}`);
         } else if (minPlayers && maxPlayers) {
@@ -81,6 +86,18 @@
         } else if (maxPlayers) {
             parts.push(`players:<${parseInt(maxPlayers) + 1}`);
         }
+
+        // Capacity (Max Players)
+        if (minMaxPlayers && maxMaxPlayers && minMaxPlayers === maxMaxPlayers) {
+            parts.push(`limit:${minMaxPlayers}`);
+        } else if (minMaxPlayers && maxMaxPlayers) {
+            parts.push(`limit:${minMaxPlayers}..${maxMaxPlayers}`);
+        } else if (minMaxPlayers) {
+            parts.push(`limit:>${parseInt(minMaxPlayers) - 1}`);
+        } else if (maxMaxPlayers) {
+            parts.push(`limit:<${parseInt(maxMaxPlayers) + 1}`);
+        }
+
         if (parsedQuery) parts.push(parsedQuery);
         
         rawSearchText = parts.join(" ");
@@ -91,7 +108,7 @@
     function parseSearchText() {
         isParsing = true;
         const text = rawSearchText;
-        const regex = /(?:(brand|version|country|status|type|players|category|asn):(?:(["'])(.*?)\2|([^ ]+)))/gi;
+        const regex = /(?:(brand|version|country|status|type|players|limit|category|asn):(?:(["'])(.*?)\2|([^ ]+)))/gi;
         let match;
         let remainingText = text;
 
@@ -102,7 +119,10 @@
         let newType = "all";
         let newMin = "";
         let newMax = "";
+        let newMinMax = "";
+        let newMaxMax = "";
         let newCat = "all";
+        let newAsn = "";
 
         while ((match = regex.exec(text)) !== null) {
             const fullMatch = match[0];
@@ -117,6 +137,7 @@
             if (key === "status") newStatus = ["all", "online", "offline"].includes(val.toLowerCase()) ? val.toLowerCase() : "all";
             if (key === "type") newType = ["all", "java", "bedrock"].includes(val.toLowerCase()) ? val.toLowerCase() : "all";
             if (key === "category") newCat = val;
+            if (key === "asn") newAsn = val;
             if (key === "players") {
                 if (val.startsWith(">")) newMin = (parseInt(val.slice(1)) + 1).toString();
                 else if (val.startsWith("<")) newMax = (parseInt(val.slice(1)) - 1).toString();
@@ -129,6 +150,18 @@
                     newMax = val;
                 }
             }
+            if (key === "limit") {
+                if (val.startsWith(">")) newMinMax = (parseInt(val.slice(1)) + 1).toString();
+                else if (val.startsWith("<")) newMaxMax = (parseInt(val.slice(1)) - 1).toString();
+                else if (val.includes("..")) {
+                    const parts = val.split("..");
+                    newMinMax = parts[0] || "";
+                    newMaxMax = parts[1] || "";
+                } else {
+                    newMinMax = val;
+                    newMaxMax = val;
+                }
+            }
         }
 
         brandFilter = newBrand;
@@ -137,8 +170,11 @@
         statusFilter = newStatus;
         serverTypeFilter = newType;
         asnCategory = newCat;
+        asnFilter = newAsn;
         minPlayers = newMin;
         maxPlayers = newMax;
+        minMaxPlayers = newMinMax;
+        maxMaxPlayers = newMaxMax;
         
         parsedQuery = remainingText.trim().replace(/\s+/g, " ");
 
@@ -173,8 +209,11 @@
             if (countryFilter) params.set("country", countryFilter);
             if (serverTypeFilter !== "all") params.set("server_type", serverTypeFilter);
             if (asnCategory !== "all") params.set("asn_category", asnCategory);
+            if (asnFilter) params.set("asn", asnFilter);
             if (minPlayers) params.set("min_players", minPlayers);
             if (maxPlayers) params.set("max_players", maxPlayers);
+            if (minMaxPlayers) params.set("min_max_players", minMaxPlayers);
+            if (maxMaxPlayers) params.set("max_max_players", maxMaxPlayers);
             
             params.set("sort_by", sortBy);
             params.set("sort_order", sortOrder);
@@ -303,6 +342,15 @@
                     </div>
                 </div>
 
+                <div class="space-y-2">
+                    <label class="text-xs font-semibold uppercase text-muted-foreground">Server Capacity</label>
+                    <div class="flex items-center gap-2">
+                        <Input type="number" placeholder="Min" class="h-9" bind:value={minMaxPlayers} oninput={buildSearchTextFromSidebar} />
+                        <span class="text-muted-foreground">-</span>
+                        <Input type="number" placeholder="Max" class="h-9" bind:value={maxMaxPlayers} oninput={buildSearchTextFromSidebar} />
+                    </div>
+                </div>
+
                 <Separator />
 
                 <div class="space-y-2">
@@ -316,6 +364,7 @@
                 <div class="space-y-2">
                     <label class="text-xs font-semibold uppercase text-muted-foreground">Network</label>
                     <Input placeholder="Country Code (e.g. US)" class="h-9 mb-2 uppercase" bind:value={countryFilter} oninput={buildSearchTextFromSidebar} maxlength={2} />
+                    <Input placeholder="ASN ID (e.g. 16509)" class="h-9 mb-2" bind:value={asnFilter} oninput={buildSearchTextFromSidebar} />
                     <select
                         bind:value={asnCategory}
                         onchange={buildSearchTextFromSidebar}
@@ -394,7 +443,7 @@
                             {#each servers as server}
                                 <Table.Row
                                     class="group cursor-pointer hover:bg-muted/30 transition-colors"
-                                    onclick={() => goto(`/admin/servers/${server.ip}:${server.port}`)}
+                                    onclick={() => goto(`/explore/servers/${server.ip}:${server.port}`)}
                                 >
                                     <Table.Cell>
                                         {#if server.favicon}

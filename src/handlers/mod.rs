@@ -111,6 +111,8 @@ pub struct ServerQuery {
     pub cursor_ip: Option<String>,
     pub cursor_last_seen: Option<chrono::NaiveDateTime>,
     pub asn: Option<String>,
+    pub min_max_players: Option<i32>,
+    pub max_max_players: Option<i32>,
 }
 
 fn default_limit() -> i32 {
@@ -322,6 +324,8 @@ async fn list_servers(
             query.cursor_ip.as_deref(),
             query.cursor_last_seen,
             query.asn.as_deref(),
+            query.min_max_players,
+            query.max_max_players,
         )
         .await
         .unwrap_or_default();

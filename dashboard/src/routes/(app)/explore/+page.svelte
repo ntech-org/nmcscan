@@ -20,7 +20,6 @@
     let refreshInterval: ReturnType<typeof setInterval>;
 
     async function loadData() {
-        if (!authState.isAuthenticated) return;
         try {
             const res = await fetchWithAuth('/api/stats');
             stats = await res.json();

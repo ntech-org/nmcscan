@@ -31,6 +31,7 @@
     interface Server {
         ip: string;
         port: number;
+        server_type: string;
         status: string;
         players_online: number;
         players_max: number;
@@ -44,6 +45,8 @@
         country?: string | null;
         asn_org?: string | null;
         asn_tags?: string[];
+        favicon?: string | null;
+        brand?: string | null;
     }
 
     interface HistoryResponse {
@@ -69,7 +72,7 @@
     let chart: Chart | null = null;
 
     async function loadServerData() {
-        if (!authState.isAuthenticated || !ip) return;
+        if (!ip) return;
         loading = true;
         try {
             const [serverRes, historyRes, playersRes] = await Promise.all([
@@ -79,8 +82,7 @@
             ]);
             
             server = await serverRes.json();
-            const rawHistory = await historyRes.json();
-            history = rawHistory.reverse(); // chronological order
+            history = await historyRes.json(); // Backend already returns chronological order
             players = await playersRes.json();
         } catch (e) {
             error = e instanceof Error ? e.message : 'Failed to load server data';
@@ -185,14 +187,23 @@
         <button onclick={() => window.history.back()} aria-label="Go back" class="p-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-300 transition-colors">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
         </button>
-        <h1 class="text-2xl font-bold text-white tracking-tight flex items-center gap-3">
-            {ip}
-            {#if server}
-                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border {getStatusColor(server.status)}">
-                    {server.status}
-                </span>
+        <div class="flex items-center gap-3">
+            {#if server?.favicon}
+                <img src={server.favicon} alt="" class="w-10 h-10 rounded-lg shadow-sm rendering-pixelated" />
+            {:else}
+                <div class="w-10 h-10 rounded-lg bg-gray-800 border border-gray-700 flex items-center justify-center text-gray-500">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
+                </div>
             {/if}
-        </h1>
+            <h1 class="text-2xl font-bold text-white tracking-tight flex items-center gap-3">
+                {ip}
+                {#if server}
+                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border {getStatusColor(server.status)}">
+                        {server.status}
+                    </span>
+                {/if}
+            </h1>
+        </div>
     </div>
 
     {#if loading}
@@ -215,12 +226,37 @@
                             <dd class="text-gray-200 font-mono">{server.port}</dd>
                         </div>
                         <div class="flex justify-between pb-3 border-b border-gray-800/50">
-                            <dt class="text-gray-500">Version</dt>
-                            <dd class="text-gray-200">{server.version || 'Unknown'}</dd>
+                            <dt class="text-gray-500">Type</dt>
+                            <dd class="text-gray-200 uppercase font-bold text-[10px] tracking-widest">{server.server_type}</dd>
+                        </div>
+                        <div class="flex justify-between pb-3 border-b border-gray-800/50">
+                            <dt class="text-gray-500">Software</dt>
+                            <dd class="text-gray-200 text-right">
+                                <div>{server.brand || 'Vanilla'}</div>
+                                <div class="text-[10px] text-gray-500 italic truncate max-w-[150px]">{server.version || 'Unknown'}</div>
+                            </dd>
                         </div>
                         <div class="flex justify-between pb-3 border-b border-gray-800/50">
                             <dt class="text-gray-500">Players</dt>
                             <dd class="text-gray-200">{server.players_online} / {server.players_max}</dd>
+                        </div>
+                        <div class="flex justify-between pb-3 border-b border-gray-800/50">
+                            <dt class="text-gray-500">Priority</dt>
+                            <dd class="text-gray-200">
+                                <span class="px-2 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[10px] font-bold">
+                                    Tier {server.priority}
+                                </span>
+                            </dd>
+                        </div>
+                        <div class="flex justify-between pb-3 border-b border-gray-800/50">
+                            <dt class="text-gray-500">Scan Status</dt>
+                            <dd class="text-gray-200">
+                                {#if server.consecutive_failures > 0}
+                                    <span class="text-red-400 font-medium">{server.consecutive_failures} Failures</span>
+                                {:else}
+                                    <span class="text-emerald-400 font-medium">Healthy</span>
+                                {/if}
+                            </dd>
                         </div>
                         <div class="flex justify-between pb-3 border-b border-gray-800/50">
                             <dt class="text-gray-500">Whitelist Prob.</dt>
@@ -235,7 +271,7 @@
                             <dd class="text-gray-200 text-right">
                                 {#if server.asn}
                                     <div class="flex flex-col items-end gap-1">
-                                        <a href={`/admin/servers?asn=${server.asn}`} class="text-blue-400 hover:text-blue-300 hover:underline font-mono">
+                                        <a href={`/explore/servers?asn=${server.asn}`} class="text-blue-400 hover:text-blue-300 hover:underline font-mono">
                                             {server.asn}
                                         </a>
                                         {#if server.asn_org}
@@ -260,7 +296,7 @@
                             <dt class="text-gray-500">Country</dt>
                             <dd class="text-gray-200">
                                 {#if server.country}
-                                    <a href={`/admin/servers?country=${server.country}`} class="flex items-center gap-2 hover:text-blue-400 transition-colors">
+                                    <a href={`/explore/servers?country=${server.country}`} class="flex items-center gap-2 hover:text-blue-400 transition-colors">
                                         <span>{server.country}</span>
                                         <img src={`https://flagcdn.com/20x15/${server.country.toLowerCase()}.png`} alt={server.country} class="rounded shadow-sm" />
                                     </a>

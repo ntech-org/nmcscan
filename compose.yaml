@@ -15,7 +15,7 @@ services:
       nofile:
         soft: 65536
         hard: 65536
-    command: ["postgres", "-c", "max_connections=1000"]
+    command: ["postgres", "-c", "max_connections=1000", "-c", "shared_buffers=512MB", "-c", "synchronous_commit=off", "-c", "work_mem=16MB"]
 
   nmcscan:
     build: .
@@ -36,7 +36,7 @@ services:
       - DATABASE_URL=postgres://nmcscan:nmcscan_secret@postgres:5432/nmcscan
       - EXCLUDE_FILE=/app/exclude.conf
       - TARGET_RPS=${TARGET_RPS:-100}
-      - TARGET_CONCURRENCY=${TARGET_CONCURRENCY:-2500}
+      - TARGET_CONCURRENCY=${TARGET_CONCURRENCY:-1000}
       - TARGET_COLD_RPS
       - TEST_MODE=${TEST_MODE:-false}
       - TEST_MAX_SERVERS=${TEST_MAX_SERVERS:-50}

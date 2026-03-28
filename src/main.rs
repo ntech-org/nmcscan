@@ -138,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Initialize database
     tracing::info!("Initializing database at {}...", args.database);
     let mut opt = ConnectOptions::new(&args.database);
-    opt.max_connections(args.target_concurrency.min(1000).max(100))
+    opt.max_connections(100)
        .acquire_timeout(std::time::Duration::from_secs(30))
        .sqlx_logging(false);
     
@@ -208,7 +208,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let scanner = Scanner::new(
         Arc::clone(&exclude_manager),
-        Arc::clone(&server_repo),
         Arc::clone(&asn_fetcher),
         args.target_rps,
         args.target_concurrency,
@@ -275,6 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scheduler = Arc::clone(&scheduler);
         let scanner = Arc::clone(&scanner);
         let stats_repo = Arc::clone(&stats_repo);
+        let server_repo_clone = Arc::clone(&server_repo);
         
         // Background filler task
         let scheduler_filler = Arc::clone(&scheduler);
@@ -291,7 +291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         tokio::spawn(async move {
-            run_scanner_loop(scanner, scheduler, stats_repo, args.target_concurrency).await;
+            run_scanner_loop(scanner, scheduler, stats_repo, server_repo_clone, args.target_concurrency).await;
         })
     };
 
@@ -354,12 +354,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use tokio::sync::mpsc;
+use tokio::time::{self, Duration};
 
 /// Background scanner loop with tiered rate limiting and concurrency.
 async fn run_scanner_loop(
     scanner: Arc<Scanner>,
     scheduler: Arc<Scheduler>,
     stats_repo: Arc<StatsRepository>,
+    server_repo: Arc<ServerRepository>,
     max_concurrency: u32,
 ) {
     tracing::info!("Scanner loop started (max concurrency: {})", max_concurrency);
@@ -377,6 +380,40 @@ async fn run_scanner_loop(
 
     let mut status_interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
     let mut stats_flush_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+
+    // Result batching system
+    let (result_tx, mut result_rx) = mpsc::channel::<crate::network::ScanResult>(max_concurrency as usize * 2);
+    let server_repo_clone = Arc::clone(&server_repo);
+    
+    // Background task for batching DB writes
+    tokio::spawn(async move {
+        let mut buffer = Vec::with_capacity(100);
+        let mut interval = time::interval(Duration::from_secs(1));
+
+        loop {
+            tokio::select! {
+                res = result_rx.recv() => {
+                    if let Some(result) = res {
+                        buffer.push(result);
+                        if buffer.len() >= 100 {
+                            if let Err(e) = server_repo_clone.batch_update_results(buffer.split_off(0)).await {
+                                tracing::error!("Failed to batch update results: {}", e);
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if !buffer.is_empty() {
+                        if let Err(e) = server_repo_clone.batch_update_results(buffer.split_off(0)).await {
+                            tracing::error!("Failed to batch update results: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     loop {
         tokio::select! {
@@ -420,6 +457,7 @@ async fn run_scanner_loop(
                     let warm_buffer = Arc::clone(&warm_buffer);
                     let cold_buffer = Arc::clone(&cold_buffer);
                     let discoveries_buffer = Arc::clone(&discoveries_buffer);
+                    let result_tx = result_tx.clone();
 
                     active_tasks.fetch_add(1, Ordering::SeqCst);
                     
@@ -429,12 +467,18 @@ async fn run_scanner_loop(
                         // Check if it's a brand new discovery target (never scanned)
                         let is_discovery = server.last_scanned.is_none();
 
-                        let (was_online, is_new) = scanner
+                        let scan_result = scanner
                             .scan_server(&server.ip, server.port, server.hostname.as_deref(), priority, is_discovery, &server.server_type)
                             .await;
 
+                        let was_online = scan_result.as_ref().map(|r| r.online).unwrap_or(false);
+
                         // Re-queue with updated priority
                         scheduler.requeue_server(server, was_online).await;
+
+                        if let Some(res) = scan_result {
+                            let _ = result_tx.send(res).await;
+                        }
 
                         // Track scan counts in memory buffers
                         match priority {
@@ -451,7 +495,7 @@ async fn run_scanner_loop(
                                 cold_buffer.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        if is_new {
+                        if was_online && is_discovery {
                             discoveries_buffer.fetch_add(1, Ordering::Relaxed);
                         }
                         

@@ -219,6 +219,121 @@ impl ServerRepository {
         Ok(())
     }
 
+    pub async fn batch_update_results(&self, results: Vec<crate::network::ScanResult>) -> Result<(), DbErr> {
+        if results.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self.db.begin().await?;
+
+        for res in results {
+            if res.online {
+                let server = servers::ActiveModel {
+                    ip: Set(res.ip.clone()),
+                    port: Set(res.port as i32),
+                    server_type: Set(res.server_type.clone()),
+                    status: Set("online".to_string()),
+                    players_online: Set(res.players_online),
+                    players_max: Set(res.players_max),
+                    motd: Set(res.motd),
+                    version: Set(res.version),
+                    favicon: Set(res.favicon),
+                    brand: Set(res.brand),
+                    priority: Set(1),
+                    last_seen: Set(Some(res.timestamp)),
+                    consecutive_failures: Set(0),
+                    asn: Set(res.asn),
+                    country: Set(res.country.unwrap_or(None)),
+                    ..Default::default()
+                };
+
+                servers::Entity::insert(server)
+                    .on_conflict(
+                        sea_query::OnConflict::columns([servers::Column::Ip, servers::Column::Port])
+                            .update_columns([
+                                servers::Column::Status,
+                                servers::Column::PlayersOnline,
+                                servers::Column::PlayersMax,
+                                servers::Column::Motd,
+                                servers::Column::Version,
+                                servers::Column::Favicon,
+                                servers::Column::Brand,
+                                servers::Column::LastSeen,
+                                servers::Column::Priority,
+                                servers::Column::ConsecutiveFailures,
+                                servers::Column::Asn,
+                                servers::Column::Country,
+                            ])
+                            .to_owned()
+                    )
+                    .exec(&txn)
+                    .await?;
+
+                // Insert into history
+                let history_model = server_history::ActiveModel {
+                    ip: Set(res.ip.clone()),
+                    port: Set(res.port as i32),
+                    timestamp: Set(res.timestamp),
+                    players_online: Set(res.players_online),
+                    ..Default::default()
+                };
+                server_history::Entity::insert(history_model).exec(&txn).await?;
+
+                // Update players
+                if let Some(samples) = res.players_sample {
+                    for p in samples {
+                        let p_model = server_players::ActiveModel {
+                            ip: Set(res.ip.clone()),
+                            port: Set(res.port as i32),
+                            player_name: Set(p.name),
+                            player_uuid: Set(Some(p.uuid)),
+                            last_seen: Set(res.timestamp),
+                            ..Default::default()
+                        };
+                        server_players::Entity::insert(p_model)
+                            .on_conflict(
+                                sea_query::OnConflict::columns([server_players::Column::Ip, server_players::Column::Port, server_players::Column::PlayerName])
+                                    .update_columns([server_players::Column::PlayerUuid, server_players::Column::LastSeen])
+                                    .to_owned()
+                            )
+                            .exec(&txn)
+                            .await?;
+                    }
+                }
+            } else {
+                let server = servers::ActiveModel {
+                    ip: Set(res.ip.clone()),
+                    port: Set(res.port as i32),
+                    server_type: Set(res.server_type.clone()),
+                    status: Set("ignored".to_string()),
+                    priority: Set(3),
+                    last_seen: Set(Some(res.timestamp)),
+                    consecutive_failures: Set(1),
+                    asn: Set(res.asn),
+                    country: Set(res.country.unwrap_or(None)),
+                    ..Default::default()
+                };
+
+                servers::Entity::insert(server)
+                    .on_conflict(
+                        sea_query::OnConflict::columns([servers::Column::Ip, servers::Column::Port])
+                            .value(servers::Column::Status, Expr::cust("CASE WHEN servers.motd IS NOT NULL OR servers.status = 'online' THEN 'offline' ELSE 'ignored' END"))
+                            .value(servers::Column::ConsecutiveFailures, Expr::cust("servers.consecutive_failures + 1"))
+                            .value(servers::Column::LastSeen, res.timestamp)
+                            .value(servers::Column::Priority, Expr::cust("CASE WHEN servers.consecutive_failures >= 5 THEN 3 ELSE servers.priority END"))
+                            .value(servers::Column::Asn, Expr::cust("COALESCE(servers.asn, excluded.asn)"))
+                            .value(servers::Column::Country, Expr::cust("COALESCE(servers.country, excluded.country)"))
+                            .to_owned()
+                    )
+                    .exec(&txn)
+                    .await?;
+            }
+        }
+
+        txn.commit().await?;
+        Ok(())
+    }
+
     pub async fn get_all_servers(
         &self,
         status_filter: Option<&str>,
@@ -238,6 +353,8 @@ impl ServerRepository {
         cursor_ip: Option<&str>,
         cursor_last_seen: Option<NaiveDateTime>,
         asn_filter: Option<&str>,
+        min_max_players: Option<i32>,
+        max_max_players: Option<i32>,
     ) -> Result<Vec<servers::Model>, DbErr> {
         let mut query = servers::Entity::find()
             .filter(servers::Column::Status.ne("ignored"));
@@ -249,7 +366,9 @@ impl ServerRepository {
         }
 
         if let Some(st) = server_type_filter {
-            query = query.filter(servers::Column::ServerType.eq(st));
+            if st != "all" {
+                query = query.filter(servers::Column::ServerType.eq(st));
+            }
         }
 
         if let Some(search) = search_query {
@@ -269,6 +388,14 @@ impl ServerRepository {
             query = query.filter(servers::Column::PlayersOnline.lte(max_p));
         }
 
+        if let Some(min_mp) = min_max_players {
+            query = query.filter(servers::Column::PlayersMax.gte(min_mp));
+        }
+
+        if let Some(max_mp) = max_max_players {
+            query = query.filter(servers::Column::PlayersMax.lte(max_mp));
+        }
+
         if let Some(ver) = version {
             query = query.filter(servers::Column::Version.contains(ver));
         }
@@ -278,16 +405,17 @@ impl ServerRepository {
         }
 
         if let Some(cat) = asn_category {
-            // This requires a subquery or a join.
-            query = query.filter(
-                servers::Column::Asn.in_subquery(
-                    crate::models::entities::asns::Entity::find()
-                        .select_only()
-                        .column(crate::models::entities::asns::Column::Asn)
-                        .filter(crate::models::entities::asns::Column::Category.eq(cat))
-                        .into_query()
-                )
-            );
+            if cat != "all" {
+                query = query.filter(
+                    servers::Column::Asn.in_subquery(
+                        crate::models::entities::asns::Entity::find()
+                            .select_only()
+                            .column(crate::models::entities::asns::Column::Asn)
+                            .filter(crate::models::entities::asns::Column::Category.eq(cat))
+                            .into_query()
+                    )
+                );
+            }
         }
 
         if let Some(asn) = asn_filter {
@@ -299,7 +427,7 @@ impl ServerRepository {
         }
 
         if let Some(b) = brand {
-            query = query.filter(servers::Column::Brand.eq(b));
+            query = query.filter(servers::Column::Brand.contains(b));
         }
 
         let order = match sort_order {

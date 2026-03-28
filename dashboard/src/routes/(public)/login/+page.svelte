@@ -7,7 +7,7 @@
 
   async function handleSignIn(provider: string) {
     loading = provider;
-    await signIn(provider, { callbackUrl: '/admin' });
+    await signIn(provider, { callbackUrl: '/explore' });
   }
 </script>
 

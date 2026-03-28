@@ -122,7 +122,7 @@
           {#each asns as asn}
             <Table.Row class="group">
               <Table.Cell class="font-mono text-sm font-semibold text-primary">
-                <a href={`/admin/servers?asn=${asn.asn}`} class="hover:underline">
+                <a href={`/explore/servers?asn=${asn.asn}`} class="hover:underline">
                   {asn.asn}
                 </a>
               </Table.Cell>
