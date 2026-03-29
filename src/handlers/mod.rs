@@ -65,9 +65,11 @@ pub struct ServerResponse {
 }
 
 use crate::models::entities::servers;
-use crate::repositories::{ServerRepository, AsnRepository, StatsRepository};
+use crate::repositories::{ServerRepository, AsnRepository, StatsRepository, ApiKeyRepository};
 use crate::services::scheduler::Scheduler;
 use crate::utils::exclude::ExcludeManager;
+
+pub mod api_keys;
 
 /// Shared application state.
 #[allow(dead_code)]
@@ -77,11 +79,18 @@ pub struct AppState {
     pub server_repo: Arc<ServerRepository>,
     pub asn_repo: Arc<AsnRepository>,
     pub stats_repo: Arc<StatsRepository>,
+    pub api_key_repo: Arc<ApiKeyRepository>,
     pub scheduler: Arc<Scheduler>,
     pub exclude_list: Arc<ExcludeManager>,
     pub api_key: Option<String>,
     pub contact_email: Option<String>,
     pub discord_link: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct AuthContext {
+    pub user_id: Option<i32>,
+    pub is_master: bool,
 }
 
 #[derive(Serialize)]
@@ -218,18 +227,42 @@ pub struct ExcludeEntry {
 async fn auth_middleware(
     State(state): State<AppState>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if let Some(expected_key) = &state.api_key {
-        let auth_header = headers.get("X-API-Key")
-            .and_then(|h| h.to_str().ok());
+    let mut authenticated_user_id = None;
+    let mut is_master = false;
 
-        if auth_header != Some(expected_key) {
-            tracing::warn!("Unauthorized access attempt from {:?}", request.uri());
-            return Err(StatusCode::UNAUTHORIZED);
+    if let Some(auth_header) = headers.get("X-API-Key").and_then(|h| h.to_str().ok()) {
+        if state.api_key.as_deref() == Some(auth_header) {
+            is_master = true;
+            // Allow proxy to impersonate user if master key is used
+            if let Some(user_id) = headers.get("X-User-Id").and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<i32>().ok()) {
+                authenticated_user_id = Some(user_id);
+            }
+        } else {
+            // Check api_keys table (hash the provided raw key first to compare)
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(auth_header.as_bytes());
+            let hash_hex = format!("{:x}", hasher.finalize());
+            
+            if let Ok(Some(user_id)) = state.api_key_repo.validate_key(&hash_hex).await {
+                authenticated_user_id = Some(user_id);
+            }
         }
     }
+
+    if !is_master && authenticated_user_id.is_none() {
+        tracing::warn!("Unauthorized access attempt from {:?}", request.uri());
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    request.extensions_mut().insert(AuthContext {
+        user_id: authenticated_user_id,
+        is_master,
+    });
+
     Ok(next.run(request).await)
 }
 
@@ -252,6 +285,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/asns/{asn}", get(get_asn))
         .route("/exclude", get(get_exclude_list).post(add_exclusion))
         .route("/scan/test", post(trigger_test_scan))
+        .route("/keys", get(api_keys::list_keys).post(api_keys::create_key))
+        .route("/keys/{id}", axum::routing::delete(api_keys::revoke_key))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Combine all API routes under /api

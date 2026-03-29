@@ -26,7 +26,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use sea_orm::{Database, ConnectOptions, EntityTrait, QueryFilter, ColumnTrait, QuerySelect};
 use migration::Migrator;
 use sea_orm_migration::MigratorTrait;
-use crate::repositories::{ServerRepository, AsnRepository, StatsRepository};
+use crate::repositories::{ServerRepository, AsnRepository, StatsRepository, ApiKeyRepository};
 use crate::services::asn_fetcher::AsnFetcher;
 use crate::services::scheduler::{Scheduler, ServerTarget};
 use crate::network::scanner::Scanner;
@@ -155,6 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_repo = Arc::new(ServerRepository::new((*db).clone()));
     let asn_repo = Arc::new(AsnRepository::new((*db).clone()));
     let stats_repo = Arc::new(StatsRepository::new((*db).clone()));
+    let api_key_repo = Arc::new(ApiKeyRepository::new((*db).clone()));
 
     // 3. Initialize ASN fetcher
     tracing::info!("Initializing ASN fetcher...");
@@ -331,6 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         server_repo: Arc::clone(&server_repo),
         asn_repo: Arc::clone(&asn_repo),
         stats_repo: Arc::clone(&stats_repo),
+        api_key_repo: Arc::clone(&api_key_repo),
         scheduler: Arc::clone(&scheduler),
         exclude_list: Arc::clone(&exclude_manager),
         api_key: args.api_key.clone(),

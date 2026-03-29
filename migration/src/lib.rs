@@ -1,8 +1,8 @@
 pub use sea_orm_migration::prelude::*;
-pub use sea_orm_migration::MigratorTrait;
 
 mod m20220101_000001_create_table;
 mod m20260328_000002_add_performance_indexes;
+mod m20260329_000003_create_api_keys;
 
 pub struct Migrator;
 
@@ -12,6 +12,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20220101_000001_create_table::Migration),
             Box::new(m20260328_000002_add_performance_indexes::Migration),
+            Box::new(m20260329_000003_create_api_keys::Migration),
         ]
     }
 }

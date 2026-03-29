@@ -21,6 +21,9 @@ export const fallback: RequestHandler = async (event) => {
   
   const headers = new Headers(request.headers);
   headers.set('X-API-Key', API_KEY);
+  if (session && session.user) {
+    headers.set('X-User-Id', (session.user as any).id.toString());
+  }
   // Remove host header to avoid issues with target
   headers.delete('host');
   headers.delete('connection');
