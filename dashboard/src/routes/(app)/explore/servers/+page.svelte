@@ -299,18 +299,18 @@
     <div class="flex flex-col md:flex-row gap-6 items-start">
         <!-- Sidebar Filters -->
         <Card.Root class="w-full md:w-64 flex-shrink-0 bg-card shadow-lg border-muted {showMobileFilters ? 'block' : 'hidden md:block'}">
-            <Card.Header class="p-4 pb-2 border-b bg-muted/20">
-                <h3 class="font-bold flex items-center gap-2 text-sm uppercase tracking-wider text-muted-foreground">
-                    <Filter class="h-4 w-4" /> Filters
+            <Card.Header class="p-3 pb-2 border-b bg-muted/20">
+                <h3 class="font-bold flex items-center gap-2 text-[11px] uppercase tracking-wider text-muted-foreground">
+                    <Filter class="h-3.5 w-3.5" /> Filters
                 </h3>
             </Card.Header>
-            <Card.Content class="p-4 space-y-5">
-                <div class="space-y-2">
-                    <label class="text-xs font-semibold uppercase text-muted-foreground">Status</label>
+            <Card.Content class="p-3 space-y-4">
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-semibold uppercase text-muted-foreground/70 ml-1">Status</label>
                     <select
                         bind:value={statusFilter}
                         onchange={buildSearchTextFromSidebar}
-                        class="w-full h-9 px-3 bg-background border rounded-md text-sm focus:ring-1 focus:ring-primary outline-none"
+                        class="w-full h-8 px-2 bg-background border rounded-md text-xs focus:ring-1 focus:ring-primary outline-none"
                     >
                         <option value="all">All Status</option>
                         <option value="online">Online Only</option>
@@ -318,12 +318,12 @@
                     </select>
                 </div>
 
-                <div class="space-y-2">
-                    <label class="text-xs font-semibold uppercase text-muted-foreground">Server Type</label>
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-semibold uppercase text-muted-foreground/70 ml-1">Server Type</label>
                     <select
                         bind:value={serverTypeFilter}
                         onchange={buildSearchTextFromSidebar}
-                        class="w-full h-9 px-3 bg-background border rounded-md text-sm focus:ring-1 focus:ring-primary outline-none"
+                        class="w-full h-8 px-2 bg-background border rounded-md text-xs focus:ring-1 focus:ring-primary outline-none"
                     >
                         <option value="all">All Types</option>
                         <option value="java">Java (Standard)</option>
@@ -333,42 +333,42 @@
 
                 <Separator />
 
-                <div class="space-y-2">
-                    <label class="text-xs font-semibold uppercase text-muted-foreground">Players Online</label>
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-semibold uppercase text-muted-foreground/70 ml-1">Players Online</label>
                     <div class="flex items-center gap-2">
-                        <Input type="number" placeholder="Min" class="h-9" bind:value={minPlayers} oninput={buildSearchTextFromSidebar} />
-                        <span class="text-muted-foreground">-</span>
-                        <Input type="number" placeholder="Max" class="h-9" bind:value={maxPlayers} oninput={buildSearchTextFromSidebar} />
+                        <Input type="number" placeholder="Min" class="h-8 text-xs" bind:value={minPlayers} oninput={buildSearchTextFromSidebar} />
+                        <span class="text-muted-foreground text-xs">-</span>
+                        <Input type="number" placeholder="Max" class="h-8 text-xs" bind:value={maxPlayers} oninput={buildSearchTextFromSidebar} />
                     </div>
                 </div>
 
-                <div class="space-y-2">
-                    <label class="text-xs font-semibold uppercase text-muted-foreground">Server Capacity</label>
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-semibold uppercase text-muted-foreground/70 ml-1">Server Capacity</label>
                     <div class="flex items-center gap-2">
-                        <Input type="number" placeholder="Min" class="h-9" bind:value={minMaxPlayers} oninput={buildSearchTextFromSidebar} />
-                        <span class="text-muted-foreground">-</span>
-                        <Input type="number" placeholder="Max" class="h-9" bind:value={maxMaxPlayers} oninput={buildSearchTextFromSidebar} />
+                        <Input type="number" placeholder="Min" class="h-8 text-xs" bind:value={minMaxPlayers} oninput={buildSearchTextFromSidebar} />
+                        <span class="text-muted-foreground text-xs">-</span>
+                        <Input type="number" placeholder="Max" class="h-8 text-xs" bind:value={maxMaxPlayers} oninput={buildSearchTextFromSidebar} />
                     </div>
                 </div>
 
                 <Separator />
 
-                <div class="space-y-2">
-                    <label class="text-xs font-semibold uppercase text-muted-foreground">Software</label>
-                    <Input placeholder="Brand (e.g. Paper)" class="h-9 mb-2" bind:value={brandFilter} oninput={buildSearchTextFromSidebar} />
-                    <Input placeholder="Version (e.g. 1.21)" class="h-9" bind:value={versionFilter} oninput={buildSearchTextFromSidebar} />
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-semibold uppercase text-muted-foreground/70 ml-1">Software</label>
+                    <Input placeholder="Brand (e.g. Paper)" class="h-8 text-xs mb-1.5" bind:value={brandFilter} oninput={buildSearchTextFromSidebar} />
+                    <Input placeholder="Version (e.g. 1.21)" class="h-8 text-xs" bind:value={versionFilter} oninput={buildSearchTextFromSidebar} />
                 </div>
 
                 <Separator />
 
-                <div class="space-y-2">
-                    <label class="text-xs font-semibold uppercase text-muted-foreground">Network</label>
-                    <Input placeholder="Country Code (e.g. US)" class="h-9 mb-2 uppercase" bind:value={countryFilter} oninput={buildSearchTextFromSidebar} maxlength={2} />
-                    <Input placeholder="ASN ID (e.g. 16509)" class="h-9 mb-2" bind:value={asnFilter} oninput={buildSearchTextFromSidebar} />
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-semibold uppercase text-muted-foreground/70 ml-1">Network</label>
+                    <Input placeholder="Country Code (e.g. US)" class="h-8 text-xs mb-1.5 uppercase" bind:value={countryFilter} oninput={buildSearchTextFromSidebar} maxlength={2} />
+                    <Input placeholder="ASN ID (e.g. 16509)" class="h-8 text-xs mb-1.5" bind:value={asnFilter} oninput={buildSearchTextFromSidebar} />
                     <select
                         bind:value={asnCategory}
                         onchange={buildSearchTextFromSidebar}
-                        class="w-full h-9 px-3 bg-background border rounded-md text-sm focus:ring-1 focus:ring-primary outline-none"
+                        class="w-full h-8 px-2 bg-background border rounded-md text-xs focus:ring-1 focus:ring-primary outline-none"
                     >
                         <option value="all">All Categories</option>
                         <option value="hosting">Hosting</option>

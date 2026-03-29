@@ -161,8 +161,8 @@
                     </Badge>
                 </div>
             </header>
-            <ScrollArea class="flex-1 p-6">
-                <div class="max-w-7xl mx-auto space-y-6">
+            <ScrollArea class="flex-1">
+                <div class="max-w-7xl mx-auto p-6 space-y-6">
                     {@render children()}
                 </div>
             </ScrollArea>
