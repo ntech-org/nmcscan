@@ -366,6 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. Create login queue
     let login_queue = Arc::new(LoginQueue::new(Arc::clone(&server_repo)));
+    login_queue.start();
 
     // 8. Start web API
     let api_state = handlers::AppState {
