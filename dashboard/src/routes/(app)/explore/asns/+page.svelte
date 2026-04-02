@@ -92,7 +92,7 @@
     </div>
   {/if}
 
-  <Card.Root class="bg-card shadow-lg border-muted overflow-hidden">
+  <Card.Root class="bg-card shadow-lg border-muted overflow-hidden !py-0">
     <Card.Content class="p-0">
       <Table.Root>
         <Table.Header>

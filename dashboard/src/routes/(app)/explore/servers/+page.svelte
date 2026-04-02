@@ -385,7 +385,7 @@
 
         <!-- Main Content -->
         <div class="flex-1 min-w-0 w-full space-y-4">
-            <Card.Root class="bg-card shadow-lg border-muted">
+            <Card.Root class="bg-card shadow-lg border-muted !py-0">
                 <Card.Header class="p-4 border-b bg-muted/10">
                     <div class="flex flex-col md:flex-row gap-4">
                         <div class="relative flex-1 group">
