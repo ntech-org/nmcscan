@@ -100,6 +100,10 @@ struct Args {
     /// API listen address
     #[arg(long, env = "LISTEN_ADDR", default_value = "0.0.0.0:3000")]
     listen_addr: String,
+
+    /// Force ASN database re-import from iptoasn.com on startup
+    #[arg(long, default_value = "false")]
+    force_asn_import: bool,
 }
 
 #[tokio::main]
@@ -195,10 +199,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         asn_fetcher.asn_manager().read().await.range_count()
     );
 
-    // GLOBAL DISCOVERY SYNC: If we have very few ASNs, trigger a full import from iptoasn.com
-    // to discover all hosting providers globally. Must complete before scheduler starts.
-    if asn_fetcher.asn_manager().read().await.asn_count() < 100 {
-        tracing::info!("Few ASNs cached, running full database import...");
+    // GLOBAL DISCOVERY SYNC: Trigger a full import from iptoasn.com if:
+    // - Very few ASNs (< 100), OR
+    // - Very few ranges (< 100) — indicates old/broken range data, OR
+    // - --force-asn-import flag is set
+    let range_count = asn_fetcher.asn_manager().read().await.range_count();
+    let asn_count = asn_fetcher.asn_manager().read().await.asn_count();
+    if asn_count < 100 || range_count < 100 || args.force_asn_import {
+        tracing::info!("Running full ASN database import (ASNs: {}, ranges: {}, forced: {})...",
+            asn_count, range_count, args.force_asn_import);
         match asn_fetcher.import_full_database().await {
             Ok(()) => tracing::info!("Full ASN import completed successfully."),
             Err(e) => tracing::error!("Full ASN import failed: {}", e),
