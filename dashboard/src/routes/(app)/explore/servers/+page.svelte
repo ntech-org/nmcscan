@@ -35,6 +35,9 @@
         country?: string | null;
         favicon?: string | null;
         brand?: string | null;
+        login_obstacle?: string | null;
+        last_login_at?: string | null;
+        flags?: string[];
     }
 
     let servers = $state<Server[]>([]);
@@ -414,6 +417,7 @@
                                 <Table.Head class="w-16"></Table.Head>
                                 <Table.Head>Server Address</Table.Head>
                                 <Table.Head>Status</Table.Head>
+                                <Table.Head>Login</Table.Head>
                                 <Table.Head>Players</Table.Head>
                                 <Table.Head>Software</Table.Head>
                                 <Table.Head class="text-right">Action</Table.Head>
@@ -422,7 +426,7 @@
                         <Table.Body>
                             {#if loading && servers.length === 0}
                                 <Table.Row>
-                                    <Table.Cell colspan={6} class="h-32 text-center text-muted-foreground">
+                                    <Table.Cell colspan={7} class="h-32 text-center text-muted-foreground">
                                         <div class="flex flex-col items-center justify-center gap-2">
                                             <RefreshCcw class="w-6 h-6 animate-spin mx-auto opacity-50 mb-2" />
                                             <span class="italic text-sm">Querying database...</span>
@@ -431,7 +435,7 @@
                                 </Table.Row>
                             {:else if servers.length === 0}
                                 <Table.Row>
-                                    <Table.Cell colspan={6} class="h-32 text-center text-muted-foreground">
+                                    <Table.Cell colspan={7} class="h-32 text-center text-muted-foreground">
                                         <div class="flex flex-col items-center justify-center gap-2">
                                             <Search class="w-8 h-8 opacity-20" />
                                             <span class="italic text-sm">No servers match your advanced criteria.</span>
@@ -477,6 +481,19 @@
                                             <Badge class="bg-emerald-500/10 text-emerald-600 hover:bg-emerald-500/20 border-emerald-500/20 px-2 py-0 text-[10px] uppercase font-bold tracking-wider">Online</Badge>
                                         {:else}
                                             <Badge variant="outline" class="text-muted-foreground/70 px-2 py-0 text-[10px] uppercase font-bold tracking-wider">Offline</Badge>
+                                        {/if}
+                                    </Table.Cell>
+                                    <Table.Cell>
+                                        {#if server.login_obstacle === 'success'}
+                                            <Badge class="bg-emerald-500/10 text-emerald-600 border-emerald-500/20 px-2 py-0 text-[10px] uppercase font-bold tracking-wider">Cracked</Badge>
+                                        {:else if server.login_obstacle === 'premium'}
+                                            <Badge class="bg-blue-500/10 text-blue-500 border-blue-500/20 px-2 py-0 text-[10px] uppercase font-bold tracking-wider">Premium</Badge>
+                                        {:else if server.login_obstacle === 'whitelist'}
+                                            <Badge class="bg-yellow-500/10 text-yellow-600 border-yellow-500/20 px-2 py-0 text-[10px] uppercase font-bold tracking-wider">WL</Badge>
+                                        {:else if server.login_obstacle === 'banned'}
+                                            <Badge class="bg-destructive/10 text-destructive border-destructive/20 px-2 py-0 text-[10px] uppercase font-bold tracking-wider">Banned</Badge>
+                                        {:else}
+                                            <span class="text-[10px] text-muted-foreground/50">—</span>
                                         {/if}
                                     </Table.Cell>
                                     <Table.Cell>

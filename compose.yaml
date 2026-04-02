@@ -50,6 +50,7 @@ services:
       - TEST_MAX_SERVERS=${TEST_MAX_SERVERS:-50}
       - TEST_SCAN_INTERVAL=${TEST_SCAN_INTERVAL:-60}
       - TEST_REGIONS
+      - FORCE_ASN_IMPORT=${FORCE_ASN_IMPORT:-false}
     volumes:
       - ./data:/app/data
       - ./exclude.conf:/app/exclude.conf

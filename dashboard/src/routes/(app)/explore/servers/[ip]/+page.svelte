@@ -47,6 +47,9 @@
         asn_tags?: string[];
         favicon?: string | null;
         brand?: string | null;
+        login_obstacle?: string | null;
+        last_login_at?: string | null;
+        flags?: string[];
     }
 
     interface HistoryResponse {
@@ -305,6 +308,44 @@
                                 {/if}
                             </dd>
                         </div>
+                        {#if server.login_obstacle}
+                        <div class="flex justify-between pb-3 border-b border-border/50">
+                            <dt class="text-muted-foreground">Login Status</dt>
+                            <dd>
+                                <span class="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider
+                                    {server.login_obstacle === 'success' ? 'bg-emerald-500/10 text-emerald-500 border border-emerald-500/20' : ''}
+                                    {server.login_obstacle === 'premium' ? 'bg-blue-500/10 text-blue-500 border border-blue-500/20' : ''}
+                                    {server.login_obstacle === 'whitelist' ? 'bg-yellow-500/10 text-yellow-500 border border-yellow-500/20' : ''}
+                                    {server.login_obstacle === 'banned' ? 'bg-destructive/10 text-destructive border border-destructive/20' : ''}
+                                    {!['success','premium','whitelist','banned'].includes(server.login_obstacle) ? 'bg-muted text-muted-foreground border border-border' : ''}
+                                ">
+                                    {server.login_obstacle === 'success' ? 'Cracked' : ''}
+                                    {server.login_obstacle === 'premium' ? 'Premium Only' : ''}
+                                    {server.login_obstacle === 'whitelist' ? 'Whitelisted' : ''}
+                                    {server.login_obstacle === 'banned' ? 'Banned' : ''}
+                                    {!['success','premium','whitelist','banned'].includes(server.login_obstacle) ? server.login_obstacle : ''}
+                                </span>
+                            </dd>
+                        </div>
+                        {/if}
+                        {#if server.last_login_at}
+                        <div class="flex justify-between pb-3 border-b border-border/50">
+                            <dt class="text-muted-foreground">Last Login Test</dt>
+                            <dd class="text-foreground text-sm">{new Date(server.last_login_at).toLocaleString()}</dd>
+                        </div>
+                        {/if}
+                        {#if server.flags && server.flags.length > 0}
+                        <div class="flex justify-between">
+                            <dt class="text-muted-foreground">Flags</dt>
+                            <dd class="flex flex-wrap justify-end gap-1">
+                                {#each server.flags as flag}
+                                    <span class="px-1.5 py-0.5 rounded bg-muted text-muted-foreground text-[9px] font-bold uppercase tracking-tight border border-border">
+                                        {flag}
+                                    </span>
+                                {/each}
+                            </dd>
+                        </div>
+                        {/if}
                     </dl>
                 </div>
                 

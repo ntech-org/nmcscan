@@ -102,7 +102,7 @@ struct Args {
     listen_addr: String,
 
     /// Force ASN database re-import from iptoasn.com on startup
-    #[arg(long, default_value = "false")]
+    #[arg(long, env = "FORCE_ASN_IMPORT", default_value = "false")]
     force_asn_import: bool,
 }
 
