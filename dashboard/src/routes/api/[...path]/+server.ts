@@ -9,21 +9,30 @@ export const fallback: RequestHandler = async (event) => {
   const { params, request, url } = event;
   const path = params.path;
 
+  const clientApiKey = request.headers.get('X-API-Key');
   const session = await event.locals.auth();
-  
-  if (!session && path !== 'info') {
-    throw error(401, 'Unauthorized: No session');
+
+  // Allow requests with a valid API key (external tools) or a browser session
+  if (!clientApiKey && !session && path !== 'info') {
+    throw error(401, 'Unauthorized: No session or API key');
   }
 
-  
   // Forward everything to the Rust backend
   const targetUrl = `${BACKEND_URL}/api/${path}${url.search}`;
-  
+
   const headers = new Headers(request.headers);
-  headers.set('X-API-Key', API_KEY);
-  if (session && session.user) {
-    headers.set('X-User-Id', (session.user as any).id.toString());
+
+  if (clientApiKey) {
+    // External tool: forward their API key as-is, let the backend validate it
+    headers.set('X-API-Key', clientApiKey);
+  } else if (API_KEY) {
+    // Dashboard session: use master key + user ID for impersonation
+    headers.set('X-API-Key', API_KEY);
+    if (session && session.user) {
+      headers.set('X-User-Id', (session.user as any).id.toString());
+    }
   }
+
   // Remove host header to avoid issues with target
   headers.delete('host');
   headers.delete('connection');

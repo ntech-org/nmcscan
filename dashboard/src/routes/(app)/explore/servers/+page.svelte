@@ -77,24 +77,24 @@
         if (asnFilter) parts.push(`asn:${asnFilter}`);
         
         // Players Online
-        if (minPlayers && maxPlayers && minPlayers === maxPlayers) {
+        if (minPlayers !== "" && maxPlayers !== "" && minPlayers === maxPlayers) {
             parts.push(`players:${minPlayers}`);
-        } else if (minPlayers && maxPlayers) {
+        } else if (minPlayers !== "" && maxPlayers !== "") {
             parts.push(`players:${minPlayers}..${maxPlayers}`);
-        } else if (minPlayers) {
+        } else if (minPlayers !== "") {
             parts.push(`players:>${parseInt(minPlayers) - 1}`);
-        } else if (maxPlayers) {
+        } else if (maxPlayers !== "") {
             parts.push(`players:<${parseInt(maxPlayers) + 1}`);
         }
 
         // Capacity (Max Players)
-        if (minMaxPlayers && maxMaxPlayers && minMaxPlayers === maxMaxPlayers) {
+        if (minMaxPlayers !== "" && maxMaxPlayers !== "" && minMaxPlayers === maxMaxPlayers) {
             parts.push(`limit:${minMaxPlayers}`);
-        } else if (minMaxPlayers && maxMaxPlayers) {
+        } else if (minMaxPlayers !== "" && maxMaxPlayers !== "") {
             parts.push(`limit:${minMaxPlayers}..${maxMaxPlayers}`);
-        } else if (minMaxPlayers) {
+        } else if (minMaxPlayers !== "") {
             parts.push(`limit:>${parseInt(minMaxPlayers) - 1}`);
-        } else if (maxMaxPlayers) {
+        } else if (maxMaxPlayers !== "") {
             parts.push(`limit:<${parseInt(maxMaxPlayers) + 1}`);
         }
 
@@ -210,10 +210,10 @@
             if (serverTypeFilter !== "all") params.set("server_type", serverTypeFilter);
             if (asnCategory !== "all") params.set("asn_category", asnCategory);
             if (asnFilter) params.set("asn", asnFilter);
-            if (minPlayers) params.set("min_players", minPlayers);
-            if (maxPlayers) params.set("max_players", maxPlayers);
-            if (minMaxPlayers) params.set("min_max_players", minMaxPlayers);
-            if (maxMaxPlayers) params.set("max_max_players", maxMaxPlayers);
+            if (minPlayers !== "") params.set("min_players", minPlayers);
+            if (maxPlayers !== "") params.set("max_players", maxPlayers);
+            if (minMaxPlayers !== "") params.set("min_max_players", minMaxPlayers);
+            if (maxMaxPlayers !== "") params.set("max_max_players", maxMaxPlayers);
             
             params.set("sort_by", sortBy);
             params.set("sort_order", sortOrder);

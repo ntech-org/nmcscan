@@ -131,20 +131,52 @@ impl AsnRepository {
     }
 
     pub async fn get_ranges_to_scan(&self, category: &str, limit: u64) -> Result<Vec<asn_ranges::Model>, DbErr> {
-        asn_ranges::Entity::find()
-            .join_rev(
-                JoinType::InnerJoin,
-                asns::Entity::belongs_to(asn_ranges::Entity)
-                    .from(asns::Column::Asn)
-                    .to(asn_ranges::Column::Asn)
-                    .into()
-            )
-            .filter(asns::Column::Category.eq(category))
-            .order_by_asc(asn_ranges::Column::LastScannedAt)
-            .order_by_asc(asn_ranges::Column::ScanOffset)
-            .limit(limit)
-            .all(&self.db)
-            .await
+        // Use raw SQL to prioritize ranges from ASNs with more discovered servers.
+        // This ensures productive ASNs (e.g. Hetzner, OVH) get scanned more frequently
+        // than unproductive ones (e.g. residential ISPs with millions of IPs but 0 servers).
+        //
+        // Deprioritization: ranges cycled 3+ times with 0 servers are sorted to the back.
+        // They're not filtered out (still scanned occasionally) but productive ranges
+        // get priority.
+        let sql = format!(r#"
+            SELECT r.cidr, r.asn, r.scan_offset, r.last_scanned_at, r.scan_epoch
+            FROM asn_ranges r
+            JOIN asns a ON r.asn = a.asn
+            LEFT JOIN (
+                SELECT asn, COUNT(*)::bigint as server_count
+                FROM servers
+                WHERE status = 'online'
+                GROUP BY asn
+            ) sc ON r.asn = sc.asn
+            WHERE a.category = '{}'
+            ORDER BY
+                -- Deprioritize exhausted unproductive ranges (3+ cycles, 0 servers)
+                CASE WHEN r.scan_epoch >= 3 AND COALESCE(sc.server_count, 0) = 0
+                     THEN 1 ELSE 0 END ASC,
+                -- Most productive ASNs first
+                COALESCE(sc.server_count, 0) DESC,
+                -- Least recently scanned first within each ASN
+                r.last_scanned_at ASC NULLS FIRST,
+                -- Lowest offset as tiebreaker
+                r.scan_offset ASC
+            LIMIT {}
+        "#, category, limit);
+
+        let stmt = Statement::from_string(self.db.get_database_backend(), sql);
+        let rows = self.db.query_all(stmt).await?;
+
+        use crate::models::entities::asn_ranges::Model as AsnRangeModel;
+        let models: Vec<AsnRangeModel> = rows.into_iter().map(|row| {
+            AsnRangeModel {
+                cidr: row.try_get("", "cidr").unwrap_or_default(),
+                asn: row.try_get("", "asn").unwrap_or_default(),
+                scan_offset: row.try_get("", "scan_offset").unwrap_or(0),
+                last_scanned_at: row.try_get("", "last_scanned_at").ok(),
+                scan_epoch: row.try_get("", "scan_epoch").unwrap_or(0),
+            }
+        }).collect();
+
+        Ok(models)
     }
 
     pub async fn update_range_progress(&self, cidr: &str, new_offset: i64, reset: bool) -> Result<(), DbErr> {
@@ -165,10 +197,12 @@ impl AsnRepository {
         Ok(())
     }
 
-    pub async fn update_batch_range_progress(&self, updates: Vec<(String, i64, bool)>) -> Result<(), DbErr> {
+    pub async fn update_batch_range_progress(&self, updates: Vec<(String, i64, bool, bool)>) -> Result<(), DbErr> {
         let txn = self.db.begin().await?;
-        for (cidr, offset, reset) in updates {
-            let sql = if reset {
+        for (cidr, offset, reset, bump_epoch) in updates {
+            let sql = if reset && bump_epoch {
+                "UPDATE asn_ranges SET scan_offset = 0, last_scanned_at = CURRENT_TIMESTAMP, scan_epoch = scan_epoch + 1 WHERE cidr = $1"
+            } else if reset {
                 "UPDATE asn_ranges SET scan_offset = 0, last_scanned_at = CURRENT_TIMESTAMP WHERE cidr = $1"
             } else {
                 "UPDATE asn_ranges SET scan_offset = $1 WHERE cidr = $2"
@@ -185,4 +219,49 @@ impl AsnRepository {
         txn.commit().await?;
         Ok(())
     }
+
+    /// Get scan progress per category: total ranges, scanned ranges, total epochs.
+    pub async fn get_scan_progress(&self) -> Result<Vec<CategoryProgress>, DbErr> {
+        let sql = r#"
+            SELECT a.category,
+                   COUNT(r.cidr)::bigint as total_ranges,
+                   SUM(CASE WHEN r.last_scanned_at IS NOT NULL THEN 1 ELSE 0 END)::bigint as scanned_ranges,
+                   SUM(r.scan_epoch)::bigint as total_epochs
+            FROM asn_ranges r
+            JOIN asns a ON r.asn = a.asn
+            GROUP BY a.category
+            ORDER BY a.category
+        "#;
+
+        let stmt = Statement::from_string(self.db.get_database_backend(), sql.to_string());
+        let rows = self.db.query_all(stmt).await?;
+
+        let progress: Vec<CategoryProgress> = rows.into_iter().map(|row| {
+            let total: i64 = row.try_get("", "total_ranges").unwrap_or(0);
+            let scanned: i64 = row.try_get("", "scanned_ranges").unwrap_or(0);
+            CategoryProgress {
+                category: row.try_get("", "category").unwrap_or_default(),
+                total_ranges: total,
+                scanned_ranges: scanned,
+                total_epochs: row.try_get("", "total_epochs").unwrap_or(0),
+                cycle_progress_pct: if total > 0 {
+                    (scanned as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                },
+            }
+        }).collect();
+
+        Ok(progress)
+    }
+}
+
+/// Per-category scan progress.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CategoryProgress {
+    pub category: String,
+    pub total_ranges: i64,
+    pub scanned_ranges: i64,
+    pub total_epochs: i64,
+    pub cycle_progress_pct: f64,
 }

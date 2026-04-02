@@ -1,7 +1,10 @@
 <script lang="ts">
     import { onMount } from 'svelte';
-    import { fetchWithAuth, authState } from '$lib/state.svelte';
-    
+    import { fetchWithAuth } from '$lib/state.svelte';
+    import { Separator } from '$lib/components/ui/separator';
+    import { Progress } from '$lib/components/ui/progress';
+    import { Badge } from '$lib/components/ui/badge';
+
     interface Stats {
         total_servers: number;
         online_servers: number;
@@ -11,18 +14,49 @@
         asn_unknown: number;
     }
 
+    interface CategoryProgress {
+        category: string;
+        total_ranges: number;
+        scanned_ranges: number;
+        total_epochs: number;
+        cycle_progress_pct: number;
+    }
+
+    interface ScanProgress {
+        categories: CategoryProgress[];
+        queues: { hot: number; warm: number; cold: number; discovery: number };
+    }
+
+    interface LoginQueueStatus {
+        running: boolean;
+        total_attempts: number;
+        success: number;
+        premium: number;
+        whitelist: number;
+        banned: number;
+        rejected: number;
+        unreachable: number;
+        timeout: number;
+    }
+
     let stats = $state<Stats | null>(null);
+    let scanProgress = $state<ScanProgress | null>(null);
+    let loginStatus = $state<LoginQueueStatus | null>(null);
     let testScanning = $state(false);
     let testScanResult = $state<{ status: string; servers_added: number } | null>(null);
     let testScanRegion = $state('quick');
     let error = $state<string | null>(null);
 
-    let refreshInterval: ReturnType<typeof setInterval>;
-
     async function loadData() {
         try {
-            const res = await fetchWithAuth('/api/stats');
-            stats = await res.json();
+            const [statsRes, progressRes, loginRes] = await Promise.all([
+                fetchWithAuth('/api/stats'),
+                fetchWithAuth('/api/scan/progress'),
+                fetchWithAuth('/api/login-queue/status'),
+            ]);
+            stats = await statsRes.json();
+            scanProgress = await progressRes.json();
+            loginStatus = await loginRes.json();
         } catch (e) {
             console.error("Data load error:", e);
         }
@@ -50,93 +84,179 @@
         }
     }
 
+    function formatNum(n: number | undefined | null): string {
+        return (n ?? 0).toLocaleString();
+    }
+
+    let refreshInterval: ReturnType<typeof setInterval>;
     onMount(() => {
         loadData();
-        refreshInterval = setInterval(() => {
-            loadData();
-        }, 30000);
-
+        refreshInterval = setInterval(loadData, 30000);
         return () => clearInterval(refreshInterval);
     });
 </script>
 
-<div class="space-y-8">
-    <div class="flex items-center justify-between">
-        <h1 class="text-2xl font-bold text-white tracking-tight">System Overview</h1>
+<!-- Stats row -->
+<div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-6">
+    <div class="space-y-1">
+        <div class="text-3xl font-bold tracking-tight">{formatNum(stats?.total_servers)}</div>
+        <div class="text-xs text-muted-foreground">Discovered Servers</div>
     </div>
-
-    <!-- Stats Grid -->
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm relative overflow-hidden group">
-            <div class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-                <svg class="w-12 h-12 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
-            </div>
-            <div class="text-gray-400 font-medium text-sm">Discovered Servers</div>
-            <div class="text-4xl font-bold text-white mt-2 tracking-tight">{stats?.total_servers?.toLocaleString() ?? 0}</div>
-        </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm relative overflow-hidden group">
-            <div class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-                <svg class="w-12 h-12 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.121 17.804A13.937 13.937 0 0112 16c2.5 0 4.847.655 6.879 1.804M15 10a3 3 0 11-6 0 3 3 0 016 0zm6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-            </div>
-            <div class="text-gray-400 font-medium text-sm">Online Right Now</div>
-            <div class="text-4xl font-bold text-green-400 mt-2 tracking-tight">{stats?.online_servers?.toLocaleString() ?? 0}</div>
-        </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm relative overflow-hidden group">
-            <div class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-                <svg class="w-12 h-12 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
-            </div>
-            <div class="text-gray-400 font-medium text-sm">Players Online</div>
-            <div class="text-4xl font-bold text-purple-400 mt-2 tracking-tight">{stats?.total_players?.toLocaleString() ?? 0}</div>
-        </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm relative overflow-hidden group">
-            <div class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-                <svg class="w-12 h-12 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-            </div>
-            <div class="text-gray-400 font-medium text-sm">Hosting ASNs Tracked</div>
-            <div class="text-4xl font-bold text-orange-400 mt-2 tracking-tight">{stats?.asn_hosting?.toLocaleString() ?? 0}</div>
-        </div>
+    <div class="space-y-1">
+        <div class="text-3xl font-bold tracking-tight text-emerald-500">{formatNum(stats?.online_servers)}</div>
+        <div class="text-xs text-muted-foreground">Online Now</div>
     </div>
+    <div class="space-y-1">
+        <div class="text-3xl font-bold tracking-tight">{formatNum(stats?.total_players)}</div>
+        <div class="text-xs text-muted-foreground">Players Online</div>
+    </div>
+    <div class="space-y-1">
+        <div class="text-3xl font-bold tracking-tight">{formatNum(stats?.asn_hosting)}</div>
+        <div class="text-xs text-muted-foreground">Hosting ASNs</div>
+    </div>
+    <div class="space-y-1">
+        <div class="text-3xl font-bold tracking-tight">{formatNum(stats?.asn_residential)}</div>
+        <div class="text-xs text-muted-foreground">Residential ASNs</div>
+    </div>
+    <div class="space-y-1">
+        <div class="text-3xl font-bold tracking-tight">{formatNum(scanProgress?.queues?.discovery)}</div>
+        <div class="text-xs text-muted-foreground">Discovery Queue</div>
+    </div>
+</div>
 
-    <!-- Test Scan Panel -->
-    <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm">
-        <div class="flex items-center justify-between flex-wrap gap-4">
-            <div>
-                <h2 class="text-lg font-semibold text-white">Manual Scanner Override</h2>
-                <p class="text-gray-400 text-sm mt-1">Force an immediate scan on specific network segments.</p>
-            </div>
-            <div class="flex items-center gap-3">
-                <select
-                    class="bg-gray-950 border border-gray-700 rounded-lg px-4 py-2 text-sm text-gray-200 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none"
-                    bind:value={testScanRegion}
-                >
-                    <option value="quick">Quick Test (10 servers)</option>
-                    <option value="default">All Known Servers (50)</option>
-                    <option value="us">US Servers</option>
-                    <option value="eu">EU Servers</option>
-                </select>
-                <button
-                    class="px-5 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg text-sm font-medium transition-all shadow-md active:scale-95 flex items-center gap-2"
-                    onclick={triggerTestScan}
-                    disabled={testScanning}
-                >
-                    {#if testScanning}
-                        <svg class="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                        Deploying...
-                    {:else}
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-                        Execute Scan
-                    {/if}
-                </button>
-            </div>
+<Separator />
+
+<!-- Scan cycle progress -->
+<div class="space-y-4">
+    <h2 class="text-sm font-semibold tracking-tight">Scan Cycle Progress</h2>
+    {#if scanProgress?.categories?.length}
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {#each scanProgress.categories as cat}
+                <div class="space-y-2">
+                    <div class="flex items-center justify-between text-xs">
+                        <span class="capitalize text-muted-foreground">{cat.category}</span>
+                        <span class="font-mono">{cat.cycle_progress_pct.toFixed(1)}%</span>
+                    </div>
+                    <Progress value={cat.cycle_progress_pct} max={100} class="h-1.5" />
+                    <div class="text-[10px] text-muted-foreground">
+                        {formatNum(cat.scanned_ranges)} / {formatNum(cat.total_ranges)} ranges
+                        <span class="ml-2">{formatNum(cat.total_epochs)} epochs</span>
+                    </div>
+                </div>
+            {/each}
         </div>
-        {#if error}
-            <div class="mt-4 p-3 bg-red-500/10 border border-red-500/20 text-red-400 rounded-lg text-sm">{error}</div>
+    {:else}
+        <p class="text-xs text-muted-foreground">Loading...</p>
+    {/if}
+</div>
+
+<Separator />
+
+<!-- Queue sizes + login queue side by side -->
+<div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+    <!-- Queue sizes -->
+    <div class="space-y-3">
+        <h2 class="text-sm font-semibold tracking-tight">Queue Sizes</h2>
+        {#if scanProgress?.queues}
+            <div class="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+                <div class="flex justify-between">
+                    <span class="text-muted-foreground">Hot</span>
+                    <span class="font-mono">{formatNum(scanProgress.queues.hot)}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-muted-foreground">Warm</span>
+                    <span class="font-mono">{formatNum(scanProgress.queues.warm)}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-muted-foreground">Cold</span>
+                    <span class="font-mono">{formatNum(scanProgress.queues.cold)}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-muted-foreground">Discovery</span>
+                    <span class="font-mono">{formatNum(scanProgress.queues.discovery)}</span>
+                </div>
+            </div>
         {/if}
-        {#if testScanResult}
-            <div class="mt-4 p-3 bg-green-500/10 border border-green-500/20 text-green-400 rounded-lg text-sm flex items-center gap-2">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
-                Successfully dispatched tasks for {testScanResult.servers_added} servers.
+    </div>
+
+    <!-- Login queue -->
+    <div class="space-y-3">
+        <div class="flex items-center gap-2">
+            <h2 class="text-sm font-semibold tracking-tight">Login Queue</h2>
+            {#if loginStatus?.running}
+                <Badge variant="outline" class="text-[10px] gap-1 px-1.5 py-0">
+                    <span class="w-1 h-1 rounded-full bg-emerald-500 animate-pulse"></span>
+                    Active
+                </Badge>
+            {/if}
+        </div>
+        {#if loginStatus}
+            <div class="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+                <div class="flex justify-between">
+                    <span class="text-muted-foreground">Cracked</span>
+                    <span class="font-mono text-emerald-500">{formatNum(loginStatus.success)}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-muted-foreground">Premium</span>
+                    <span class="font-mono">{formatNum(loginStatus.premium)}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-muted-foreground">Whitelisted</span>
+                    <span class="font-mono">{formatNum(loginStatus.whitelist)}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-muted-foreground">Banned</span>
+                    <span class="font-mono">{formatNum(loginStatus.banned)}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-muted-foreground">Total</span>
+                    <span class="font-mono">{formatNum(loginStatus.total_attempts)}</span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-muted-foreground">Unreachable</span>
+                    <span class="font-mono">{formatNum(loginStatus.unreachable)}</span>
+                </div>
             </div>
+        {:else}
+            <p class="text-xs text-muted-foreground">Loading...</p>
+        {/if}
+    </div>
+</div>
+
+<Separator />
+
+<!-- Scanner control -->
+<div class="space-y-3">
+    <h2 class="text-sm font-semibold tracking-tight">Scanner Control</h2>
+    <div class="flex items-center gap-3 flex-wrap">
+        <select
+            class="h-9 px-3 bg-background border border-input rounded-md text-sm focus:ring-1 focus:ring-ring outline-none"
+            bind:value={testScanRegion}
+        >
+            <option value="quick">Quick Test (10)</option>
+            <option value="default">All Known (50)</option>
+            <option value="us">US Servers</option>
+            <option value="eu">EU Servers</option>
+        </select>
+        <button
+            class="inline-flex items-center gap-2 h-9 px-4 bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 rounded-md text-sm font-medium transition-colors"
+            onclick={triggerTestScan}
+            disabled={testScanning}
+        >
+            {#if testScanning}
+                <svg class="animate-spin h-3.5 w-3.5" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                Deploying...
+            {:else}
+                Execute Scan
+            {/if}
+        </button>
+        {#if testScanResult}
+            <span class="text-xs text-emerald-500">
+                Dispatched {testScanResult.servers_added} servers
+            </span>
+        {/if}
+        {#if error}
+            <span class="text-xs text-destructive">{error}</span>
         {/if}
     </div>
 </div>

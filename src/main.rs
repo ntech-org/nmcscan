@@ -29,6 +29,7 @@ use sea_orm_migration::MigratorTrait;
 use crate::repositories::{ServerRepository, AsnRepository, StatsRepository, ApiKeyRepository};
 use crate::services::asn_fetcher::AsnFetcher;
 use crate::services::scheduler::{Scheduler, ServerTarget};
+use crate::services::login_queue::LoginQueue;
 use crate::network::scanner::Scanner;
 use crate::utils::exclude::{ExcludeList, ExcludeManager};
 use crate::utils::test_mode;
@@ -162,8 +163,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let asn_fetcher = Arc::new(AsnFetcher::new(Arc::clone(&db), Arc::clone(&asn_repo)));
     asn_fetcher.initialize().await?;
     
-    // STARTUP SCRUB: Recategorize any existing "unknown" ASNs with latest heuristics
-    let _ = asn_fetcher.recategorize_all_asns().await;
+    // STARTUP SCRUB: Recategorize "unknown" ASNs with latest heuristics.
+    // Only runs if no ASN (any category) was updated in the last 7 days.
+    // The weekly background refresh (run_background_refresh) handles full
+    // re-categorization of ALL ASNs from the iptoasn.com database, so this
+    // startup scrub is just a safety net for when the weekly import hasn't run.
+    // The timer persists across restarts via the last_updated column in asns.
+    {
+        use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, QuerySelect};
+        let any_recent = crate::models::entities::asns::Entity::find()
+            .filter(
+                crate::models::entities::asns::Column::LastUpdated
+                    .gt(chrono::Utc::now() - chrono::Duration::days(7))
+            )
+            .limit(1)
+            .one(&*db)
+            .await
+            .unwrap_or_default();
+
+        if any_recent.is_some() {
+            tracing::info!("ASN data was updated within 7 days, skipping startup scrub.");
+        } else {
+            tracing::info!("Running startup ASN recategorization (no updates in > 7 days)...");
+            let _ = asn_fetcher.recategorize_all_asns().await;
+        }
+    }
 
     tracing::info!(
         "ASN fetcher initialized: {} ASNs, {} ranges",
@@ -214,7 +238,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.target_concurrency,
         args.target_cold_rps,
     );
-    let scheduler = Scheduler::new(Arc::clone(&server_repo), Arc::clone(&asn_repo), args.test_mode || args.quick_test, args.test_interval as u32);
+    let scheduler = Scheduler::new(
+        Arc::clone(&server_repo),
+        Arc::clone(&asn_repo),
+        args.test_mode || args.quick_test,
+        args.test_interval as u32,
+    );
 
     // Load servers based on mode
     if args.test_mode || args.quick_test {
@@ -260,11 +289,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let (h, w, c, d) = scheduler.get_queue_sizes().await;
     tracing::info!(
-        "Scheduler initialized with queues: Hot={}, Warm={}, Cold={}",
-        scheduler.get_queue_sizes().await.0,
-        scheduler.get_queue_sizes().await.1,
-        scheduler.get_queue_sizes().await.2
+        "Scheduler initialized with queues: Hot={}, Warm={}, Cold={}, Discovery={}",
+        h, w, c, d
     );
 
     let scheduler = Arc::new(scheduler);
@@ -278,14 +306,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let server_repo_clone = Arc::clone(&server_repo);
         
         // Background filler task
+        // Background filler task: alternates between discovery and rescan.
+        // Every 3rd tick (15s): heavy discovery (warm + cold ASN ranges).
+        // Other ticks: rescan known servers from DB whose scan interval elapsed.
+        // This gives a 2:1 rescan:discovery ratio, spending more time on known servers.
         let scheduler_filler = Arc::clone(&scheduler);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            let mut tick = 0u64;
             loop {
                 interval.tick().await;
+                tick += 1;
                 if !scheduler_filler.test_mode {
-                    scheduler_filler.fill_warm_queue_if_needed().await;
-                    scheduler_filler.fill_cold_queue_if_needed().await;
+                    // Every 3rd tick: run discovery (adds to discovery_queue)
+                    if tick % 3 == 0 {
+                        scheduler_filler.fill_warm_queue_if_needed().await;
+                        scheduler_filler.fill_cold_queue_if_needed().await;
+                    }
+                    // Always run refill (re-queues known servers whose interval elapsed)
                     scheduler_filler.try_refill_queues().await;
                 }
             }
@@ -326,7 +364,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // 7. Start web API
+    // 7. Create login queue
+    let login_queue = Arc::new(LoginQueue::new(Arc::clone(&server_repo)));
+
+    // 8. Start web API
     let api_state = handlers::AppState {
         db: (*db).clone(),
         server_repo: Arc::clone(&server_repo),
@@ -334,6 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats_repo: Arc::clone(&stats_repo),
         api_key_repo: Arc::clone(&api_key_repo),
         scheduler: Arc::clone(&scheduler),
+        login_queue: Arc::clone(&login_queue),
         exclude_list: Arc::clone(&exclude_manager),
         api_key: args.api_key.clone(),
         contact_email: args.contact_email.clone(),
@@ -420,8 +462,8 @@ async fn run_scanner_loop(
     loop {
         tokio::select! {
             _ = status_interval.tick() => {
-                let (h, w, c) = scheduler.get_queue_sizes().await;
-                tracing::info!("Queue sizes: Hot={}, Warm={}, Cold={}", h, w, c);
+                let (h, w, c, d) = scheduler.get_queue_sizes().await;
+                tracing::info!("Queue sizes: Hot={}, Warm={}, Cold={}, Discovery={}", h, w, c, d);
                 tracing::info!("Status: Active Tasks={}, Scans today: Hot={}, Warm={}, Cold={}", 
                     active_tasks.load(Ordering::Relaxed),
                     hot_count.load(Ordering::Relaxed), 
@@ -504,8 +546,10 @@ async fn run_scanner_loop(
                         active_tasks_clone.fetch_sub(1, Ordering::SeqCst);
                     });
                 } else {
-                    // No servers ready, sleep a bit to avoid CPU spin
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    // No servers ready — all items have future next_scan_at.
+                    // Sleep 2s to avoid tight-loop CPU waste. The refill task
+                    // adds new servers every 5s, so we won't miss anything.
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                 }
             }
         }

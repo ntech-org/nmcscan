@@ -1,6 +1,7 @@
 //! Priority-based scheduler for efficient server scanning.
 //!
 //! Implements Hot/Warm/Cold tier algorithm with ethical weighted selection.
+//! Discovery uses deterministic hash-based IP shuffle tracked by offset in PostgreSQL.
 
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
@@ -9,8 +10,16 @@ use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use crate::repositories::{ServerRepository, AsnRepository};
 use crate::models::asn::AsnCategory;
-use rand::prelude::*;
 use rand::seq::SliceRandom;
+
+/// Queue sizes for API reporting.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueStats {
+    pub hot: usize,
+    pub warm: usize,
+    pub cold: usize,
+    pub discovery: usize,
+}
 
 /// Target server for scanning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,10 +77,68 @@ impl ServerTarget {
     }
 }
 
+/// Deterministic hash-based shuffle: compute the IP at a given position
+/// in a shuffled permutation of a CIDR range.
+///
+/// Uses a linear bijection: f(x) = (a*x + b) mod range_size
+/// where gcd(a, range_size) = 1 (guaranteed by construction).
+/// Same (position, seed) → same IP every time. No storage needed.
+pub fn ip_at_position(position: u64, base_ip: u32, range_size: u64, seed: u64) -> u32 {
+    if range_size <= 1 {
+        return base_ip;
+    }
+
+    // Derive a from seed, then reduce mod range_size to avoid u64 overflow in multiply.
+    // Must be coprime to range_size for bijection.
+    let mut a = mix_bits(seed ^ 0x9E3779B97F4A7C15) % range_size;
+    if a % 2 == 0 {
+        a ^= 1; // make odd for better coprimality with powers of 2
+    }
+    while gcd(a, range_size) != 1 {
+        a = (a + 1) % range_size;
+        if a == 0 { a = 1; }
+    }
+    let b = mix_bits(seed ^ 0x517CC1B727220A95) % range_size;
+
+    // Bijective mapping: f(x) = (a*x + b) mod range_size
+    let permuted = (a * position + b) % range_size;
+
+    base_ip + permuted as u32
+}
+
+/// Greatest common divisor.
+#[inline]
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Mix a u64 value using multiply-xorshift for good avalanche properties.
+#[inline]
+fn mix_bits(x: u64) -> u64 {
+    let mut v = x;
+    v ^= v >> 33;
+    v = v.wrapping_mul(0xFF51AFD7ED558CCD);
+    v ^= v >> 33;
+    v = v.wrapping_mul(0xC4CEB9FE1A85EC53);
+    v ^= v >> 33;
+    v
+}
+
+/// Maximum items per queue to prevent unbounded memory growth.
+const MAX_QUEUE_SIZE: usize = 10000;
+
 pub struct Scheduler {
     hot_queue: Arc<Mutex<VecDeque<ServerTarget>>>,
     warm_queue: Arc<Mutex<VecDeque<ServerTarget>>>,
     cold_queue: Arc<Mutex<VecDeque<ServerTarget>>>,
+    /// Discovery targets — always ready (next_scan_at = None).
+    /// Separate from main queues to prevent stalls when queues are full.
+    discovery_queue: Arc<Mutex<VecDeque<ServerTarget>>>,
     pub server_repo: Arc<ServerRepository>,
     pub asn_repo: Arc<AsnRepository>,
     pub test_mode: bool,
@@ -79,11 +146,17 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(server_repo: Arc<ServerRepository>, asn_repo: Arc<AsnRepository>, test_mode: bool, test_interval: u32) -> Self {
+    pub fn new(
+        server_repo: Arc<ServerRepository>,
+        asn_repo: Arc<AsnRepository>,
+        test_mode: bool,
+        test_interval: u32,
+    ) -> Self {
         Self {
             hot_queue: Arc::new(Mutex::new(VecDeque::new())),
             warm_queue: Arc::new(Mutex::new(VecDeque::new())),
             cold_queue: Arc::new(Mutex::new(VecDeque::new())),
+            discovery_queue: Arc::new(Mutex::new(VecDeque::new())),
             server_repo,
             asn_repo,
             test_mode,
@@ -92,12 +165,27 @@ impl Scheduler {
     }
 
     pub async fn add_server(&self, server: ServerTarget, at_front: bool) {
+        // Discovery targets always go to the dedicated discovery queue (always ready).
+        if server.is_discovery {
+            let mut dq = self.discovery_queue.lock().await;
+            if dq.len() >= MAX_QUEUE_SIZE { return; }
+            if at_front {
+                dq.push_front(server);
+            } else {
+                dq.push_back(server);
+            }
+            return;
+        }
+
         let queue = match server.priority {
             1 => &self.hot_queue,
             2 => &self.warm_queue,
             _ => &self.cold_queue,
         };
         let mut q = queue.lock().await;
+        if q.len() >= MAX_QUEUE_SIZE {
+            return;
+        }
         if at_front {
             q.push_front(server);
         } else {
@@ -105,67 +193,115 @@ impl Scheduler {
         }
     }
 
-    /// Get the next server to scan using weighted random selection to prevent tier starvation.
+    /// Get the next server to scan. Picks from the queue whose earliest-ready item
+    /// is due first. Never returns a server whose next_scan_at is in the future.
+    /// This prevents the resource leak where servers get over-scanned.
+    ///
+    /// Discovery targets (always ready) are checked first to prevent stalls
+    /// when main queues are full of items with future next_scan_at.
     pub async fn next_server(&self) -> Option<ServerTarget> {
-        let now = Utc::now();
-        
-        // Tier sizes for dynamic priority
-        let hot_len = self.hot_queue.lock().await.len();
-        let warm_len = self.warm_queue.lock().await.len();
-
-        let roll = {
-            let mut rng = rand::thread_rng();
-            rng.gen_range(0..100)
-        };
-
-        // If Hot or Warm have items, they get 90% of the priority.
-        // Hot gets first pick in that 90%.
-        let tiers = if (hot_len > 0 || warm_len > 0) && roll < 90 {
-            if hot_len > 0 {
-                vec![1, 2, 3]
-            } else {
-                vec![2, 1, 3]
+        // 1. Check discovery queue first — always ready, O(1) pop
+        {
+            let mut dq = self.discovery_queue.lock().await;
+            if let Some(target) = dq.pop_front() {
+                return Some(target);
             }
-        } else if roll < 95 {
-            vec![2, 1, 3] // 5% dedicated to Warm
-        } else {
-            vec![3, 1, 2] // 5% dedicated to Cold
-        };
+        }
 
-        for tier in tiers {
-            let queue = match tier {
-                1 => &self.hot_queue,
-                2 => &self.warm_queue,
-                _ => &self.cold_queue,
-            };
+        let now = Utc::now();
 
-            let mut q = queue.lock().await;
-            if q.is_empty() { continue; }
-            
-            // Check up to 5000 elements to find one that is ready to scan.
-            let search_limit = std::cmp::min(q.len(), 5000);
-            for i in 0..search_limit {
+        // 2. For each tier, find the index of the earliest-ready item (up to 5000 deep).
+        let hot_info = self.find_earliest_ready(&self.hot_queue, &now).await;
+        let warm_info = self.find_earliest_ready(&self.warm_queue, &now).await;
+        let cold_info = self.find_earliest_ready(&self.cold_queue, &now).await;
+
+        // Collect ready tiers with their earliest scan time
+        let mut ready: Vec<(&Arc<Mutex<VecDeque<ServerTarget>>>, usize, DateTime<Utc>)> = Vec::new();
+        if let Some((idx, t)) = hot_info { ready.push((&self.hot_queue, idx, t)); }
+        if let Some((idx, t)) = warm_info { ready.push((&self.warm_queue, idx, t)); }
+        if let Some((idx, t)) = cold_info { ready.push((&self.cold_queue, idx, t)); }
+
+        if !ready.is_empty() {
+            // Pick the tier with the earliest-ready item (most overdue)
+            ready.sort_by_key(|(_, _, t)| *t);
+            let (queue, idx, _) = &ready[0];
+            return Some(queue.lock().await.remove(*idx).unwrap());
+        }
+
+        // 3. Nothing found in first 5000 — deep scan ALL queues for ANY ready item.
+        let queues = [&self.hot_queue, &self.warm_queue, &self.cold_queue];
+        let mut best: Option<(&Arc<Mutex<VecDeque<ServerTarget>>>, usize, DateTime<Utc>)> = None;
+
+        for queue in &queues {
+            let q = queue.lock().await;
+            for i in 0..q.len() {
                 if q[i].next_scan_at.map_or(true, |t| t <= now) {
-                    return q.remove(i);
+                    let t = q[i].next_scan_at.unwrap_or(now);
+                    if best.as_ref().map_or(true, |(_, _, bt)| t < *bt) {
+                        best = Some((queue, i, t));
+                    }
                 }
             }
         }
+
+        if let Some((queue, idx, _)) = best {
+            return Some(queue.lock().await.remove(idx).unwrap());
+        }
+
+        // Truly nothing ready — return None so the scanner loop can sleep.
         None
     }
 
+    /// Search up to `limit` items in a queue for the earliest one ready to scan.
+    /// Returns (index, next_scan_at) of the best candidate, or None if none ready.
+    async fn find_earliest_ready(
+        &self,
+        queue: &Arc<Mutex<VecDeque<ServerTarget>>>,
+        now: &DateTime<Utc>,
+    ) -> Option<(usize, DateTime<Utc>)> {
+        let q = queue.lock().await;
+        let limit = std::cmp::min(q.len(), 5000);
+        let mut best_idx = None;
+        let mut best_time = None;
+
+        for i in 0..limit {
+            let ready = q[i].next_scan_at.map_or(true, |t| t <= *now);
+            if ready {
+                let t = q[i].next_scan_at.unwrap_or(*now);
+                if best_time.is_none() || t < best_time.unwrap() {
+                    best_idx = Some(i);
+                    best_time = Some(t);
+                }
+            }
+        }
+
+        best_idx.map(|i| (i, best_time.unwrap()))
+    }
+
     pub async fn fill_warm_queue_if_needed(&self) {
-        let warm_len = self.warm_queue.lock().await.len();
-        if warm_len > 5000 { return; } 
+        // Always run discovery — discovery targets go to the dedicated
+        // discovery_queue, so queue size doesn't matter.
+        // This prevents the stall where all main queue items have future next_scan_at.
 
         // INTERLEAVED DISCOVERY: Fetch hosting ranges
         match self.asn_repo.get_ranges_to_scan("hosting", 100).await {
             Ok(ranges) => {
-                if ranges.is_empty() {
-                    return;
-                }
+                if ranges.is_empty() { return; }
                 let count = self.fill_discovery_queue(ranges, 2, 100).await.unwrap_or(0);
                 if count > 0 {
-                    tracing::info!("Discovery: Added {} new targets to Warm queue (from hosting)", count);
+                    tracing::info!("Discovery: Added {} new targets to discovery queue (from hosting)", count);
+                } else {
+                    // Dead tick: all ranges were exhausted. Re-fetch immediately
+                    // — ranges now have offset=0 with fresh epoch.
+                    match self.asn_repo.get_ranges_to_scan("hosting", 100).await {
+                        Ok(ranges2) if !ranges2.is_empty() => {
+                            let count2 = self.fill_discovery_queue(ranges2, 2, 100).await.unwrap_or(0);
+                            if count2 > 0 {
+                                tracing::info!("Discovery: Recovered from dead tick, added {} targets (hosting)", count2);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Err(e) => {
@@ -175,10 +311,9 @@ impl Scheduler {
     }
 
     pub async fn fill_cold_queue_if_needed(&self) {
-        let cold_len = self.cold_queue.lock().await.len();
-        if cold_len > 5000 { return; }
+        // Always run discovery — discovery targets go to the dedicated discovery_queue.
 
-        // 1. Try to recycle dead/ignored servers
+        // 1. Try to recycle dead/ignored servers (these go to main cold queue)
         if let Ok(dead_servers) = self.server_repo.get_dead_servers(1000).await {
             for server in dead_servers {
                 let mut target = ServerTarget::new(server.ip, server.port as u16, server.server_type);
@@ -203,13 +338,33 @@ impl Scheduler {
         if !ranges.is_empty() {
             let count = self.fill_discovery_queue(ranges, 3, 100).await.unwrap_or(0);
             if count > 0 {
-                tracing::info!("Discovery: Added {} new targets to Cold queue (from {})", count, source);
+                tracing::info!("Discovery: Added {} new targets to discovery queue (from {})", count, source);
+            } else {
+                // Dead tick recovery: re-fetch ranges (now offset=0 with fresh epoch)
+                let mut ranges2 = self.asn_repo.get_ranges_to_scan("residential", 100).await.unwrap_or_default();
+                let mut source2 = "residential";
+                if ranges2.is_empty() {
+                    if let Ok(r) = self.asn_repo.get_ranges_to_scan("unknown", 100).await {
+                        ranges2 = r;
+                        source2 = "unknown";
+                    }
+                }
+                if !ranges2.is_empty() {
+                    let count2 = self.fill_discovery_queue(ranges2, 3, 100).await.unwrap_or(0);
+                    if count2 > 0 {
+                        tracing::info!("Discovery: Recovered from dead tick, added {} targets ({})", count2, source2);
+                    }
+                }
             }
         }
     }
 
-    /// Master discovery function that takes multiple ranges, pulls a few IPs from each,
-    /// shuffles the aggregate list, and pushes to the queue.
+    /// Master discovery function that takes multiple ranges, computes IPs via
+    /// deterministic shuffle at the current offset, and pushes to the queue.
+    ///
+    /// No bitset filter — every IP at each offset is unique per epoch cycle.
+    /// When a range is exhausted, its offset resets to 0 and epoch increments,
+    /// giving a fresh shuffled permutation for the next cycle.
     pub async fn fill_discovery_queue(
         &self,
         ranges: Vec<crate::models::entities::asn_ranges::Model>,
@@ -218,7 +373,7 @@ impl Scheduler {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         use ipnetwork::Ipv4Network;
 
-        let mut all_candidates = Vec::new();
+        let mut all_targets = Vec::new();
         let mut updates = Vec::new();
 
         for range in ranges {
@@ -227,42 +382,28 @@ impl Scheduler {
                 Err(_) => continue,
             };
             let total_ips = network.size() as i64;
-            let mut current_offset = range.scan_offset;
-            let mut added = 0;
+            let current_offset = range.scan_offset;
 
-            // If the range is already exhausted, mark it for reset and skip
+            // If the range is exhausted, reset it immediately for next cycle.
+            // This prevents wasted batch slots — without this, exhausted ranges
+            // returned by get_ranges_to_scan contribute nothing.
             if current_offset >= total_ips {
-                updates.push((range.cidr.clone(), 0, true));
+                updates.push((range.cidr.clone(), 0_i64, true, true));
                 continue;
             }
 
-            // Pull a batch of IPs from the range
-            while added < ips_per_range && current_offset < total_ips {
-                if let Some(ip) = network.nth(current_offset as u32) {
-                    all_candidates.push(ip.to_string());
-                    added += 1;
-                }
-                current_offset += 1;
-            }
+            // Compute seed from CIDR + epoch for deterministic shuffle
+            let seed = compute_seed(&range.cidr, range.scan_epoch as u64);
+            let base_ip = u32::from(network.network());
 
-            // Always record progress to move to the next set of IPs or next range
-            let is_done = current_offset >= total_ips;
-            updates.push((range.cidr.clone(), if is_done { 0 } else { current_offset }, is_done));
-        }
+            // Compute IPs via deterministic shuffle at current offset
+            let mut added = 0u64;
+            let offset = current_offset as u64;
+            while (added as usize) < ips_per_range && (offset + added) < total_ips as u64 {
+                let position = offset + added;
+                let ip_val = ip_at_position(position, base_ip, total_ips as u64, seed);
+                let ip_str = format_ip(ip_val);
 
-        // Batch update progress in DB
-        if !updates.is_empty() {
-            self.asn_repo.update_batch_range_progress(updates).await?;
-        }
-
-        if all_candidates.is_empty() { return Ok(0); }
-
-        // BATCH CHECK: Find which IPs are already in our database in one go
-        let known_ips = self.server_repo.get_existing_ips(all_candidates.clone()).await?;
-
-        let mut all_targets = Vec::new();
-        for ip_str in all_candidates {
-            if !known_ips.contains(&ip_str) {
                 let mut java_target = ServerTarget::new(ip_str.clone(), 25565, "java".to_string());
                 java_target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
                 java_target.priority = priority;
@@ -274,7 +415,30 @@ impl Scheduler {
                 bedrock_target.priority = priority;
                 bedrock_target.is_discovery = true;
                 all_targets.push(bedrock_target);
+
+                added += 1;
             }
+
+            if added == 0 {
+                // Range had IPs available but none were generated (shouldn't happen,
+                // but safety net). Reset with epoch bump to get fresh permutation.
+                updates.push((range.cidr.clone(), 0_i64, true, true));
+                continue;
+            }
+
+            let new_offset = offset + added;
+            let is_done = new_offset >= total_ips as u64;
+            updates.push((
+                range.cidr.clone(),
+                if is_done { 0 } else { new_offset as i64 },
+                is_done,
+                is_done, // increment epoch when range is exhausted
+            ));
+        }
+
+        // Batch update progress in DB (offset + epoch)
+        if !updates.is_empty() {
+            self.asn_repo.update_batch_range_progress(updates).await?;
         }
 
         let added_count = all_targets.len();
@@ -292,32 +456,6 @@ impl Scheduler {
         }
 
         Ok(added_count)
-    }
-    /// Synchronous helper to sample IPs to avoid holding non-Send ThreadRng across awaits.
-    #[allow(dead_code)]
-    fn sample_ips_from_network(&self, network: &ipnetwork::Ipv4Network, max_to_add: usize) -> Vec<std::net::Ipv4Addr> {
-        let mut rng = rand::thread_rng();
-        let mut sampled_ips = Vec::new();
-        let total_ips = network.size() as u64;
-
-        if total_ips <= 500 {
-            let mut all_ips: Vec<_> = network.iter().collect();
-            all_ips.shuffle(&mut rng);
-            sampled_ips = all_ips.into_iter().take(max_to_add).collect();
-        } else {
-            let mut picked_indices = std::collections::HashSet::new();
-            let mut attempts = 0;
-            while sampled_ips.len() < max_to_add && attempts < max_to_add * 3 {
-                let idx = rng.gen_range(0..total_ips);
-                if picked_indices.insert(idx) {
-                    if let Some(ip) = network.nth(idx as u32) {
-                        sampled_ips.push(ip);
-                    }
-                }
-                attempts += 1;
-            }
-        }
-        sampled_ips
     }
 
     pub async fn requeue_server(&self, mut server: ServerTarget, was_online: bool) {
@@ -338,11 +476,13 @@ impl Scheduler {
                         let mut t_up = ServerTarget::new(server.ip.clone(), server.port + 1, "java".to_string());
                         t_up.direction = 1;
                         t_up.category = server.category.clone();
+                        t_up.priority = server.priority;
                         self.add_server(t_up, false).await;
                         
                         let mut t_down = ServerTarget::new(server.ip.clone(), server.port - 1, "java".to_string());
                         t_down.direction = -1;
                         t_down.category = server.category.clone();
+                        t_down.priority = server.priority;
                         self.add_server(t_down, false).await;
                     }
                 } else if server.direction == 1 && server.port < 65535 {
@@ -350,12 +490,14 @@ impl Scheduler {
                     let mut t_up = ServerTarget::new(server.ip.clone(), server.port + 1, "java".to_string());
                     t_up.direction = 1;
                     t_up.category = server.category.clone();
+                    t_up.priority = server.priority;
                     self.add_server(t_up, false).await;
                 } else if server.direction == -1 && server.port > 1 {
                     // Continue scanning downwards
                     let mut t_down = ServerTarget::new(server.ip.clone(), server.port - 1, "java".to_string());
                     t_down.direction = -1;
                     t_down.category = server.category.clone();
+                    t_down.priority = server.priority;
                     self.add_server(t_down, false).await;
                 }
             }
@@ -374,7 +516,7 @@ impl Scheduler {
             chrono::Duration::seconds(self.test_interval as i64)
         } else {
             match server.priority {
-                1 => chrono::Duration::hours(4),
+                1 => chrono::Duration::hours(2),
                 2 => chrono::Duration::hours(24),
                 _ => chrono::Duration::days(7),
             }
@@ -383,19 +525,26 @@ impl Scheduler {
         self.add_server(server, false).await;
     }
 
-    pub async fn get_queue_sizes(&self) -> (usize, usize, usize) {
+    pub async fn get_queue_sizes(&self) -> (usize, usize, usize, usize) {
         (
             self.hot_queue.lock().await.len(),
             self.warm_queue.lock().await.len(),
             self.cold_queue.lock().await.len(),
+            self.discovery_queue.lock().await.len(),
         )
+    }
+
+    /// Get queue sizes as a serializable struct for the API.
+    pub async fn get_queue_stats(&self) -> QueueStats {
+        let (hot, warm, cold, discovery) = self.get_queue_sizes().await;
+        QueueStats { hot, warm, cold, discovery }
     }
 
     /// Periodically refill queues from DB with servers whose scan interval has elapsed.
     /// Prevents scanner from stalling when in-memory queues drain after initial batch.
     pub async fn try_refill_queues(&self) {
         let configs = vec![
-            (1, 4, 1000, 500u64), // priority, interval_hours, threshold, limit
+            (1, 2, 1000, 500u64), // priority, interval_hours, threshold, limit
             (2, 24, 500, 300u64),
             (3, 168, 500, 200u64),
         ];
@@ -443,7 +592,7 @@ impl Scheduler {
                 let last = last_seen.and_utc();
                 target.last_scanned = Some(last);
                 let delay = match target.priority {
-                    1 => chrono::Duration::hours(4),
+                    1 => chrono::Duration::hours(2),
                     2 => chrono::Duration::hours(24),
                     _ => chrono::Duration::days(7),
                 };
@@ -453,23 +602,153 @@ impl Scheduler {
         }
         Ok(())
     }
+}
 
-    #[allow(dead_code)]
-    pub async fn select_next_asn_for_warm_scan(&self) -> Option<String> {
-        None
+/// Compute a deterministic seed from a CIDR string and epoch.
+fn compute_seed(cidr: &str, epoch: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cidr.hash(&mut hasher);
+    epoch.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Format a u32 IP value as a dotted-quad string.
+fn format_ip(ip: u32) -> String {
+    let a = (ip >> 24) & 0xFF;
+    let b = (ip >> 16) & 0xFF;
+    let c = (ip >> 8) & 0xFF;
+    let d = ip & 0xFF;
+    format!("{}.{}.{}.{}", a, b, c, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ip_at_position_covers_range() {
+        let base = 0x0A000000u32; // 10.0.0.0
+        let size = 256u64;
+        let seed = compute_seed("10.0.0.0/24", 0);
+
+        let mut seen = std::collections::HashSet::new();
+        for pos in 0..size {
+            let ip = ip_at_position(pos, base, size, seed);
+            assert!(ip >= base && ip < base + size as u32, "IP out of range at pos {}", pos);
+            assert!(seen.insert(ip), "Duplicate IP {} at pos {}", format_ip(ip), pos);
+        }
+        assert_eq!(seen.len(), size as usize, "Should cover all {} IPs", size);
     }
 
-    #[allow(dead_code)]
-    async fn calculate_asn_score(
-        &self, 
-        _asn: &str, 
-        _counts: &std::collections::HashMap<String, u32>,
-        _last_scanned: &std::collections::HashMap<String, DateTime<Utc>>
-    ) -> f32 {
-        0.0
+    #[test]
+    fn test_ip_at_position_different_seeds() {
+        let base = 0x0A000000u32;
+        let size = 256u64;
+        let seed0 = compute_seed("10.0.0.0/24", 0);
+        let seed1 = compute_seed("10.0.0.0/24", 1);
+
+        let ip0 = ip_at_position(0, base, size, seed0);
+        let ip1 = ip_at_position(0, base, size, seed1);
+        assert_ne!(ip0, ip1, "Different seeds should produce different IPs");
     }
 
-    #[allow(dead_code)]
-    pub async fn record_asn_scan(&self, _asn: &str) {
+    #[test]
+    fn test_ip_at_position_deterministic() {
+        let base = 0x0A000000u32;
+        let size = 256u64;
+        let seed = compute_seed("10.0.0.0/24", 0);
+
+        let a = ip_at_position(42, base, size, seed);
+        let b = ip_at_position(42, base, size, seed);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_ip_at_position_large_range() {
+        // /16 range: 65536 IPs
+        let base = 0x0A000000u32;
+        let size = 65536u64;
+        let seed = compute_seed("10.0.0.0/16", 0);
+
+        // Spot check: all should be in range
+        for pos in [0, 1000, 32768, 65535] {
+            let ip = ip_at_position(pos, base, size, seed);
+            assert!(ip >= base && ip < base + size as u32, "IP out of range at pos {}", pos);
+        }
+
+        // Verify first 1000 are unique
+        let mut seen = std::collections::HashSet::new();
+        for pos in 0..1000u64 {
+            let ip = ip_at_position(pos, base, size, seed);
+            assert!(seen.insert(ip), "Duplicate IP {} at pos {}", format_ip(ip), pos);
+        }
+        assert_eq!(seen.len(), 1000);
+    }
+
+    #[test]
+    fn test_ip_at_position_non_power_of_2() {
+        // 100 IPs (not a power of 2)
+        let base = 0x0A000000u32;
+        let size = 100u64;
+        let seed = compute_seed("10.0.0.0/25", 0);
+
+        let mut seen = std::collections::HashSet::new();
+        for pos in 0..size {
+            let ip = ip_at_position(pos, base, size, seed);
+            assert!(ip >= base && ip < base + size as u32, "IP out of range at pos {}", pos);
+            assert!(seen.insert(ip), "Duplicate IP {} at pos {}", format_ip(ip), pos);
+        }
+        assert_eq!(seen.len(), size as usize);
+    }
+
+    #[test]
+    fn test_ip_at_position_very_small() {
+        // 3 IPs
+        let base = 0x0A000000u32;
+        let size = 3u64;
+        let seed = compute_seed("test", 0);
+
+        let mut seen = std::collections::HashSet::new();
+        for pos in 0..size {
+            let ip = ip_at_position(pos, base, size, seed);
+            assert!(ip >= base && ip < base + size as u32, "IP out of range at pos {}", pos);
+            assert!(seen.insert(ip), "Duplicate IP at pos {}", pos);
+        }
+    }
+
+    #[test]
+    fn test_format_ip() {
+        assert_eq!(format_ip(0x0A000001), "10.0.0.1");
+        assert_eq!(format_ip(0xC0A80001), "192.168.0.1");
+        assert_eq!(format_ip(0), "0.0.0.0");
+        assert_eq!(format_ip(0xFFFFFFFF), "255.255.255.255");
+    }
+
+    #[test]
+    fn test_compute_seed_varies() {
+        let s1 = compute_seed("10.0.0.0/24", 0);
+        let s2 = compute_seed("10.0.0.0/24", 1);
+        let s3 = compute_seed("10.0.0.1/24", 0);
+        assert_ne!(s1, s2);
+        assert_ne!(s1, s3);
+    }
+
+    #[test]
+    fn test_epoch_changes_permutation() {
+        let base = 0x0A000000u32;
+        let size = 256u64;
+        let seed0 = compute_seed("10.0.0.0/24", 0);
+        let seed1 = compute_seed("10.0.0.0/24", 1);
+
+        // Different epochs should produce different permutations
+        let mut diffs = 0;
+        for pos in 0..size {
+            if ip_at_position(pos, base, size, seed0) != ip_at_position(pos, base, size, seed1) {
+                diffs += 1;
+            }
+        }
+        // Most positions should differ
+        assert!(diffs > size / 2, "Only {}/{} positions differ", diffs, size);
     }
 }

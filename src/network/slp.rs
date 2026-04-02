@@ -47,6 +47,15 @@ pub struct ServerStatus {
 pub struct ModInfo {
     #[serde(rename = "type")]
     pub mod_type: String,
+    #[serde(rename = "modList", default)]
+    pub mod_list: Option<Vec<ModEntry>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModEntry {
+    pub modid: String,
+    #[serde(default)]
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -330,43 +339,69 @@ pub fn extract_motd(status: &ServerStatus) -> String {
     parse_json_text(&status.description)
 }
 
-/// Extract server brand (Vanilla, Paper, Forge, etc.) from status.
+/// Extract server brand from SLP status.
+///
+/// Classification:
+/// - "Vanilla" = vanilla-like (accepts vanilla clients): Paper, Spigot, Purpur, Bukkit, Arclight, Pufferfish
+/// - "Forge" = requires Forge client mods
+/// - "Fabric" = requires Fabric client mods
+/// - "NeoForge" = requires NeoForge client mods
+/// - "Proxy" = Velocity, BungeeCord, Waterfall
+/// - "Vanilla" = default fallback
 pub fn extract_brand(status: &ServerStatus) -> String {
+    // 1. Check modinfo field (Forge/FML servers include this in SLP)
     if let Some(mod_info) = &status.mod_info {
         let t = mod_info.mod_type.to_lowercase();
-        if t == "fml" || t == "forge" { return "Forge".to_string(); }
-        return mod_info.mod_type.clone();
-    }
-    
-    if let Some(version) = &status.version {
-        let name = version.name.to_lowercase();
-        if name.contains("paper") { return "Paper".to_string(); }
-        if name.contains("spigot") { return "Spigot".to_string(); }
-        if name.contains("bukkit") { return "Bukkit".to_string(); }
-        if name.contains("forge") { return "Forge".to_string(); }
-        if name.contains("fabric") { return "Fabric".to_string(); }
-        if name.contains("neoforge") { return "NeoForge".to_string(); }
-        if name.contains("purpur") { return "Purpur".to_string(); }
-        if name.contains("velocity") { return "Velocity".to_string(); }
-        if name.contains("bungeecord") { return "BungeeCord".to_string(); }
-        
-        // Advanced Vanilla Check:
-        // Vanilla version strings are usually just "1.x.y" or "1.x".
-        // If it contains spaces, ranges (1.8x - 1.21), or extra text, it's almost certainly a proxy (Bungee/Velocity) 
-        // or a custom implementation (Hypixel).
-        let is_suspicious = version.name.contains(' ') || 
-                           version.name.contains(" - ") || 
-                           version.name.contains("Requires") ||
-                           version.name.contains(',') ||
-                           version.name.contains('x') ||
-                           version.name.len() > 10; // "1.20.4-rc1" is 10 chars. Anything longer is likely non-vanilla.
-
-        if is_suspicious {
-            return "Unknown".to_string();
+        if t == "fml" || t == "forge" {
+            return "Forge".to_string();
+        }
+        if !t.is_empty() {
+            return capitalize_first(&mod_info.mod_type);
         }
     }
-    
+
+    // 2. Version string analysis
+    if let Some(version) = &status.version {
+        let name = version.name.to_lowercase();
+
+        // Server-side only (accept vanilla clients) → classify as "Vanilla"
+        // These are all vanilla-compatible server implementations
+        if name.contains("paper") || name.contains("pufferfish") || name.contains("arclight") {
+            return "Vanilla".to_string();
+        }
+        if name.contains("spigot") || name.contains("craftbukkit") || name.contains("purpur") {
+            return "Vanilla".to_string();
+        }
+
+        // True modded (require client-side mods)
+        if name.contains("forge") || name.contains("fml") { return "Forge".to_string(); }
+        if name.contains("fabric") { return "Fabric".to_string(); }
+        if name.contains("neoforge") { return "NeoForge".to_string(); }
+
+        // Proxies
+        if name.contains("velocity") { return "Proxy".to_string(); }
+        if name.contains("bungeecord") || name.contains("bungee") { return "Proxy".to_string(); }
+        if name.contains("waterfall") { return "Proxy".to_string(); }
+
+        // Multi-version strings indicate a proxy
+        if name.contains(" - ") || name.contains(" to ") {
+            return "Proxy".to_string();
+        }
+        if name.contains(',') && name.contains('.') {
+            // "1.8, 1.9, 1.10" style version lists
+            return "Proxy".to_string();
+        }
+    }
+
     "Vanilla".to_string()
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    }
 }
 
 fn parse_json_text(val: &serde_json::Value) -> String {

@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use ipnetwork::Ipv4Network;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
 /// ASN category for scan prioritization.
@@ -75,6 +75,8 @@ pub struct AsnManager {
     asns: HashMap<String, AsnRecord>,
     /// IP ranges indexed by ASN.
     ranges: Vec<AsnRange>,
+    /// Set of CIDRs already in ranges (for O(1) dedup).
+    range_set: HashSet<String>,
 }
 
 impl AsnManager {
@@ -82,6 +84,7 @@ impl AsnManager {
         Self {
             asns: HashMap::new(),
             ranges: Vec::new(),
+            range_set: HashSet::new(),
         }
     }
 
@@ -95,7 +98,11 @@ impl AsnManager {
         if cidr.contains(':') {
             return;
         } // Skip IPv6
-        if let Ok(range) = AsnRange::new(cidr, asn) {
+        if self.range_set.contains(&cidr) {
+            return;
+        } // Skip duplicates
+        if let Ok(range) = AsnRange::new(cidr.clone(), asn) {
+            self.range_set.insert(cidr);
             self.ranges.push(range);
         }
     }

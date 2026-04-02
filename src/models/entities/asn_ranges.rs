@@ -8,6 +8,7 @@ pub struct Model {
     pub asn: String,
     pub scan_offset: i64,
     pub last_scanned_at: Option<DateTime>,
+    pub scan_epoch: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

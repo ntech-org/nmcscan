@@ -1,6 +1,7 @@
 pub mod scanner;
 pub mod slp;
 pub mod raknet;
+pub mod login;
 
 #[derive(Debug, Clone)]
 pub struct PlayerSample {

@@ -62,11 +62,15 @@ pub struct ServerResponse {
     pub brand: Option<String>,
     pub asn_org: Option<String>,
     pub asn_tags: Vec<String>,
+    pub login_obstacle: Option<String>,
+    pub last_login_at: Option<chrono::NaiveDateTime>,
+    pub flags: Vec<String>,
 }
 
 use crate::models::entities::servers;
 use crate::repositories::{ServerRepository, AsnRepository, StatsRepository, ApiKeyRepository};
 use crate::services::scheduler::Scheduler;
+use crate::services::login_queue::LoginQueue;
 use crate::utils::exclude::ExcludeManager;
 
 pub mod api_keys;
@@ -81,6 +85,7 @@ pub struct AppState {
     pub stats_repo: Arc<StatsRepository>,
     pub api_key_repo: Arc<ApiKeyRepository>,
     pub scheduler: Arc<Scheduler>,
+    pub login_queue: Arc<LoginQueue>,
     pub exclude_list: Arc<ExcludeManager>,
     pub api_key: Option<String>,
     pub contact_email: Option<String>,
@@ -122,6 +127,7 @@ pub struct ServerQuery {
     pub asn: Option<String>,
     pub min_max_players: Option<i32>,
     pub max_max_players: Option<i32>,
+    pub flags: Option<String>,
 }
 
 fn default_limit() -> i32 {
@@ -170,6 +176,49 @@ pub struct TestScanRequest {
 pub struct AddExcludeRequest {
     pub network: String,
     pub comment: Option<String>,
+}
+
+/// Login queue trigger request.
+#[derive(Deserialize)]
+pub struct LoginTriggerRequest {
+    pub ip: String,
+    #[serde(default = "default_login_port")]
+    pub port: u16,
+}
+
+fn default_login_port() -> u16 {
+    25565
+}
+
+/// Login queue status response.
+#[derive(Serialize)]
+pub struct LoginQueueStatusResponse {
+    pub running: bool,
+    pub total_attempts: u64,
+    pub success: u64,
+    pub premium: u64,
+    pub whitelist: u64,
+    pub banned: u64,
+    pub rejected: u64,
+    pub unreachable: u64,
+    pub timeout: u64,
+    pub last_server: Option<String>,
+}
+
+/// Login trigger response.
+#[derive(Serialize)]
+pub struct LoginTriggerResponse {
+    pub obstacle: String,
+    pub disconnect_reason: Option<String>,
+    pub latency_ms: u128,
+    pub protocol_used: i32,
+}
+
+/// Scan progress response.
+#[derive(Serialize)]
+pub struct ScanProgressResponse {
+    pub categories: Vec<crate::repositories::asns::CategoryProgress>,
+    pub queues: crate::services::scheduler::QueueStats,
 }
 
 /// Test scan response.
@@ -271,7 +320,7 @@ pub fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::HeaderName::from_static("x-api-key")]);
+        .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::HeaderName::from_static("x-api-key"), axum::http::header::HeaderName::from_static("x-user-id")]);
 
     // Protected API routes
     let protected_routes = Router::new()
@@ -285,6 +334,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/asns/{asn}", get(get_asn))
         .route("/exclude", get(get_exclude_list).post(add_exclusion))
         .route("/scan/test", post(trigger_test_scan))
+        .route("/scan/progress", get(get_scan_progress))
+        .route("/login-queue/status", get(login_queue_status))
+        .route("/login-queue/start", post(login_queue_start))
+        .route("/login-queue/stop", post(login_queue_stop))
+        .route("/login-queue/trigger", post(login_queue_trigger))
         .route("/keys", get(api_keys::list_keys).post(api_keys::create_key))
         .route("/keys/{id}", axum::routing::delete(api_keys::revoke_key))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -339,28 +393,58 @@ async fn list_servers(
     State(state): State<AppState>,
     Query(query): Query<ServerQuery>,
 ) -> Json<Vec<ServerResponse>> {
+    // Parse DSL tokens from the search parameter if present
+    let parsed = query.search.as_deref().map(crate::utils::query_parser::parse);
+
+    // DSL values act as defaults; explicit query params override them
+    let status = query.status.as_deref()
+        .or(parsed.as_ref().and_then(|p| p.status.as_deref()));
+    // Use free_text from DSL parser (falls back to full search when no DSL tokens found)
+    let search_text = parsed.as_ref().and_then(|p| p.free_text.as_deref());
+    let min_players = query.min_players
+        .or(parsed.as_ref().and_then(|p| p.min_players));
+    let max_players = query.max_players
+        .or(parsed.as_ref().and_then(|p| p.max_players));
+    let version = query.version.as_deref()
+        .or(parsed.as_ref().and_then(|p| p.version.as_deref()));
+    let asn_category = query.asn_category.as_deref()
+        .or(parsed.as_ref().and_then(|p| p.asn_category.as_deref()));
+    let country = query.country.as_deref()
+        .or(parsed.as_ref().and_then(|p| p.country.as_deref()));
+    let brand = query.brand.as_deref()
+        .or(parsed.as_ref().and_then(|p| p.brand.as_deref()));
+    let server_type = query.server_type.as_deref()
+        .or(parsed.as_ref().and_then(|p| p.server_type.as_deref()));
+    let asn = query.asn.as_deref()
+        .or(parsed.as_ref().and_then(|p| p.asn.as_deref()));
+    let min_max_players = query.min_max_players
+        .or(parsed.as_ref().and_then(|p| p.min_max_players));
+    let max_max_players = query.max_max_players
+        .or(parsed.as_ref().and_then(|p| p.max_max_players));
+
     let servers = state
         .server_repo
         .get_all_servers(
-            query.status.as_deref(),
-            query.search.as_deref(),
+            status,
+            search_text,
             query.limit as u64,
-            query.min_players,
-            query.max_players,
-            query.version.as_deref(),
-            query.asn_category.as_deref(),
+            min_players,
+            max_players,
+            version,
+            asn_category,
             query.whitelist_prob_min,
-            query.country.as_deref(),
-            query.brand.as_deref(),
-            query.server_type.as_deref(),
+            country,
+            brand,
+            server_type,
             query.sort_by.as_deref(),
             query.sort_order.as_deref(),
             query.cursor_players,
             query.cursor_ip.as_deref(),
             query.cursor_last_seen,
-            query.asn.as_deref(),
-            query.min_max_players,
-            query.max_max_players,
+            asn,
+            min_max_players,
+            max_max_players,
+            query.flags.as_deref(),
         )
         .await
         .unwrap_or_default();
@@ -420,6 +504,11 @@ async fn get_server(
 }
 
 fn enrich_server_response(server: servers::Model, asn_org: Option<String>, asn_tags: Vec<String>) -> ServerResponse {
+    let flags = server.flags
+        .as_deref()
+        .map(|f| f.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+
     ServerResponse {
         ip: server.ip,
         port: server.port,
@@ -439,6 +528,9 @@ fn enrich_server_response(server: servers::Model, asn_org: Option<String>, asn_t
         brand: server.brand,
         asn_org,
         asn_tags,
+        login_obstacle: server.login_obstacle,
+        last_login_at: server.last_login_at,
+        flags,
     }
 }
 
@@ -691,6 +783,74 @@ async fn trigger_test_scan(
         servers_added: servers_info.len(),
         servers: servers_info,
     })
+}
+
+/// GET /api/login-queue/status - Get login queue status and statistics.
+async fn login_queue_status(
+    State(state): State<AppState>,
+) -> Json<LoginQueueStatusResponse> {
+    let stats = state.login_queue.get_stats().await;
+    Json(LoginQueueStatusResponse {
+        running: stats.running,
+        total_attempts: stats.total_attempts,
+        success: stats.success,
+        premium: stats.premium,
+        whitelist: stats.whitelist,
+        banned: stats.banned,
+        rejected: stats.rejected,
+        unreachable: stats.unreachable,
+        timeout: stats.timeout,
+        last_server: stats.last_server,
+    })
+}
+
+/// POST /api/login-queue/start - Start the login queue.
+async fn login_queue_start(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    if state.login_queue.is_running() {
+        return Json(serde_json::json!({
+            "status": "already_running"
+        }));
+    }
+    state.login_queue.start();
+    Json(serde_json::json!({
+        "status": "started"
+    }))
+}
+
+/// POST /api/login-queue/stop - Stop the login queue.
+async fn login_queue_stop(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    state.login_queue.stop();
+    Json(serde_json::json!({
+        "status": "stopping"
+    }))
+}
+
+/// POST /api/login-queue/trigger - Manually trigger a login attempt.
+async fn login_queue_trigger(
+    State(state): State<AppState>,
+    Json(req): Json<LoginTriggerRequest>,
+) -> Json<LoginTriggerResponse> {
+    let result = state.login_queue.login_single(&req.ip, req.port).await;
+    Json(LoginTriggerResponse {
+        obstacle: result.obstacle.to_string(),
+        disconnect_reason: result.disconnect_reason,
+        latency_ms: result.latency_ms,
+        protocol_used: result.protocol_used,
+    })
+}
+
+/// GET /api/scan/progress - Get scan cycle progress and queue stats.
+async fn get_scan_progress(
+    State(state): State<AppState>,
+) -> Result<Json<ScanProgressResponse>, StatusCode> {
+    let categories = state.asn_repo.get_scan_progress().await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let queues = state.scheduler.get_queue_stats().await;
+    Ok(Json(ScanProgressResponse { categories, queues }))
 }
 
 /// Start the web server.

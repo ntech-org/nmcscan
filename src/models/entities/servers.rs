@@ -21,6 +21,9 @@ pub struct Model {
     pub country: Option<String>,
     pub favicon: Option<String>,
     pub brand: Option<String>,
+    pub login_obstacle: Option<String>,
+    pub last_login_at: Option<DateTime>,
+    pub flags: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

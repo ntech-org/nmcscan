@@ -3,6 +3,9 @@ use sea_orm::sea_query::Expr;
 use crate::models::entities::{servers, server_players, server_history};
 use chrono::{NaiveDateTime, Utc};
 
+const MAX_HISTORY_ENTRIES: u64 = 500;
+const MAX_FAVICON_SIZE: usize = 2048; // Truncate favicons larger than 2KB
+
 #[derive(Clone)]
 pub struct ServerRepository {
     db: DatabaseConnection,
@@ -81,6 +84,7 @@ impl ServerRepository {
         let existing = self.get_server(ip, port).await?;
         let is_new = existing.is_none();
 
+        let favicon = truncate_favicon(favicon);
         let txn = self.db.begin().await?;
 
         let server = servers::ActiveModel {
@@ -125,15 +129,8 @@ impl ServerRepository {
             .exec(&txn)
             .await?;
 
-        // History
-        let history = server_history::ActiveModel {
-            ip: Set(ip.to_string()),
-            port: Set(port),
-            players_online: Set(players_online),
-            timestamp: Set(Utc::now().naive_utc()),
-            ..Default::default()
-        };
-        server_history::Entity::insert(history).exec(&txn).await?;
+        // History (capped)
+        self.insert_history_capped(&txn, ip, port, Utc::now().naive_utc(), players_online).await?;
 
         // Players
         if let Some(sample) = players_sample {
@@ -164,40 +161,39 @@ impl ServerRepository {
         Ok(is_new)
     }
 
+    /// Offline scans are no longer stored in the database.
+    /// Scan tracking is handled by the Redis bitset (ScanTracker).
+    /// For previously-known servers that go offline, we update their status in-place.
     pub async fn mark_offline(
         &self,
         ip: &str,
         port: i32,
-        server_type: &str,
-        asn: Option<String>,
-        country: Option<String>,
+        _server_type: &str,
+        _asn: Option<String>,
+        _country: Option<String>,
     ) -> Result<(), DbErr> {
-        let server = servers::ActiveModel {
-            ip: Set(ip.to_string()),
-            port: Set(port),
-            server_type: Set(server_type.to_string()),
-            status: Set("ignored".to_string()),
-            priority: Set(3),
-            last_seen: Set(Some(Utc::now().naive_utc())),
-            consecutive_failures: Set(1),
-            asn: Set(asn),
-            country: Set(country),
-            ..Default::default()
-        };
-
-        servers::Entity::insert(server)
-            .on_conflict(
-                sea_query::OnConflict::columns([servers::Column::Ip, servers::Column::Port])
-                    .value(servers::Column::Status, Expr::cust("CASE WHEN servers.motd IS NOT NULL OR servers.status = 'online' THEN 'offline' ELSE 'ignored' END"))
-                    .value(servers::Column::ConsecutiveFailures, Expr::cust("servers.consecutive_failures + 1"))
-                    .value(servers::Column::LastSeen, Expr::cust("CURRENT_TIMESTAMP"))
-                    .value(servers::Column::Priority, Expr::cust("CASE WHEN servers.consecutive_failures >= 5 THEN 3 ELSE servers.priority END"))
-                    .value(servers::Column::Asn, Expr::cust("COALESCE(servers.asn, excluded.asn)"))
-                    .value(servers::Column::Country, Expr::cust("COALESCE(servers.country, excluded.country)"))
-                    .to_owned()
-            )
-            .exec(&self.db)
-            .await?;
+        // Only update existing servers (ones that were previously online).
+        // Discovery IPs that fail are NOT inserted into the DB at all.
+        let existing = self.get_server(ip, port).await?;
+        if let Some(model) = existing {
+            if model.status == "online" || model.motd.is_some() {
+                let failures = model.consecutive_failures + 1;
+                let server = servers::ActiveModel {
+                    ip: Set(ip.to_string()),
+                    port: Set(port),
+                    status: Set("offline".to_string()),
+                    consecutive_failures: Set(failures),
+                    last_seen: Set(Some(Utc::now().naive_utc())),
+                    priority: Set(if failures >= 5 { 3 } else { model.priority }),
+                    ..Default::default()
+                };
+                servers::Entity::update(server)
+                    .filter(servers::Column::Ip.eq(ip))
+                    .filter(servers::Column::Port.eq(port))
+                    .exec(&self.db)
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -227,106 +223,92 @@ impl ServerRepository {
         let txn = self.db.begin().await?;
 
         for res in results {
-            if res.online {
-                let server = servers::ActiveModel {
-                    ip: Set(res.ip.clone()),
-                    port: Set(res.port as i32),
-                    server_type: Set(res.server_type.clone()),
-                    status: Set("online".to_string()),
-                    players_online: Set(res.players_online),
-                    players_max: Set(res.players_max),
-                    motd: Set(res.motd),
-                    version: Set(res.version),
-                    favicon: Set(res.favicon),
-                    brand: Set(res.brand),
-                    priority: Set(1),
-                    last_seen: Set(Some(res.timestamp)),
-                    consecutive_failures: Set(0),
-                    asn: Set(res.asn),
-                    country: Set(res.country.unwrap_or(None)),
-                    ..Default::default()
-                };
-
-                servers::Entity::insert(server)
-                    .on_conflict(
-                        sea_query::OnConflict::columns([servers::Column::Ip, servers::Column::Port])
-                            .update_columns([
-                                servers::Column::Status,
-                                servers::Column::PlayersOnline,
-                                servers::Column::PlayersMax,
-                                servers::Column::Motd,
-                                servers::Column::Version,
-                                servers::Column::Favicon,
-                                servers::Column::Brand,
-                                servers::Column::LastSeen,
-                                servers::Column::Priority,
-                                servers::Column::ConsecutiveFailures,
-                                servers::Column::Asn,
-                                servers::Column::Country,
-                            ])
-                            .to_owned()
-                    )
-                    .exec(&txn)
+            if !res.online {
+                // Skip offline results entirely - they are tracked in Redis bitset only.
+                // Only update existing servers that were previously online.
+                let existing = servers::Entity::find_by_id((res.ip.clone(), res.port as i32))
+                    .one(&txn)
                     .await?;
-
-                // Insert into history
-                let history_model = server_history::ActiveModel {
-                    ip: Set(res.ip.clone()),
-                    port: Set(res.port as i32),
-                    timestamp: Set(res.timestamp),
-                    players_online: Set(res.players_online),
-                    ..Default::default()
-                };
-                server_history::Entity::insert(history_model).exec(&txn).await?;
-
-                // Update players
-                if let Some(samples) = res.players_sample {
-                    for p in samples {
-                        let p_model = server_players::ActiveModel {
-                            ip: Set(res.ip.clone()),
-                            port: Set(res.port as i32),
-                            player_name: Set(p.name),
-                            player_uuid: Set(Some(p.uuid)),
-                            last_seen: Set(res.timestamp),
-                            ..Default::default()
-                        };
-                        server_players::Entity::insert(p_model)
-                            .on_conflict(
-                                sea_query::OnConflict::columns([server_players::Column::Ip, server_players::Column::Port, server_players::Column::PlayerName])
-                                    .update_columns([server_players::Column::PlayerUuid, server_players::Column::LastSeen])
-                                    .to_owned()
-                            )
-                            .exec(&txn)
-                            .await?;
+                if let Some(model) = existing {
+                    if model.status == "online" || model.motd.is_some() {
+                        let failures = model.consecutive_failures + 1;
+                        let mut am: servers::ActiveModel = model.into();
+                        am.status = Set("offline".to_string());
+                        am.consecutive_failures = Set(failures);
+                        am.last_seen = Set(Some(res.timestamp));
+                        am.priority = Set(if failures >= 5 { 3 } else { am.priority.unwrap() });
+                        am.update(&txn).await?;
                     }
                 }
-            } else {
-                let server = servers::ActiveModel {
-                    ip: Set(res.ip.clone()),
-                    port: Set(res.port as i32),
-                    server_type: Set(res.server_type.clone()),
-                    status: Set("ignored".to_string()),
-                    priority: Set(3),
-                    last_seen: Set(Some(res.timestamp)),
-                    consecutive_failures: Set(1),
-                    asn: Set(res.asn),
-                    country: Set(res.country.unwrap_or(None)),
-                    ..Default::default()
-                };
+                continue;
+            }
 
-                servers::Entity::insert(server)
-                    .on_conflict(
-                        sea_query::OnConflict::columns([servers::Column::Ip, servers::Column::Port])
-                            .value(servers::Column::Status, Expr::cust("CASE WHEN servers.motd IS NOT NULL OR servers.status = 'online' THEN 'offline' ELSE 'ignored' END"))
-                            .value(servers::Column::ConsecutiveFailures, Expr::cust("servers.consecutive_failures + 1"))
-                            .value(servers::Column::LastSeen, res.timestamp)
-                            .value(servers::Column::Priority, Expr::cust("CASE WHEN servers.consecutive_failures >= 5 THEN 3 ELSE servers.priority END"))
-                            .value(servers::Column::Asn, Expr::cust("COALESCE(servers.asn, excluded.asn)"))
-                            .value(servers::Column::Country, Expr::cust("COALESCE(servers.country, excluded.country)"))
-                            .to_owned()
-                    )
-                    .exec(&txn)
-                    .await?;
+            // Online server - store/update in database
+            let favicon = truncate_favicon(res.favicon);
+            let server = servers::ActiveModel {
+                ip: Set(res.ip.clone()),
+                port: Set(res.port as i32),
+                server_type: Set(res.server_type.clone()),
+                status: Set("online".to_string()),
+                players_online: Set(res.players_online),
+                players_max: Set(res.players_max),
+                motd: Set(res.motd),
+                version: Set(res.version),
+                favicon: Set(favicon),
+                brand: Set(res.brand),
+                priority: Set(1),
+                last_seen: Set(Some(res.timestamp)),
+                consecutive_failures: Set(0),
+                asn: Set(res.asn),
+                country: Set(res.country.unwrap_or(None)),
+                ..Default::default()
+            };
+
+            servers::Entity::insert(server)
+                .on_conflict(
+                    sea_query::OnConflict::columns([servers::Column::Ip, servers::Column::Port])
+                        .update_columns([
+                            servers::Column::Status,
+                            servers::Column::PlayersOnline,
+                            servers::Column::PlayersMax,
+                            servers::Column::Motd,
+                            servers::Column::Version,
+                            servers::Column::Favicon,
+                            servers::Column::Brand,
+                            servers::Column::LastSeen,
+                            servers::Column::Priority,
+                            servers::Column::ConsecutiveFailures,
+                            servers::Column::Asn,
+                            servers::Column::Country,
+                        ])
+                        .to_owned()
+                )
+                .exec(&txn)
+                .await?;
+
+            // Insert into history (capped to prevent unbounded growth)
+            self.insert_history_capped(&txn, &res.ip, res.port as i32, res.timestamp, res.players_online).await?;
+
+            // Update players
+            if let Some(samples) = res.players_sample {
+                for p in samples {
+                    let p_model = server_players::ActiveModel {
+                        ip: Set(res.ip.clone()),
+                        port: Set(res.port as i32),
+                        player_name: Set(p.name),
+                        player_uuid: Set(Some(p.uuid)),
+                        last_seen: Set(res.timestamp),
+                        ..Default::default()
+                    };
+                    server_players::Entity::insert(p_model)
+                        .on_conflict(
+                            sea_query::OnConflict::columns([server_players::Column::Ip, server_players::Column::Port, server_players::Column::PlayerName])
+                                .update_columns([server_players::Column::PlayerUuid, server_players::Column::LastSeen])
+                                .to_owned()
+                        )
+                        .exec(&txn)
+                        .await?;
+                }
             }
         }
 
@@ -355,6 +337,7 @@ impl ServerRepository {
         asn_filter: Option<&str>,
         min_max_players: Option<i32>,
         max_max_players: Option<i32>,
+        flags_filter: Option<&str>,
     ) -> Result<Vec<servers::Model>, DbErr> {
         let mut query = servers::Entity::find()
             .filter(servers::Column::Status.ne("ignored"));
@@ -428,6 +411,25 @@ impl ServerRepository {
 
         if let Some(b) = brand {
             query = query.filter(servers::Column::Brand.contains(b));
+        }
+
+        // Flags filter: comma-separated flags, match each requested flag
+        if let Some(flags_str) = flags_filter {
+            for flag in flags_str.split(',') {
+                let flag = flag.trim();
+                if flag.is_empty() { continue; }
+                // Match flag surrounded by commas or at start/end of string
+                let p1 = format!(",{},", flag);
+                let p2 = format!("{},", flag);
+                let p3 = format!(",{}", flag);
+                query = query.filter(
+                    Condition::any()
+                        .add(servers::Column::Flags.like(&p1))
+                        .add(servers::Column::Flags.like(&p2))
+                        .add(servers::Column::Flags.like(&p3))
+                        .add(servers::Column::Flags.eq(flag))
+                );
+            }
         }
 
         let order = match sort_order {
@@ -579,29 +581,13 @@ impl ServerRepository {
             .await
     }
 
-    pub async fn get_existing_ips(&self, ips: Vec<String>) -> Result<std::collections::HashSet<String>, DbErr> {
-        let mut known_ips = std::collections::HashSet::new();
-        for chunk in ips.chunks(500) {
-            let chunk_vec: Vec<String> = chunk.to_vec();
-            let found = servers::Entity::find()
-                .filter(servers::Column::Ip.is_in(chunk_vec))
-                .select_only()
-                .column(servers::Column::Ip)
-                .all(&self.db)
-                .await?;
-            for model in found {
-                known_ips.insert(model.ip);
-            }
-        }
-        Ok(known_ips)
+    pub async fn get_existing_ips(&self, _ips: Vec<String>) -> Result<std::collections::HashSet<String>, DbErr> {
+        // Deprecated: Scan tracking moved to Redis bitset (ScanTracker).
+        // This method is kept as a no-op for backwards compatibility.
+        Ok(std::collections::HashSet::new())
     }
 
     pub async fn link_servers_to_asns(&self) -> Result<u64, DbErr> {
-        // This one is complex and might be better left as raw SQL if it's a one-off,
-        // but let's try to implement the logic from db.rs or use raw SQL.
-        // The original logic used a loop over ranges.
-        
-        // Since this is a specialized maintenance task, I'll use raw SQL for it to keep it simple and efficient.
         let sql = r#"
             UPDATE servers 
             SET asn = r.asn, 
@@ -618,5 +604,123 @@ impl ServerRepository {
         
         let result = self.db.execute(Statement::from_string(self.db.get_database_backend(), sql.to_string())).await?;
         Ok(result.rows_affected())
+    }
+
+    /// Insert history entry but cap total entries per server to prevent unbounded growth.
+    async fn insert_history_capped(
+        &self,
+        txn: &DatabaseTransaction,
+        ip: &str,
+        port: i32,
+        timestamp: chrono::NaiveDateTime,
+        players_online: i32,
+    ) -> Result<(), DbErr> {
+        // Check current count
+        let count = server_history::Entity::find()
+            .filter(server_history::Column::Ip.eq(ip))
+            .filter(server_history::Column::Port.eq(port))
+            .count(txn)
+            .await?;
+
+        // If at cap, delete oldest entries
+        if count >= MAX_HISTORY_ENTRIES {
+            let excess = count - MAX_HISTORY_ENTRIES + 1;
+            let oldest: Vec<server_history::Model> = server_history::Entity::find()
+                .filter(server_history::Column::Ip.eq(ip))
+                .filter(server_history::Column::Port.eq(port))
+                .order_by_asc(server_history::Column::Timestamp)
+                .limit(excess)
+                .all(txn)
+                .await?;
+
+            for entry in oldest {
+                server_history::Entity::delete_by_id((entry.ip, entry.port, entry.timestamp))
+                    .exec(txn)
+                    .await?;
+            }
+        }
+
+        let history = server_history::ActiveModel {
+            ip: Set(ip.to_string()),
+            port: Set(port),
+            timestamp: Set(timestamp),
+            players_online: Set(players_online),
+            ..Default::default()
+        };
+        server_history::Entity::insert(history).exec(txn).await?;
+        Ok(())
+    }
+
+    /// Delete all servers with status 'ignored' to reclaim storage.
+    /// Call this once after migrating to Redis bitset tracking.
+    pub async fn purge_ignored_servers(&self) -> Result<u64, DbErr> {
+        let result = servers::Entity::delete_many()
+            .filter(servers::Column::Status.eq("ignored"))
+            .exec(&self.db)
+            .await?;
+        Ok(result.rows_affected)
+    }
+
+    /// Update login obstacle result for a server.
+    /// The PostgreSQL trigger will automatically recompute flags.
+    pub async fn update_login_result(
+        &self,
+        ip: &str,
+        port: i32,
+        obstacle: &str,
+    ) -> Result<(), DbErr> {
+        let server = servers::ActiveModel {
+            ip: Set(ip.to_string()),
+            port: Set(port),
+            login_obstacle: Set(Some(obstacle.to_string())),
+            last_login_at: Set(Some(Utc::now().naive_utc())),
+            ..Default::default()
+        };
+        servers::Entity::update(server)
+            .filter(servers::Column::Ip.eq(ip))
+            .filter(servers::Column::Port.eq(port))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Get servers filtered by a flag (e.g., "cracked", "vanilla", "active").
+    /// Uses LIKE with comma delimiters for reliable matching.
+    pub async fn get_servers_by_flag(
+        &self,
+        flag: &str,
+        limit: u64,
+    ) -> Result<Vec<servers::Model>, DbErr> {
+        // Match flag surrounded by commas or at start/end of string
+        let pattern = format!("%,{},%", flag);
+        let pattern_start = format!("{},%", flag);
+        let pattern_end = format!("%,{}", flag);
+
+        servers::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(servers::Column::Flags.like(&pattern))
+                    .add(servers::Column::Flags.like(&pattern_start))
+                    .add(servers::Column::Flags.like(&pattern_end))
+                    .add(servers::Column::Flags.eq(flag))
+            )
+            .filter(servers::Column::Status.eq("online"))
+            .order_by_desc(servers::Column::PlayersOnline)
+            .limit(limit)
+            .all(&self.db)
+            .await
+    }
+}
+
+/// Truncate oversized favicon data to save storage.
+/// Favicons are base64-encoded PNGs that can be 5-10KB each.
+fn truncate_favicon(favicon: Option<String>) -> Option<String> {
+    let f = favicon?;
+    if f.len() > MAX_FAVICON_SIZE {
+        // Keep just the first portion to avoid massive storage bloat
+        // but preserve enough for a recognizable icon
+        None // Drop oversized favicons entirely
+    } else {
+        Some(f)
     }
 }
