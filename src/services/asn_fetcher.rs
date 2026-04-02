@@ -13,6 +13,36 @@ use tokio::sync::RwLock;
 use tokio::time;
 use tracing;
 use std::path::Path;
+use std::net::Ipv4Addr;
+
+/// Convert an IP range (inclusive start, inclusive end) to a list of CIDR blocks.
+/// Uses greedy largest-block-first algorithm to minimize the number of CIDRs.
+fn ip_range_to_cidrs(start: u32, end: u32) -> Vec<String> {
+    let mut cidrs = Vec::new();
+    let mut current = start;
+
+    while current <= end {
+        // Find the largest block size that:
+        // 1. Starts at `current` (is aligned)
+        // 2. Doesn't exceed `end`
+        let mut size = 1u32;
+        for bit in (0..32).rev() {
+            let block_size = 1u32 << bit;
+            // Check alignment: current must be a multiple of block_size
+            if current % block_size == 0 && current + block_size - 1 <= end {
+                size = block_size;
+                break;
+            }
+        }
+
+        let prefix = 32 - size.trailing_zeros() as u8;
+        let ip = Ipv4Addr::from(current);
+        cidrs.push(format!("{}/{}", ip, prefix));
+        current += size;
+    }
+
+    cidrs
+}
 use std::fs;
 use std::io::Read;
 use maxminddb::Reader;
@@ -218,17 +248,13 @@ impl AsnFetcher {
                 asn_map.insert(asn.clone(), (org.to_string(), country.to_string(), Vec::new()));
             }
             
-            // Try to convert range to CIDR
-            if let (Ok(start), Ok(end)) = (range_start.parse::<std::net::Ipv4Addr>(), range_end.parse::<std::net::Ipv4Addr>()) {
-                let start_octets = start.octets();
-                let end_octets = end.octets();
+            // Convert IP range to proper CIDR blocks (not just one /24)
+            if let (Ok(start), Ok(end)) = (range_start.parse::<Ipv4Addr>(), range_end.parse::<Ipv4Addr>()) {
+                let start_int = u32::from(start);
+                let end_int = u32::from(end);
                 
-                let cidr = format!("{}.{}.{}.0/24", start_octets[0], start_octets[1], start_octets[2]);
-                range_dedup.insert(cidr, asn.clone());
-
-                if start_octets[1] != end_octets[1] || (end_octets[2] as i16 - start_octets[2] as i16) > 10 {
-                    let mid_cidr = format!("{}.{}.{}.0/24", start_octets[0], start_octets[1], start_octets[2] + 5);
-                    range_dedup.insert(mid_cidr, asn);
+                for cidr in ip_range_to_cidrs(start_int, end_int) {
+                    range_dedup.entry(cidr).or_insert_with(|| asn.clone());
                 }
             }
         }
@@ -512,5 +538,82 @@ impl AsnFetcher {
             // 2. Refresh Full ASN Discovery Database
             let _ = self.import_full_database().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ip_range_to_cidrs_single_ip() {
+        // Single IP: 10.0.0.1
+        let cidrs = ip_range_to_cidrs(
+            u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+            u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+        );
+        assert_eq!(cidrs, vec!["10.0.0.1/32"]);
+    }
+
+    #[test]
+    fn test_ip_range_to_cidrs_full_slash24() {
+        // Full /24: 10.0.0.0 - 10.0.0.255
+        let cidrs = ip_range_to_cidrs(
+            u32::from(Ipv4Addr::new(10, 0, 0, 0)),
+            u32::from(Ipv4Addr::new(10, 0, 0, 255)),
+        );
+        assert_eq!(cidrs, vec!["10.0.0.0/24"]);
+    }
+
+    #[test]
+    fn test_ip_range_to_cidrs_full_slash16() {
+        // Full /16: 10.0.0.0 - 10.0.255.255
+        let cidrs = ip_range_to_cidrs(
+            u32::from(Ipv4Addr::new(10, 0, 0, 0)),
+            u32::from(Ipv4Addr::new(10, 0, 255, 255)),
+        );
+        assert_eq!(cidrs, vec!["10.0.0.0/16"]);
+    }
+
+    #[test]
+    fn test_ip_range_to_cidrs_unaligned() {
+        // 10.0.0.100 - 10.0.0.200 (non-aligned, should produce multiple CIDRs)
+        let cidrs = ip_range_to_cidrs(
+            u32::from(Ipv4Addr::new(10, 0, 0, 100)),
+            u32::from(Ipv4Addr::new(10, 0, 0, 200)),
+        );
+        // Should cover the range exactly with multiple CIDRs
+        let total_ips: u32 = cidrs.iter().map(|c| {
+            let prefix: u8 = c.split('/').nth(1).unwrap().parse().unwrap();
+            1u32 << (32 - prefix)
+        }).sum();
+        assert_eq!(total_ips, 101); // 200 - 100 + 1 = 101 IPs
+    }
+
+    #[test]
+    fn test_ip_range_to_cidrs_cross_octet() {
+        // 10.0.0.200 - 10.0.1.50 (crosses /24 boundary)
+        let cidrs = ip_range_to_cidrs(
+            u32::from(Ipv4Addr::new(10, 0, 0, 200)),
+            u32::from(Ipv4Addr::new(10, 0, 1, 50)),
+        );
+        let total_ips: u32 = cidrs.iter().map(|c| {
+            let prefix: u8 = c.split('/').nth(1).unwrap().parse().unwrap();
+            1u32 << (32 - prefix)
+        }).sum();
+        // 56 (200-255) + 51 (0-50) = 107 IPs... wait: 256-200=56, 50-0+1=51 = 107
+        // Actually: 10.0.0.200 to 10.0.0.255 = 56 IPs, 10.0.1.0 to 10.0.1.50 = 51 IPs
+        // Total = 107
+        assert_eq!(total_ips, 107);
+    }
+
+    #[test]
+    fn test_ip_range_to_cidrs_large_range() {
+        // 10.0.0.0 - 10.0.7.255 = /21 (2048 IPs)
+        let cidrs = ip_range_to_cidrs(
+            u32::from(Ipv4Addr::new(10, 0, 0, 0)),
+            u32::from(Ipv4Addr::new(10, 0, 7, 255)),
+        );
+        assert_eq!(cidrs, vec!["10.0.0.0/21"]);
     }
 }
