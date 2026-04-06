@@ -121,12 +121,12 @@ impl LoginQueue {
         // Use latest protocol version for manual attempts
         let result = login::attempt_login(addr, 775).await;
         let obstacle_str = result.obstacle.to_string();
-        let port_i16: i16 = port.try_into().unwrap_or(25565);
+        let port: i16 = port.try_into().unwrap_or(25565);
 
         // Store result
         if let Err(e) = self
             .server_repo
-            .update_login_result(ip, port_i16, &obstacle_str)
+            .update_login_result(ip, port as i32, &obstacle_str)
             .await
         {
             tracing::error!("Failed to update login result for {}:{}: {}", ip, port, e);
@@ -238,11 +238,7 @@ impl LoginQueue {
             let total_attempts = Arc::clone(&self.total_attempts);
 
             tokio::spawn(async move {
-                let addr = SocketAddr::new(
-                    ip.parse()
-                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-                    port as u16,
-                );
+                let addr = SocketAddr::new(ip.ip(), port as u16);
 
                 // Extract protocol version from SLP-reported version string if available
                 let protocol = server_version
@@ -256,7 +252,7 @@ impl LoginQueue {
 
                 // Update server record
                 if let Err(e) = server_repo
-                    .update_login_result(&ip, port, &obstacle_str)
+                    .update_login_result(&ip.to_string(), port, &obstacle_str)
                     .await
                 {
                     tracing::error!("Failed to update login result for {}:{}: {}", ip, port, e);

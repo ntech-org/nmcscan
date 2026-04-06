@@ -566,7 +566,7 @@ async fn get_server(
     Path(ip_param): Path<String>,
 ) -> Result<Json<ServerResponse>, StatusCode> {
     let (ip, port) = if let Some((i, p)) = ip_param.split_once(':') {
-        (i, p.parse::<i16>().unwrap_or(25565))
+        (i, p.parse::<i32>().unwrap_or(25565))
     } else {
         (ip_param.as_str(), 25565)
     };
@@ -619,8 +619,8 @@ fn enrich_server_response(
         .unwrap_or_default();
 
     ServerResponse {
-        ip: server.ip,
-        port: server.port,
+        ip: server.ip.to_string(),
+        port: server.port as i16,
         server_type: server.server_type,
         status: server.status,
         players_online: server.players_online,
@@ -649,7 +649,7 @@ async fn get_server_history(
     Path(ip_param): Path<String>,
 ) -> Json<Vec<HistoryResponse>> {
     let (ip, port) = if let Some((i, p)) = ip_param.split_once(':') {
-        (i, p.parse::<i16>().unwrap_or(25565))
+        (i, p.parse::<i32>().unwrap_or(25565))
     } else {
         (ip_param.as_str(), 25565)
     };
@@ -674,7 +674,7 @@ async fn get_server_players(
     Path(ip_param): Path<String>,
 ) -> Json<Vec<ServerPlayerResponse>> {
     let (ip, port) = if let Some((i, p)) = ip_param.split_once(':') {
-        (i, p.parse::<i16>().unwrap_or(25565))
+        (i, p.parse::<i32>().unwrap_or(25565))
     } else {
         (ip_param.as_str(), 25565)
     };
@@ -709,8 +709,8 @@ async fn search_players(
         .unwrap_or_default()
         .into_iter()
         .map(|p| PlayerResponse {
-            ip: p.ip,
-            port: p.port,
+            ip: p.ip.to_string(),
+            port: p.port as i16,
             player_name: p.player_name,
             last_seen: p.last_seen,
         })
@@ -909,10 +909,10 @@ async fn trigger_test_scan(
         target.priority = 1;
         target.hostname = Some(host.clone());
 
-        let port_i16: i16 = (*port).try_into().unwrap_or(25565);
+        let port: i16 = (*port).try_into().unwrap_or(25565);
         let _ = state
             .server_repo
-            .insert_server_if_new(ip, port_i16, server_type)
+            .insert_server_if_new(ip, port as i32, server_type)
             .await;
         state.scheduler.add_server(target, true).await;
     }

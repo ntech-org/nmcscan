@@ -3,10 +3,10 @@ use sea_orm::entity::prelude::*;
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "servers")]
 pub struct Model {
+    #[sea_orm(primary_key, column_type = "Inet")]
+    pub ip: IpNetwork,
     #[sea_orm(primary_key)]
-    pub ip: String,
-    #[sea_orm(primary_key, column_type = "SmallInteger")]
-    pub port: i16,
+    pub port: i32,
     pub server_type: String,
     pub status: String,
     pub players_online: i32,

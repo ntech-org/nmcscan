@@ -294,7 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !servers.is_empty() {
                     tracing::info!("Backfilling ASN data for {} servers...", servers.len());
                     for server in servers {
-                        let _ = asn_clone.fetch_asn_for_ip(&server.ip).await;
+                        let _ = asn_clone.fetch_asn_for_ip(server.ip.to_string().as_str()).await;
                     }
                     tracing::info!("Backfill complete.");
                 }
@@ -350,7 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let port_i16: i16 = (*port).try_into().unwrap_or(25565);
             let _ = server_repo
-                .insert_server_if_new(ip, port_i16, &server_type)
+                .insert_server_if_new(ip, port_i16 as i32, &server_type)
                 .await;
 
             scheduler.add_server(target, false).await;
@@ -617,7 +617,7 @@ async fn run_scanner_loop(
                         let is_discovery = server.last_scanned.is_none();
 
                         let scan_result = scanner
-                            .scan_server(&server.ip, server.port, server.hostname.as_deref(), priority, is_discovery, &server.server_type)
+                            .scan_server(server.ip.to_string().as_str(), server.port, server.hostname.as_deref(), priority, is_discovery, &server.server_type)
                             .await;
 
                         let was_online = scan_result.as_ref().map(|r| r.online).unwrap_or(false);

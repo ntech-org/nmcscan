@@ -338,7 +338,7 @@ impl Scheduler {
         if let Ok(dead_servers) = self.server_repo.get_dead_servers(1000).await {
             for server in dead_servers {
                 let mut target =
-                    ServerTarget::new(server.ip, server.port as u16, server.server_type);
+                    ServerTarget::new(server.ip.to_string(), server.port as i32 as u16, server.server_type);
                 target.priority = 3;
                 if let Some(last) = server.last_seen {
                     target.next_scan_at = Some(last.and_utc() + chrono::Duration::days(7));
@@ -569,7 +569,7 @@ impl Scheduler {
         if is_new_discovery && !was_online {
             tracing::debug!(
                 "Dropping offline discovery target: {}:{}",
-                server.ip,
+                server.ip.to_string(),
                 server.port
             );
             return;
@@ -651,7 +651,7 @@ impl Scheduler {
             let mut q = queue.lock().await;
             for server in ready_servers {
                 let mut target = ServerTarget::new(
-                    server.ip,
+                    server.ip.to_string(),
                     server.port.try_into().unwrap_or(25565),
                     server.server_type,
                 );
@@ -670,7 +670,7 @@ impl Scheduler {
 
         for server in servers {
             let mut target = ServerTarget::new(
-                server.ip,
+                server.ip.to_string(),
                 server.port.try_into().unwrap_or(25565),
                 server.server_type,
             );
