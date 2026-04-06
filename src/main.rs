@@ -350,7 +350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let port_i16: i16 = (*port).try_into().unwrap_or(25565);
             let _ = server_repo
-                .insert_server_if_new(ip, port_i16 as i32, &server_type)
+                .insert_server_if_new(ip, port_i16, &server_type)
                 .await;
 
             scheduler.add_server(target, false).await;

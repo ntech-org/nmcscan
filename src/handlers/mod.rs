@@ -566,7 +566,7 @@ async fn get_server(
     Path(ip_param): Path<String>,
 ) -> Result<Json<ServerResponse>, StatusCode> {
     let (ip, port) = if let Some((i, p)) = ip_param.split_once(':') {
-        (i, p.parse::<i32>().unwrap_or(25565))
+        (i, p.parse::<i16>().unwrap_or(25565))
     } else {
         (ip_param.as_str(), 25565)
     };
@@ -649,7 +649,7 @@ async fn get_server_history(
     Path(ip_param): Path<String>,
 ) -> Json<Vec<HistoryResponse>> {
     let (ip, port) = if let Some((i, p)) = ip_param.split_once(':') {
-        (i, p.parse::<i32>().unwrap_or(25565))
+        (i, p.parse::<i16>().unwrap_or(25565))
     } else {
         (ip_param.as_str(), 25565)
     };
@@ -674,7 +674,7 @@ async fn get_server_players(
     Path(ip_param): Path<String>,
 ) -> Json<Vec<ServerPlayerResponse>> {
     let (ip, port) = if let Some((i, p)) = ip_param.split_once(':') {
-        (i, p.parse::<i32>().unwrap_or(25565))
+        (i, p.parse::<i16>().unwrap_or(25565))
     } else {
         (ip_param.as_str(), 25565)
     };
@@ -912,7 +912,7 @@ async fn trigger_test_scan(
         let port: i16 = (*port).try_into().unwrap_or(25565);
         let _ = state
             .server_repo
-            .insert_server_if_new(ip, port as i32, server_type)
+            .insert_server_if_new(ip, port, server_type)
             .await;
         state.scheduler.add_server(target, true).await;
     }

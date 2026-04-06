@@ -23,7 +23,7 @@ impl ServerRepository {
         Self { db }
     }
 
-    pub async fn get_server(&self, ip: &str, port: i32) -> Result<Option<servers::Model>, DbErr> {
+    pub async fn get_server(&self, ip: &str, port: i16) -> Result<Option<servers::Model>, DbErr> {
         servers::Entity::find_by_id((parse_ip(ip), port))
             .one(&self.db)
             .await
@@ -85,7 +85,7 @@ impl ServerRepository {
     pub async fn mark_online(
         &self,
         ip: &str,
-        port: i32,
+        port: i16,
         server_type: &str,
         players_online: i32,
         players_max: i32,
@@ -203,7 +203,7 @@ impl ServerRepository {
     pub async fn mark_offline(
         &self,
         ip: &str,
-        port: i32,
+        port: i16,
         _server_type: &str,
         _asn: Option<String>,
         _country: Option<String>,
@@ -236,7 +236,7 @@ impl ServerRepository {
     pub async fn insert_server_if_new(
         &self,
         ip: &str,
-        port: i32,
+        port: i16,
         server_type: &str,
     ) -> Result<(), DbErr> {
         let server = servers::ActiveModel {
@@ -271,7 +271,7 @@ impl ServerRepository {
                 // Skip offline results entirely - they are tracked in Redis bitset only.
                 // Only update existing servers that were previously online.
                 let port_i16: i16 = res.port.try_into().unwrap_or(25565);
-                let existing = servers::Entity::find_by_id((parse_ip(&res.ip), res.port as i32))
+                let existing = servers::Entity::find_by_id((parse_ip(&res.ip), res.port as i16))
                     .one(&txn)
                     .await?;
                 if let Some(model) = existing {
@@ -296,7 +296,7 @@ impl ServerRepository {
             let favicon = truncate_favicon(res.favicon);
             let server = servers::ActiveModel {
                 ip: Set(parse_ip(&res.ip)),
-                port: Set(res.port as i32),
+                port: Set(res.port as i16),
                 server_type: Set(res.server_type.clone()),
                 status: Set("online".to_string()),
                 players_online: Set(res.players_online),
@@ -350,7 +350,7 @@ impl ServerRepository {
                 for p in samples {
                     let p_model = server_players::ActiveModel {
                         ip: Set(parse_ip(&res.ip)),
-                        port: Set(res.port as i32),
+                        port: Set(res.port as i16),
                         player_name: Set(p.name),
                         player_uuid: Set(Some(p.uuid)),
                         last_seen: Set(res.timestamp),
@@ -585,7 +585,7 @@ impl ServerRepository {
     pub async fn get_server_players(
         &self,
         ip: &str,
-        port: i32,
+        port: i16,
     ) -> Result<Vec<server_players::Model>, DbErr> {
         server_players::Entity::find()
             .filter(server_players::Column::Ip.eq(ip))
@@ -599,7 +599,7 @@ impl ServerRepository {
     pub async fn get_server_history(
         &self,
         ip: &str,
-        port: i32,
+        port: i16,
         limit: u64,
     ) -> Result<Vec<server_history::Model>, DbErr> {
         server_history::Entity::find()
@@ -708,7 +708,7 @@ impl ServerRepository {
         &self,
         txn: &DatabaseTransaction,
         ip: &str,
-        port: i32,
+        port: i16,
         timestamp: chrono::NaiveDateTime,
         players_online: i32,
     ) -> Result<(), DbErr> {
@@ -763,7 +763,7 @@ impl ServerRepository {
     pub async fn update_login_result(
         &self,
         ip: &str,
-        port: i32,
+        port: i16,
         obstacle: &str,
     ) -> Result<(), DbErr> {
         let server = servers::ActiveModel {

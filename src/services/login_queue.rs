@@ -126,7 +126,7 @@ impl LoginQueue {
         // Store result
         if let Err(e) = self
             .server_repo
-            .update_login_result(ip, port as i32, &obstacle_str)
+            .update_login_result(ip, port, &obstacle_str)
             .await
         {
             tracing::error!("Failed to update login result for {}:{}: {}", ip, port, e);
@@ -252,7 +252,7 @@ impl LoginQueue {
 
                 // Update server record
                 if let Err(e) = server_repo
-                    .update_login_result(&ip.to_string(), port, &obstacle_str)
+                    .update_login_result(&ip.to_string(), port as i16, &obstacle_str)
                     .await
                 {
                     tracing::error!("Failed to update login result for {}:{}: {}", ip, port, e);
