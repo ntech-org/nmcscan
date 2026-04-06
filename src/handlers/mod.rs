@@ -68,12 +68,13 @@ pub struct ServerResponse {
 }
 
 use crate::models::entities::servers;
-use crate::repositories::{ServerRepository, AsnRepository, StatsRepository, ApiKeyRepository};
+use crate::repositories::{ServerRepository, AsnRepository, StatsRepository, ApiKeyRepository, MinecraftAccountRepository};
 use crate::services::scheduler::Scheduler;
 use crate::services::login_queue::LoginQueue;
 use crate::utils::exclude::ExcludeManager;
 
 pub mod api_keys;
+pub mod minecraft_accounts;
 
 /// Shared application state.
 #[allow(dead_code)]
@@ -84,6 +85,7 @@ pub struct AppState {
     pub asn_repo: Arc<AsnRepository>,
     pub stats_repo: Arc<StatsRepository>,
     pub api_key_repo: Arc<ApiKeyRepository>,
+    pub minecraft_account_repo: Arc<MinecraftAccountRepository>,
     pub scheduler: Arc<Scheduler>,
     pub login_queue: Arc<LoginQueue>,
     pub exclude_list: Arc<ExcludeManager>,
@@ -315,6 +317,21 @@ async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
+#[derive(Serialize)]
+pub struct MinecraftAccountResponse {
+    pub id: i32,
+    pub email: String,
+    pub status: String,
+    pub expires_at: Option<chrono::NaiveDateTime>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateMinecraftAccountRequest {
+    pub email: String,
+    pub password: Option<String>,
+    pub access_token: Option<String>,
+}
+
 /// Create the Axum router with all endpoints.
 pub fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
@@ -341,6 +358,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/login-queue/trigger", post(login_queue_trigger))
         .route("/keys", get(api_keys::list_keys).post(api_keys::create_key))
         .route("/keys/{id}", axum::routing::delete(api_keys::revoke_key))
+        .route("/minecraft-accounts", get(minecraft_accounts::list_accounts).post(minecraft_accounts::add_account))
+        .route("/minecraft-accounts/{id}", axum::routing::delete(minecraft_accounts::delete_account))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Combine all API routes under /api
@@ -422,6 +441,14 @@ async fn list_servers(
     let max_max_players = query.max_max_players
         .or(parsed.as_ref().and_then(|p| p.max_max_players));
 
+    // Support both DSL flags and explicit flag query param
+    let mut flags_filter = parsed.as_ref().map(|p| p.flags.clone()).unwrap_or_default();
+    if let Some(f) = &query.flags {
+        flags_filter.extend(f.split(',').map(|s| s.to_string()));
+    }
+
+    let login_obstacle = parsed.as_ref().and_then(|p| p.login.as_deref());
+
     let servers = state
         .server_repo
         .get_all_servers(
@@ -444,7 +471,8 @@ async fn list_servers(
             asn,
             min_max_players,
             max_max_players,
-            query.flags.as_deref(),
+            flags_filter,
+            login_obstacle,
         )
         .await
         .unwrap_or_default();

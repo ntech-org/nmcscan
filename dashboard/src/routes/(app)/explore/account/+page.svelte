@@ -13,6 +13,7 @@
   import Unlink from "@lucide/svelte/icons/unlink";
   import AlertCircle from "@lucide/svelte/icons/alert-circle";
   import Key from "@lucide/svelte/icons/key";
+  import Gamepad2 from "@lucide/svelte/icons/gamepad-2";
   import Plus from "@lucide/svelte/icons/plus";
   import Trash2 from "@lucide/svelte/icons/trash-2";
   import Copy from "@lucide/svelte/icons/copy";
@@ -39,6 +40,57 @@
   let createdKey = $state<string | null>(null);
   let copied = $state(false);
   let deletingId = $state<number | null>(null);
+
+  // Minecraft Account management
+  let minecraftAccounts = $state<Array<{id: number, email: string, status: string, expires_at: string | null}>>([]);
+  let newMcEmail = $state("");
+  let newMcPassword = $state("");
+  let addingMcAccount = $state(false);
+  let deletingMcId = $state<number | null>(null);
+
+  async function loadMcAccounts() {
+    try {
+      const res = await fetchWithAuth("/api/minecraft-accounts");
+      minecraftAccounts = await res.json();
+    } catch (e) {
+      console.error("Failed to load Minecraft accounts:", e);
+    }
+  }
+
+  async function addMcAccount() {
+    if (!newMcEmail.trim()) return;
+    addingMcAccount = true;
+    try {
+      await fetchWithAuth("/api/minecraft-accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          email: newMcEmail.trim(),
+          password: newMcPassword.trim() || null
+        }),
+      });
+      newMcEmail = "";
+      newMcPassword = "";
+      await loadMcAccounts();
+    } catch (e) {
+      console.error("Failed to add Minecraft account:", e);
+    } finally {
+      addingMcAccount = false;
+    }
+  }
+
+  async function deleteMcAccount(id: number) {
+    if (!confirm("Remove this Minecraft account?")) return;
+    deletingMcId = id;
+    try {
+      await fetchWithAuth(`/api/minecraft-accounts/${id}`, { method: "DELETE" });
+      await loadMcAccounts();
+    } catch (e) {
+      console.error("Failed to delete Minecraft account:", e);
+    } finally {
+      deletingMcId = null;
+    }
+  }
 
   async function loadKeys() {
     try {
@@ -98,6 +150,7 @@
 
   onMount(() => {
     loadKeys();
+    loadMcAccounts();
   });
 </script>
 
@@ -256,6 +309,79 @@
         <p class="text-[10px] text-muted-foreground italic leading-normal">
           Use API keys with the <code class="bg-muted px-1 rounded">X-API-Key</code> header to access the NMCScan REST API from external tools.
           See the API documentation for available endpoints.
+        </p>
+      </div>
+    </Card.Content>
+  </Card.Root>
+
+  <!-- Minecraft Premium Accounts Section -->
+  <Card.Root>
+    <Card.Header>
+      <Card.Title class="flex items-center gap-2">
+        <Gamepad2 class="h-5 w-5 text-primary" />
+        Minecraft Premium Accounts
+      </Card.Title>
+      <Card.Description class="italic">Add accounts to verify whitelist status on premium servers</Card.Description>
+    </Card.Header>
+    <Card.Content class="space-y-4">
+      <!-- Create form -->
+      <div class="flex flex-col md:flex-row gap-2">
+        <Input placeholder="Microsoft Email" bind:value={newMcEmail} class="h-9" />
+        <Input type="password" placeholder="Password (Optional)" bind:value={newMcPassword} class="h-9" />
+        <Button onclick={addMcAccount} disabled={addingMcAccount || !newMcEmail.trim()} class="h-9 gap-2 shrink-0">
+          <Plus size={14} />
+          Add Account
+        </Button>
+      </div>
+
+      <!-- Accounts table -->
+      {#if minecraftAccounts.length > 0}
+        <div class="border rounded-md">
+          <Table.Root>
+            <Table.Header>
+              <Table.Row class="text-[10px] uppercase tracking-wider font-bold text-muted-foreground bg-muted/20 hover:bg-muted/20">
+                <Table.Head>Email</Table.Head>
+                <Table.Head>Status</Table.Head>
+                <Table.Head>Session Expires</Table.Head>
+                <Table.Head class="w-16"></Table.Head>
+              </Table.Row>
+            </Table.Header>
+            <Table.Body>
+              {#each minecraftAccounts as account (account.id)}
+                <Table.Row>
+                  <Table.Cell class="font-medium text-sm">{account.email}</Table.Cell>
+                  <Table.Cell>
+                    <Badge variant="outline" class="text-[10px] uppercase {account.status === 'active' ? 'text-emerald-500 border-emerald-500/20 bg-emerald-500/5' : 'text-orange-500'}">
+                      {account.status}
+                    </Badge>
+                  </Table.Cell>
+                  <Table.Cell class="text-xs text-muted-foreground">
+                    {account.expires_at ? formatDate(account.expires_at) : "N/A"}
+                  </Table.Cell>
+                  <Table.Cell>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      class="h-8 w-8 text-destructive hover:text-destructive hover:bg-destructive/10"
+                      onclick={() => deleteMcAccount(account.id)}
+                      disabled={deletingMcId === account.id}
+                    >
+                      <Trash2 size={14} />
+                    </Button>
+                  </Table.Cell>
+                </Table.Row>
+              {/each}
+            </Table.Body>
+          </Table.Root>
+        </div>
+      {:else}
+        <p class="text-sm text-muted-foreground italic text-center py-4 border border-dashed rounded-md">No Minecraft accounts added yet.</p>
+      {/if}
+
+      <div class="p-3 rounded-md bg-blue-500/5 border border-blue-500/20 flex gap-3 font-mono">
+        <AlertCircle class="w-4 h-4 text-blue-500 shrink-0 mt-0.5" />
+        <p class="text-[10px] text-blue-500 italic leading-normal">
+          Adding a premium account allows the scanner to attempt full authentication on online-mode servers to determine if you are whitelisted or banned.
         </p>
       </div>
     </Card.Content>

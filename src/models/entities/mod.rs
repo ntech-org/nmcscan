@@ -10,3 +10,4 @@ pub mod sessions;
 pub mod verification_token;
 pub mod asn_stats;
 pub mod api_keys;
+pub mod minecraft_accounts;

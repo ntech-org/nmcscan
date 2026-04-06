@@ -142,71 +142,42 @@ impl AsnManager {
         self.asns.get(asn)
     }
 
-    /// Categorize an ASN based on organization name.
-    /// SAFETY: This is the primary gatekeeper for the scanner.
-    pub fn categorize_by_org(org: &str) -> (AsnCategory, Vec<String>) {
+    /// Map an ipverse category string to an AsnCategory with a safety keyword override.
+    pub fn categorize_from_ipverse(org: &str, category: Option<&str>) -> AsnCategory {
         let org_lower = org.to_lowercase();
-        let mut tags = Vec::new();
-        let mut category = AsnCategory::Unknown;
-
+        
         // 1. CRITICAL SAFETY BLOCKLIST (Military, Gov, Edu, Infrastructure)
-        let blocked_keywords = [
-            ("military", "Defense"),
-            ("defense", "Defense"),
-            ("dod", "Defense"),
-            ("pentagon", "Defense"),
-            ("army", "Defense"),
-            ("navy", "Defense"),
-            ("air force", "Defense"),
-            ("marines", "Defense"),
-            ("national security", "Security"),
-            ("intelligence", "Intelligence"),
-            ("government", "Government"),
-            ("gov.", "Government"),
-            ("ministry", "Government"),
-            ("federal", "Government"),
-            ("police", "Law Enforcement"),
-            ("fbi", "Law Enforcement"),
-            ("cia", "Intelligence"),
-            ("nsa", "Intelligence"),
-            ("university", "Education"),
-            ("college", "Education"),
-            ("school", "Education"),
-            ("academy", "Education"),
-            ("hospital", "Healthcare"),
-            ("medical", "Healthcare"),
-            ("clinic", "Healthcare"),
-            ("nuclear", "Infrastructure"),
-            ("atomic", "Infrastructure"),
-            ("power plant", "Infrastructure"),
-            ("bank", "Financial"),
-            ("financial", "Financial"),
-            ("securities", "Financial"),
-            ("reserve", "Financial"),
+        // These keywords override any external categorization for safety.
+        let safety_keywords = [
+            "military", "defense", "dod", "pentagon", "army", "navy", "air force", "marines",
+            "national security", "intelligence", "government", "gov.", "ministry", "federal",
+            "police", "fbi", "cia", "nsa", "university", "college", "school", "academy",
+            "hospital", "medical", "clinic", "nuclear", "atomic", "power plant", "bank",
+            "financial", "securities", "reserve",
         ];
 
-        for (keyword, tag) in &blocked_keywords {
+        for keyword in &safety_keywords {
             if org_lower.contains(keyword) {
-                category = AsnCategory::Excluded;
-                tags.push(tag.to_string());
+                return AsnCategory::Excluded;
             }
         }
-        if category == AsnCategory::Excluded {
-            tags.dedup();
-            return (category, tags);
-        }
 
-        // 2. Capabilities & Technology Tags
+        // 2. Map ipverse category
+        match category {
+            Some("hosting") => AsnCategory::Hosting,
+            Some("isp") | Some("business") => AsnCategory::Residential,
+            Some("education_research") | Some("government_admin") => AsnCategory::Excluded,
+            _ => AsnCategory::Unknown,
+        }
+    }
+
+    /// Extract descriptive tags based on organization name.
+    pub fn extract_tags(org: &str) -> Vec<String> {
+        let org_lower = org.to_lowercase();
+        let mut tags = Vec::new();
+
         let ddos_keywords = [
-            "ddos",
-            "shield",
-            "protect",
-            "scrub",
-            "mitigation",
-            "voxility",
-            "path.net",
-            "stormwall",
-            "cloudefense",
+            "ddos", "shield", "protect", "scrub", "mitigation", "voxility", "path.net", "stormwall", "cloudefense",
         ];
         for k in &ddos_keywords {
             if org_lower.contains(k) {
@@ -216,16 +187,7 @@ impl AsnManager {
         }
 
         let cloud_keywords = [
-            "amazon",
-            "aws",
-            "google",
-            "microsoft",
-            "azure",
-            "cloud",
-            "compute",
-            "instance",
-            "stack",
-            "lambda",
+            "amazon", "aws", "google", "microsoft", "azure", "cloud", "compute", "instance", "stack", "lambda",
         ];
         for k in &cloud_keywords {
             if org_lower.contains(k) {
@@ -235,13 +197,7 @@ impl AsnManager {
         }
 
         let cdn_keywords = [
-            "cloudflare",
-            "akamai",
-            "fastly",
-            "cdn",
-            "edgecast",
-            "limelight",
-            "bunny",
+            "cloudflare", "akamai", "fastly", "cdn", "edgecast", "limelight", "bunny",
         ];
         for k in &cdn_keywords {
             if org_lower.contains(k) {
@@ -250,68 +206,8 @@ impl AsnManager {
             }
         }
 
-        // 3. Category Determination
-        let hosting_keywords = [
-            "hetzner", "ovh", "digitalocean", "linode", "vultr", "scaleway", "online.net", "leaseweb", 
-            "contabo", "ionos", "rackspace", "hosting", "datacenter", "server", "vps", "dedicated", 
-            "colo", "compute", "packet", "infrastructure", "liquid web", "choopa", "iart", "hostinger", 
-            "porkbun", "namecheap", "godaddy", "ovhcloud", "softlayer", "ibm cloud", "linode", "equinix",
-            "hostgator", "bluehost", "dreamhost", "siteground", "a2 hosting", "inmotion", "greengeeks",
-            "fastcomet", "hostpapa", "cloudways", "kamatera", "interserver", "tmdhosting", "hostwinds",
-            "shinjiru", "orange website", "vshosting", "coolhousing", "master dc", "casablanca",
-            "wedos", "forpsi", "active24", "gigaserver", "savana", "onebit", "banan", "station",
-            "webgarden", "endora", "pipni", "hukot", "hosting90", "ignum", "it7", "telepoint",
-            "evoluso", "fcomet", "hosterion", "hoster", "m247", "edis", "terrahost", "clouvider",
-            "i3d", "reliablesite", "psychz", "quadranet", "sharktech", "incero", "fdcservers",
-            "wholesale internet", "joesdatacenter", "swiftway", "cogent", "zscaler", "akamai",
-            "cloudflare", "fastly", "limelight", "stackpath", "highwinds", "edgecast", "cdnetworks",
-            "keycdn", "beluga", "bunny", "7-sky", "aeza", "firstvds", "justhost", "selectel",
-            "beget", "timeweb", "reg.ru", "nic.ru", "mchost", "ihc", "sprinthost", "ru-center",
-            "eurovps", "vpsserver", "vpsnet", "vpscheap", "vpsville", "vpsag", "vpsland",
-            "data center", "web services", "cloud solutions", "cloud services", "managed services",
-            "internet services", "network solutions", "hosting services", "server solutions",
-            "dedicated servers", "virtual servers", "cloud computing", "information technology",
-        ];
-
-        for keyword in &hosting_keywords {
-            if org_lower.contains(keyword) {
-                category = AsnCategory::Hosting;
-                tags.push("Hosting".to_string());
-                break;
-            }
-        }
-
-        let residential_keywords = [
-            "comcast", "verizon", "at&t", "spectrum", "cox", "telekom", "bt ", "orange", "kpn", 
-            "vodafone", "sky ", "t-mobile", "jcom", "ntt ", "telstra", "rogers", "bell", "broadband", 
-            "cable", "fiber", "isp", "residential", "consumer", "home", "dsl", "wireless", "mobile", 
-            "lte", "5g", "customer", "communications", "telecom", "t-home", "t-online", "t-systems",
-            "o2 ", "telefonica", "bouygues", "free sas", "iliad", "fastweb", "tiscali", "tele2",
-            "swisscom", "sunrise", "upc ", "virgin media", "talktalk", "zen internet", "plusnet",
-            "pccw", "hkt ", "starhub", "singtel", "m1 ", "globe telecom", "pldt", "viettel",
-            "fpt ", "vnpt", "chunghwa", "sk broadband", "kt corp", "lg uplus", "china telecom",
-            "china unicom", "china mobile", "reliance jio", "bharti airtel", "vodafone idea",
-            "tata communications", "mtn ", "airtel", "etisalat", "stc ", "zain", "mobily",
-            "beeline", "mts ", "megafon", "rostelecom", "netbynet", "er-telecom", "dom.ru",
-            "akado", "mgts", "vivo", "claro", "embratel", "oi ", "tim brasil", "telefonica brasil",
-            "movistar", "entel", "vtr ", "izzi", "totalplay", "megacable", "telmex", "starnet",
-            "citynet", "metronet", "fiberlink", "google fiber", "starlink", "spacex",
-            "internet service provider", "consumer broadband", "residential network",
-            "home internet", "mobile network", "wireless internet", "cable television",
-        ];
-
-        if category == AsnCategory::Unknown {
-            for keyword in &residential_keywords {
-                if org_lower.contains(keyword) {
-                    category = AsnCategory::Residential;
-                    tags.push("Residential".to_string());
-                    break;
-                }
-            }
-        }
-
         tags.dedup();
-        (category, tags)
+        tags
     }
 }
 
@@ -331,4 +227,37 @@ pub enum AsnError {
     AsnNotFound,
     #[error("HTTP error: {0}")]
     HttpError(#[from] reqwest::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_categorize_from_ipverse() {
+        assert_eq!(AsnManager::categorize_from_ipverse("Digital Ocean", Some("hosting")), AsnCategory::Hosting);
+        assert_eq!(AsnManager::categorize_from_ipverse("Comcast", Some("isp")), AsnCategory::Residential);
+        
+        // Safety keyword override tests
+        assert_eq!(AsnManager::categorize_from_ipverse("Department of Defense", Some("business")), AsnCategory::Excluded);
+        assert_eq!(AsnManager::categorize_from_ipverse("Harvard University", Some("education_research")), AsnCategory::Excluded);
+        assert_eq!(AsnManager::categorize_from_ipverse("US Air Force", None), AsnCategory::Excluded);
+        
+        // Regular categories
+        assert_eq!(AsnManager::categorize_from_ipverse("Normal Biz", Some("business")), AsnCategory::Residential);
+        assert_eq!(AsnManager::categorize_from_ipverse("Unknown Org", Some("unknown_cat")), AsnCategory::Unknown);
+        assert_eq!(AsnManager::categorize_from_ipverse("Nothing", None), AsnCategory::Unknown);
+    }
+
+    #[test]
+    fn test_extract_tags() {
+        let tags = AsnManager::extract_tags("Amazon Cloud Services");
+        assert_eq!(tags, vec!["Cloud"]);
+
+        let tags2 = AsnManager::extract_tags("Cloudflare CDN");
+        assert_eq!(tags2, vec!["Cloud", "CDN"]); // "Cloud" matches "cloud", "CDN" matches "cloudflare" and "cdn" (deduped)
+
+        let tags3 = AsnManager::extract_tags("Comcast");
+        assert!(tags3.is_empty());
+    }
 }

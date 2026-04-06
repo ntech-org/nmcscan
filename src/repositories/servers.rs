@@ -337,7 +337,8 @@ impl ServerRepository {
         asn_filter: Option<&str>,
         min_max_players: Option<i32>,
         max_max_players: Option<i32>,
-        flags_filter: Option<&str>,
+        flags_filter: Vec<String>,
+        login_obstacle_filter: Option<&str>,
     ) -> Result<Vec<servers::Model>, DbErr> {
         let mut query = servers::Entity::find()
             .filter(servers::Column::Status.ne("ignored"));
@@ -413,23 +414,24 @@ impl ServerRepository {
             query = query.filter(servers::Column::Brand.contains(b));
         }
 
-        // Flags filter: comma-separated flags, match each requested flag
-        if let Some(flags_str) = flags_filter {
-            for flag in flags_str.split(',') {
-                let flag = flag.trim();
-                if flag.is_empty() { continue; }
-                // Match flag surrounded by commas or at start/end of string
-                let p1 = format!(",{},", flag);
-                let p2 = format!("{},", flag);
-                let p3 = format!(",{}", flag);
-                query = query.filter(
-                    Condition::any()
-                        .add(servers::Column::Flags.like(&p1))
-                        .add(servers::Column::Flags.like(&p2))
-                        .add(servers::Column::Flags.like(&p3))
-                        .add(servers::Column::Flags.eq(flag))
-                );
-            }
+        if let Some(lo) = login_obstacle_filter {
+            query = query.filter(servers::Column::LoginObstacle.eq(lo));
+        }
+
+        // Flags filter
+        for flag in flags_filter {
+            let flag = flag.trim();
+            if flag.is_empty() { continue; }
+            let pattern = format!("%,{},%", flag);
+            let pattern_start = format!("{},%", flag);
+            let pattern_end = format!("%,{}", flag);
+            query = query.filter(
+                Condition::any()
+                    .add(servers::Column::Flags.like(&pattern))
+                    .add(servers::Column::Flags.like(&pattern_start))
+                    .add(servers::Column::Flags.like(&pattern_end))
+                    .add(servers::Column::Flags.eq(flag))
+            );
         }
 
         let order = match sort_order {

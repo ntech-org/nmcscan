@@ -47,6 +47,18 @@ use std::fs;
 use std::io::Read;
 use maxminddb::Reader;
 use flate2::read::GzDecoder;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+pub struct IpverseAsn {
+    pub asn: u32,
+    pub metadata: Option<IpverseMetadata>,
+}
+
+#[derive(Deserialize)]
+pub struct IpverseMetadata {
+    pub category: Option<String>,
+}
 
 /// Path where MaxMind databases are stored.
 const DB_DIR: &str = "data/maxmind";
@@ -55,6 +67,7 @@ const COUNTRY_DB_PATH: &str = "data/maxmind/GeoLite2-Country.mmdb";
 
 /// URL for full ASN database from iptoasn.com
 const FULL_ASN_URL: &str = "https://iptoasn.com/data/ip2asn-v4.tsv.gz";
+const IPVERSE_ASN_URL: &str = "https://raw.githubusercontent.com/ipverse/as-metadata/master/as.json";
 
 /// URLs for downloading the databases (using a public mirror or requires license key).
 /// Note: Standard GeoLite2 requires a license key now.
@@ -214,8 +227,29 @@ impl AsnFetcher {
         Ok(())
     }
 
+    pub async fn fetch_ipverse_map(&self) -> std::collections::HashMap<String, String> {
+        let mut ipverse_map = std::collections::HashMap::new();
+        if let Ok(ipverse_response) = self.client.get(IPVERSE_ASN_URL).send().await {
+            if ipverse_response.status().is_success() {
+                if let Ok(ipverse_asns) = ipverse_response.json::<Vec<IpverseAsn>>().await {
+                    for item in ipverse_asns {
+                        if let Some(meta) = item.metadata {
+                            if let Some(cat) = meta.category {
+                                ipverse_map.insert(format!("AS{}", item.asn), cat);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ipverse_map
+    }
+
     /// Import the full ASN database from iptoasn.com to discover all providers globally.
     pub async fn import_full_database(&self) -> Result<(), AsnError> {
+        tracing::info!("Downloading ASN categorization metadata from ipverse...");
+        let ipverse_map = self.fetch_ipverse_map().await;
+
         tracing::info!("Downloading full ASN database from iptoasn.com...");
         let response = self.client.get(FULL_ASN_URL).send().await?;
         if !response.status().is_success() {
@@ -265,7 +299,10 @@ impl AsnFetcher {
         // Prepare ASN models with categorization
         let mut asn_models: Vec<asns::ActiveModel> = Vec::with_capacity(asn_map.len());
         for (asn, (org, country, _)) in asn_map {
-            let (category, tags) = AsnManager::categorize_by_org(&org);
+            let tags = AsnManager::extract_tags(&org);
+            let category_str = ipverse_map.get(&asn).map(|s| s.as_str());
+            let category = AsnManager::categorize_from_ipverse(&org, category_str);
+            
             let tags_str = tags.join(",");
             let cat_str = match category {
                 AsnCategory::Hosting => "hosting",
@@ -330,13 +367,13 @@ impl AsnFetcher {
         tracing::info!("Global ASN discovery sync complete.");
         
         // After full import, run a re-categorization pass
-        let _ = self.recategorize_all_asns().await;
+        let _ = self.recategorize_all_asns(&ipverse_map).await;
         
         Ok(())
     }
 
     /// Run a throttled batch re-categorization of "Unknown" ASNs in the database.
-    pub async fn recategorize_all_asns(&self) -> Result<usize, AsnError> {
+    pub async fn recategorize_all_asns(&self, ipverse_map: &std::collections::HashMap<String, String>) -> Result<usize, AsnError> {
         tracing::info!("Recategorizing Unknown ASNs in database (throttled)...");
         
         let mut total_updated = 0;
@@ -364,7 +401,9 @@ impl AsnFetcher {
 
             for model in asns_models {
                 processed += 1;
-                let (category, tags) = AsnManager::categorize_by_org(&model.org);
+                let tags = AsnManager::extract_tags(&model.org);
+                let category_str = ipverse_map.get(&model.asn).map(|s| s.as_str());
+                let category = AsnManager::categorize_from_ipverse(&model.org, category_str);
                 
                 let mut active: asns::ActiveModel = model.into();
                 let mut changed = false;
@@ -446,7 +485,13 @@ impl AsnFetcher {
 
         let asn = asn_val.unwrap_or_else(|| "AS0".to_string());
         let org = org_val.unwrap_or_else(|| "Unknown".to_string());
-        let (category, tags) = AsnManager::categorize_by_org(&org);
+        
+        // Try to get category from in-memory manager if we already know it
+        let category = {
+            let manager = self.asn_manager.read().await;
+            manager.get_category(&asn)
+        };
+        let tags = AsnManager::extract_tags(&org);
 
         let record = AsnRecord {
             asn: asn.clone(),

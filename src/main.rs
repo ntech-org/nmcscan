@@ -26,7 +26,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use sea_orm::{Database, ConnectOptions, EntityTrait, QueryFilter, ColumnTrait, QuerySelect};
 use migration::Migrator;
 use sea_orm_migration::MigratorTrait;
-use crate::repositories::{ServerRepository, AsnRepository, StatsRepository, ApiKeyRepository};
+use crate::repositories::{ServerRepository, AsnRepository, StatsRepository, ApiKeyRepository, MinecraftAccountRepository};
 use crate::services::asn_fetcher::AsnFetcher;
 use crate::services::scheduler::{Scheduler, ServerTarget};
 use crate::services::login_queue::LoginQueue;
@@ -161,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let asn_repo = Arc::new(AsnRepository::new((*db).clone()));
     let stats_repo = Arc::new(StatsRepository::new((*db).clone()));
     let api_key_repo = Arc::new(ApiKeyRepository::new((*db).clone()));
+    let minecraft_account_repo = Arc::new(MinecraftAccountRepository::new((*db).clone()));
 
     // 3. Initialize ASN fetcher
     tracing::info!("Initializing ASN fetcher...");
@@ -189,7 +190,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("ASN data was updated within 7 days, skipping startup scrub.");
         } else {
             tracing::info!("Running startup ASN recategorization (no updates in > 7 days)...");
-            let _ = asn_fetcher.recategorize_all_asns().await;
+            let ipverse_map = asn_fetcher.fetch_ipverse_map().await;
+            let _ = asn_fetcher.recategorize_all_asns(&ipverse_map).await;
         }
     }
 
@@ -384,6 +386,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         asn_repo: Arc::clone(&asn_repo),
         stats_repo: Arc::clone(&stats_repo),
         api_key_repo: Arc::clone(&api_key_repo),
+        minecraft_account_repo: Arc::clone(&minecraft_account_repo),
         scheduler: Arc::clone(&scheduler),
         login_queue: Arc::clone(&login_queue),
         exclude_list: Arc::clone(&exclude_manager),

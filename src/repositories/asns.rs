@@ -131,32 +131,22 @@ impl AsnRepository {
     }
 
     pub async fn get_ranges_to_scan(&self, category: &str, limit: u64) -> Result<Vec<asn_ranges::Model>, DbErr> {
-        // Select ranges with productivity weighting, then randomize selection
-        // to ensure ALL ranges eventually get picked (not just the most productive).
+        // Select ranges with fair round-robin scheduling, then randomize selection.
         //
         // Strategy:
-        // 1. Inner query selects a pool (10x limit) ordered by productivity
-        // 2. Outer query randomly picks from that pool
-        // This means productive ranges appear in the pool more often, but
-        // the actual selection is randomized — preventing the same 100 ranges
-        // from being picked every cycle while 42K others sit untouched.
+        // 1. Inner query selects a pool (10x limit) ordered by last scanned time.
+        //    This ensures ALL ranges eventually get picked without starvation.
+        // 2. Outer query randomly picks from that pool.
+        // This means the scanner progresses through the entire category evenly,
+        // preventing large ASNs from monopolizing the queue.
         let pool_size = limit * 10;
         let sql = format!(r#"
             SELECT cidr, asn, scan_offset, last_scanned_at, scan_epoch FROM (
                 SELECT r.cidr, r.asn, r.scan_offset, r.last_scanned_at, r.scan_epoch
                 FROM asn_ranges r
                 JOIN asns a ON r.asn = a.asn
-                LEFT JOIN (
-                    SELECT asn, COUNT(*)::bigint as server_count
-                    FROM servers
-                    WHERE status = 'online'
-                    GROUP BY asn
-                ) sc ON r.asn = sc.asn
                 WHERE a.category = '{}'
                 ORDER BY
-                    CASE WHEN r.scan_epoch >= 3 AND COALESCE(sc.server_count, 0) = 0
-                         THEN 1 ELSE 0 END ASC,
-                    COALESCE(sc.server_count, 0) DESC,
                     r.last_scanned_at ASC NULLS FIRST,
                     r.scan_offset ASC
                 LIMIT {}

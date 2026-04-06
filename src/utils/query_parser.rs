@@ -2,7 +2,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 static DSL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:(brand|version|country|status|type|players|limit|category|asn):(?:"([^"]*)"|'([^']*)'|([^ ]+)))"#).unwrap()
+    Regex::new(r#"(?:(brand|version|country|status|type|players|limit|category|asn|login|flag):(?:"([^"]*)"|'([^']*)'|([^ ]+)))"#).unwrap()
 });
 
 pub struct ParsedQuery {
@@ -17,6 +17,8 @@ pub struct ParsedQuery {
     pub max_max_players: Option<i32>,
     pub asn_category: Option<String>,
     pub asn: Option<String>,
+    pub login: Option<String>,
+    pub flags: Vec<String>,
     pub free_text: Option<String>,
 }
 
@@ -32,6 +34,8 @@ pub fn parse(search: &str) -> ParsedQuery {
     let mut max_max_players = None;
     let mut asn_category = None;
     let mut asn = None;
+    let mut login = None;
+    let mut flags = Vec::new();
 
     let mut remaining = search.to_string();
 
@@ -65,6 +69,8 @@ pub fn parse(search: &str) -> ParsedQuery {
             }
             "category" => asn_category = Some(val),
             "asn" => asn = Some(val),
+            "login" => login = Some(val.to_lowercase()),
+            "flag" => flags.push(val.to_lowercase()),
             "players" => {
                 if let Some(stripped) = val.strip_prefix('>') {
                     if let Ok(n) = stripped.parse::<i32>() {
@@ -129,6 +135,8 @@ pub fn parse(search: &str) -> ParsedQuery {
         max_max_players,
         asn_category,
         asn,
+        login,
+        flags,
         free_text,
     }
 }

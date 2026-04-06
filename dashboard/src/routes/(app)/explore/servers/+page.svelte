@@ -52,6 +52,8 @@
     let parsedQuery = $state(urlParams.get("search") || "");
     let statusFilter = $state(urlParams.get("status") || "all");
     let serverTypeFilter = $state(urlParams.get("server_type") || "all");
+    let loginFilter = $state(urlParams.get("login") || "all");
+    let flagFilter = $state(urlParams.get("flags") || "");
     let brandFilter = $state(urlParams.get("brand") || "");
     let versionFilter = $state(urlParams.get("version") || "");
     let countryFilter = $state(urlParams.get("country") || "");
@@ -76,6 +78,12 @@
         if (countryFilter) parts.push(`country:${countryFilter}`);
         if (statusFilter !== "all") parts.push(`status:${statusFilter}`);
         if (serverTypeFilter !== "all") parts.push(`type:${serverTypeFilter}`);
+        if (loginFilter !== "all") parts.push(`login:${loginFilter}`);
+        if (flagFilter) {
+            flagFilter.split(",").forEach(f => {
+                if (f.trim()) parts.push(`flag:${f.trim()}`);
+            });
+        }
         if (asnCategory !== "all") parts.push(`category:${asnCategory}`);
         if (asnFilter) parts.push(`asn:${asnFilter}`);
         
@@ -111,7 +119,7 @@
     function parseSearchText() {
         isParsing = true;
         const text = rawSearchText;
-        const regex = /(?:(brand|version|country|status|type|players|limit|category|asn):(?:(["'])(.*?)\2|([^ ]+)))/gi;
+        const regex = /(?:(brand|version|country|status|type|players|limit|category|asn|login|flag):(?:(["'])(.*?)\2|([^ ]+)))/gi;
         let match;
         let remainingText = text;
 
@@ -120,6 +128,8 @@
         let newCountry = "";
         let newStatus = "all";
         let newType = "all";
+        let newLogin = "all";
+        let newFlags: string[] = [];
         let newMin = "";
         let newMax = "";
         let newMinMax = "";
@@ -139,6 +149,8 @@
             if (key === "country") newCountry = val.toUpperCase();
             if (key === "status") newStatus = ["all", "online", "offline"].includes(val.toLowerCase()) ? val.toLowerCase() : "all";
             if (key === "type") newType = ["all", "java", "bedrock"].includes(val.toLowerCase()) ? val.toLowerCase() : "all";
+            if (key === "login") newLogin = val.toLowerCase();
+            if (key === "flag") newFlags.push(val.toLowerCase());
             if (key === "category") newCat = val;
             if (key === "asn") newAsn = val;
             if (key === "players") {
@@ -172,6 +184,8 @@
         countryFilter = newCountry;
         statusFilter = newStatus;
         serverTypeFilter = newType;
+        loginFilter = newLogin;
+        flagFilter = newFlags.join(",");
         asnCategory = newCat;
         asnFilter = newAsn;
         minPlayers = newMin;
@@ -211,6 +225,8 @@
             if (versionFilter) params.set("version", versionFilter);
             if (countryFilter) params.set("country", countryFilter);
             if (serverTypeFilter !== "all") params.set("server_type", serverTypeFilter);
+            if (loginFilter !== "all") params.set("login", loginFilter);
+            if (flagFilter) params.set("flags", flagFilter);
             if (asnCategory !== "all") params.set("asn_category", asnCategory);
             if (asnFilter) params.set("asn", asnFilter);
             if (minPlayers !== "") params.set("min_players", minPlayers);
@@ -227,13 +243,18 @@
                     noScroll: true,
                     keepFocus: true,
                 });
-            }
-
-            if (append && servers.length > 0) {
+            } else if (servers.length > 0) {
                 const last = servers[servers.length - 1];
                 params.set("cursor_ip", last.ip);
                 if (sortBy === "players") params.set("cursor_players", last.players_online.toString());
                 if (sortBy === "last_seen" && last.last_seen) params.set("cursor_last_seen", last.last_seen);
+                
+                // Also update URL with cursor when loading more
+                goto(`?${params.toString()}`, {
+                    replaceState: true,
+                    noScroll: true,
+                    keepFocus: true,
+                });
             }
 
             const res = await fetchWithAuth(`/api/servers?${params.toString()}`);
@@ -332,6 +353,51 @@
                         <option value="java">Java (Standard)</option>
                         <option value="bedrock">Bedrock (MCPE)</option>
                     </select>
+                </div>
+
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-semibold uppercase text-muted-foreground/70 ml-1">Login Status</label>
+                    <select
+                        bind:value={loginFilter}
+                        onchange={buildSearchTextFromSidebar}
+                        class="w-full h-8 px-2 bg-background border rounded-md text-xs focus:ring-1 focus:ring-primary outline-none"
+                    >
+                        <option value="all">All (Untested)</option>
+                        <option value="success">Cracked (Success)</option>
+                        <option value="premium">Premium Only</option>
+                        <option value="whitelist">Whitelisted</option>
+                        <option value="banned">Banned</option>
+                        <option value="rejected">Rejected/Failed</option>
+                    </select>
+                </div>
+
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-semibold uppercase text-muted-foreground/70 ml-1">Quick Tags</label>
+                    <div class="flex flex-wrap gap-1.5">
+                        {#each ['active', 'modded', 'vanilla', 'cracked', 'premium'] as flag}
+                            <button
+                                type="button"
+                                onclick={() => {
+                                    let flags = flagFilter.split(',').filter(f => f.trim());
+                                    if (flags.includes(flag)) {
+                                        flags = flags.filter(f => f !== flag);
+                                    } else {
+                                        flags.push(flag);
+                                    }
+                                    flagFilter = flags.join(',');
+                                    buildSearchTextFromSidebar();
+                                }}
+                                class="px-2 py-0.5 rounded text-[10px] border transition-colors {flagFilter.split(',').includes(flag) ? 'bg-primary/10 border-primary text-primary font-bold' : 'bg-background hover:bg-muted text-muted-foreground'}"
+                            >
+                                {flag}
+                            </button>
+                        {/each}
+                    </div>
+                </div>
+
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-semibold uppercase text-muted-foreground/70 ml-1">All Flags (comma-separated)</label>
+                    <Input placeholder="e.g. active,vanilla" class="h-8 text-xs" bind:value={flagFilter} oninput={buildSearchTextFromSidebar} />
                 </div>
 
                 <Separator />

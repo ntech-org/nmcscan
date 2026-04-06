@@ -50,7 +50,7 @@
 </script>
 
 <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-    <Card.Root>
+    <Card.Root class="py-0">
         <Card.Header
             class="flex flex-row items-center justify-between space-y-0 pb-2"
         >
@@ -69,7 +69,7 @@
         </Card.Content>
     </Card.Root>
 
-    <Card.Root>
+    <Card.Root class="py-0">
         <Card.Header
             class="flex flex-row items-center justify-between space-y-0 pb-2"
         >
@@ -96,7 +96,7 @@
         </Card.Content>
     </Card.Root>
 
-    <Card.Root>
+    <Card.Root class="py-0">
         <Card.Header
             class="flex flex-row items-center justify-between space-y-0 pb-2"
         >
@@ -115,7 +115,7 @@
         </Card.Content>
     </Card.Root>
 
-    <Card.Root>
+    <Card.Root class="py-0">
         <Card.Header
             class="flex flex-row items-center justify-between space-y-0 pb-2"
         >
@@ -153,7 +153,9 @@
     <Card.Root class="col-span-3">
         <Card.Header>
             <Card.Title>Network Distribution</Card.Title>
-            <Card.Description class="italic">Provider vs Residential</Card.Description>
+            <Card.Description class="italic"
+                >Provider vs Residential</Card.Description
+            >
         </Card.Header>
         <Card.Content class="space-y-4">
             <div class="space-y-2">
