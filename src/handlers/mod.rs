@@ -619,7 +619,7 @@ fn enrich_server_response(
         .unwrap_or_default();
 
     ServerResponse {
-        ip: server.ip.to_string(),
+        ip: server.ip.ip().to_string(),
         port: server.port as i16,
         server_type: server.server_type,
         status: server.status,
@@ -709,7 +709,7 @@ async fn search_players(
         .unwrap_or_default()
         .into_iter()
         .map(|p| PlayerResponse {
-            ip: p.ip.to_string(),
+            ip: p.ip.ip().to_string(),
             port: p.port as i16,
             player_name: p.player_name,
             last_seen: p.last_seen,
