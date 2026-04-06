@@ -224,7 +224,7 @@ impl ServerRepository {
                     ..Default::default()
                 };
                 servers::Entity::update(server)
-                    .filter(servers::Column::Ip.eq(ip))
+                    .filter(servers::Column::Ip.eq(parse_ip(ip)))
                     .filter(servers::Column::Port.eq(port))
                     .exec(&self.db)
                     .await?;
@@ -588,7 +588,7 @@ impl ServerRepository {
         port: i16,
     ) -> Result<Vec<server_players::Model>, DbErr> {
         server_players::Entity::find()
-            .filter(server_players::Column::Ip.eq(ip))
+            .filter(server_players::Column::Ip.eq(parse_ip(ip)))
             .filter(server_players::Column::Port.eq(port))
             .order_by_desc(server_players::Column::LastSeen)
             .limit(100)
@@ -603,7 +603,7 @@ impl ServerRepository {
         limit: u64,
     ) -> Result<Vec<server_history::Model>, DbErr> {
         server_history::Entity::find()
-            .filter(server_history::Column::Ip.eq(ip))
+            .filter(server_history::Column::Ip.eq(parse_ip(ip)))
             .filter(server_history::Column::Port.eq(port))
             .order_by_desc(server_history::Column::Timestamp)
             .limit(limit)
@@ -714,7 +714,7 @@ impl ServerRepository {
     ) -> Result<(), DbErr> {
         // Check current count
         let count = server_history::Entity::find()
-            .filter(server_history::Column::Ip.eq(ip))
+            .filter(server_history::Column::Ip.eq(parse_ip(ip)))
             .filter(server_history::Column::Port.eq(port))
             .count(txn)
             .await?;
@@ -723,7 +723,7 @@ impl ServerRepository {
         if count >= MAX_HISTORY_ENTRIES {
             let excess = count - MAX_HISTORY_ENTRIES + 1;
             let oldest: Vec<server_history::Model> = server_history::Entity::find()
-                .filter(server_history::Column::Ip.eq(ip))
+                .filter(server_history::Column::Ip.eq(parse_ip(ip)))
                 .filter(server_history::Column::Port.eq(port))
                 .order_by_asc(server_history::Column::Timestamp)
                 .limit(excess)
@@ -774,7 +774,7 @@ impl ServerRepository {
             ..Default::default()
         };
         servers::Entity::update(server)
-            .filter(servers::Column::Ip.eq(ip))
+            .filter(servers::Column::Ip.eq(parse_ip(ip)))
             .filter(servers::Column::Port.eq(port))
             .exec(&self.db)
             .await?;
