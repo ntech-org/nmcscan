@@ -15,25 +15,27 @@
 //! - **Cold**: Residential IPs, high-failure servers - ran 1-2 times/month
 
 mod handlers;
-mod services;
 mod models;
-pub mod repositories;
 mod network;
+pub mod repositories;
+mod services;
 mod utils;
 
-use std::sync::Arc;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use sea_orm::{Database, ConnectOptions, EntityTrait, QueryFilter, ColumnTrait, QuerySelect};
-use migration::Migrator;
-use sea_orm_migration::MigratorTrait;
-use crate::repositories::{ServerRepository, AsnRepository, StatsRepository, ApiKeyRepository, MinecraftAccountRepository};
-use crate::services::asn_fetcher::AsnFetcher;
-use crate::services::scheduler::{Scheduler, ServerTarget};
-use crate::services::login_queue::LoginQueue;
+use crate::models::asn::AsnCategory;
 use crate::network::scanner::Scanner;
+use crate::repositories::{
+    ApiKeyRepository, AsnRepository, MinecraftAccountRepository, ServerRepository, StatsRepository,
+};
+use crate::services::asn_fetcher::AsnFetcher;
+use crate::services::login_queue::LoginQueue;
+use crate::services::scheduler::{Scheduler, ServerTarget};
 use crate::utils::exclude::{ExcludeList, ExcludeManager};
 use crate::utils::test_mode;
-use crate::models::asn::AsnCategory;
+use migration::Migrator;
+use sea_orm::{ColumnTrait, ConnectOptions, Database, EntityTrait, QueryFilter, QuerySelect};
+use sea_orm_migration::MigratorTrait;
+use std::sync::Arc;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use clap::Parser;
 
@@ -78,7 +80,12 @@ struct Args {
     discord_link: Option<String>,
 
     /// PostgreSQL database URL
-    #[arg(short, long, env = "DATABASE_URL", default_value = "postgres://nmcscan:nmcscan_secret@localhost:5432/nmcscan")]
+    #[arg(
+        short,
+        long,
+        env = "DATABASE_URL",
+        default_value = "postgres://nmcscan:nmcscan_secret@localhost:5432/nmcscan"
+    )]
     database: String,
 
     /// Path to exclude.conf file
@@ -110,7 +117,7 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env file
     let _ = dotenvy::dotenv();
-    
+
     let args = Args::parse();
 
     // Initialize tracing
@@ -122,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     tracing::info!("🎮 Starting NMCScan...");
-    
+
     if args.test_mode || args.quick_test {
         tracing::info!("🧪 TEST MODE ENABLED - Only scanning known servers");
         if args.quick_test {
@@ -132,30 +139,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Load exclude list
     tracing::info!("Loading exclude list from {}...", args.exclude_file);
-    let exclude_list = ExcludeList::from_file(&args.exclude_file)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Could not load {}: {}", args.exclude_file, e);
-            tracing::warn!("Using empty exclude list - BE CAREFUL!");
-            ExcludeList::from_str("").unwrap()
-        });
+    let exclude_list = ExcludeList::from_file(&args.exclude_file).unwrap_or_else(|e| {
+        tracing::warn!("Could not load {}: {}", args.exclude_file, e);
+        tracing::warn!("Using empty exclude list - BE CAREFUL!");
+        ExcludeList::from_str("").unwrap()
+    });
     tracing::info!("Loaded {} exclude networks", exclude_list.len());
 
     // 2. Initialize database
     tracing::info!("Initializing database at {}...", args.database);
     let mut opt = ConnectOptions::new(&args.database);
     opt.max_connections(100)
-       .acquire_timeout(std::time::Duration::from_secs(30))
-       .sqlx_logging(false);
-    
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .sqlx_logging(false);
+
     let db = Database::connect(opt).await?;
-    
+
     // Run migrations
     tracing::info!("Running migrations...");
     Migrator::up(&db, None).await?;
     tracing::info!("Migrations applied successfully.");
-    
+
     let db = Arc::new(db);
-    
+
     // Initialize repositories
     let server_repo = Arc::new(ServerRepository::new((*db).clone()));
     let asn_repo = Arc::new(AsnRepository::new((*db).clone()));
@@ -167,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Initializing ASN fetcher...");
     let asn_fetcher = Arc::new(AsnFetcher::new(Arc::clone(&db), Arc::clone(&asn_repo)));
     asn_fetcher.initialize().await?;
-    
+
     // STARTUP SCRUB: Recategorize "unknown" ASNs with latest heuristics.
     // Only runs if no ASN (any category) was updated in the last 7 days,
     // OR if there's a high percentage of unknown ASNs (> 50%).
@@ -176,13 +182,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // startup scrub is just a safety net for when the weekly import hasn't run.
     // The timer persists across restarts via the last_updated column in asns.
     {
-        use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, QuerySelect, PaginatorTrait};
-        
+        use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect};
+
         // Check if any ASN was recently updated
         let any_recent = crate::models::entities::asns::Entity::find()
             .filter(
                 crate::models::entities::asns::Column::LastUpdated
-                    .gt(chrono::Utc::now() - chrono::Duration::days(7))
+                    .gt(chrono::Utc::now() - chrono::Duration::days(7)),
             )
             .limit(1)
             .one(&*db)
@@ -195,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .count(&*db)
             .await
             .unwrap_or(0);
-        
+
         let total_count = crate::models::entities::asns::Entity::find()
             .count(&*db)
             .await
@@ -226,13 +232,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     unknown_percentage
                 );
             }
-            
+
             let ipverse_map = asn_fetcher.fetch_ipverse_map().await;
-            tracing::info!("Fetched ipverse category map with {} entries", ipverse_map.len());
-            
+            tracing::info!(
+                "Fetched ipverse category map with {} entries",
+                ipverse_map.len()
+            );
+
             match asn_fetcher.recategorize_all_asns(&ipverse_map).await {
                 Ok(updated) => {
-                    tracing::info!("Startup recategorization complete: {} ASNs reclassified", updated);
+                    tracing::info!(
+                        "Startup recategorization complete: {} ASNs reclassified",
+                        updated
+                    );
                 }
                 Err(e) => {
                     tracing::error!("Startup recategorization failed: {}", e);
@@ -254,8 +266,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let range_count = asn_fetcher.asn_manager().read().await.range_count();
     let asn_count = asn_fetcher.asn_manager().read().await.asn_count();
     if asn_count < 100 || range_count < 100 || args.force_asn_import {
-        tracing::info!("Running full ASN database import (ASNs: {}, ranges: {}, forced: {})...",
-            asn_count, range_count, args.force_asn_import);
+        tracing::info!(
+            "Running full ASN database import (ASNs: {}, ranges: {}, forced: {})...",
+            asn_count,
+            range_count,
+            args.force_asn_import
+        );
         match asn_fetcher.import_full_database().await {
             Ok(()) => tracing::info!("Full ASN import completed successfully."),
             Err(e) => tracing::error!("Full ASN import failed: {}", e),
@@ -267,12 +283,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let db_clone = Arc::clone(&db);
         let asn_clone = Arc::clone(&asn_fetcher);
         tokio::spawn(async move {
-            let servers_res: Result<Vec<models::entities::servers::Model>, sea_orm::DbErr> = models::entities::servers::Entity::find()
-                .filter(models::entities::servers::Column::Asn.is_null())
-                .filter(models::entities::servers::Column::Status.ne("ignored"))
-                .limit(5000)
-                .all(&*db_clone)
-                .await;
+            let servers_res: Result<Vec<models::entities::servers::Model>, sea_orm::DbErr> =
+                models::entities::servers::Entity::find()
+                    .filter(models::entities::servers::Column::Asn.is_null())
+                    .filter(models::entities::servers::Column::Status.ne("ignored"))
+                    .limit(5000)
+                    .all(&*db_clone)
+                    .await;
             if let Ok(servers) = servers_res {
                 if !servers.is_empty() {
                     tracing::info!("Backfilling ASN data for {} servers...", servers.len());
@@ -287,7 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Create scanner and scheduler
     let exclude_manager = Arc::new(ExcludeManager::new(&args.exclude_file));
-    
+
     let scanner = Scanner::new(
         Arc::clone(&exclude_manager),
         Arc::clone(&asn_fetcher),
@@ -315,26 +332,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_servers: args.test_max_servers,
                 scan_interval: args.test_interval,
                 regions: vec![],
-            }.get_test_servers()
+            }
+            .get_test_servers()
         };
 
         tracing::info!("Loading {} test servers...", test_servers.len());
         for (ip, port, name, host) in &test_servers {
-            let server_type = if *port == 19132 { "bedrock".to_string() } else { "java".to_string() };
+            let server_type = if *port == 19132 {
+                "bedrock".to_string()
+            } else {
+                "java".to_string()
+            };
             let mut target = ServerTarget::new(ip.clone(), *port, server_type.clone());
             target.category = AsnCategory::Hosting;
             target.priority = 1; // Hot priority for test servers
             target.hostname = Some(host.clone());
 
             let port_i16: i16 = (*port).try_into().unwrap_or(25565);
-            let _ = server_repo.insert_server_if_new(ip, port_i16, &server_type).await;
-            
+            let _ = server_repo
+                .insert_server_if_new(ip, port_i16, &server_type)
+                .await;
+
             scheduler.add_server(target, false).await;
-            tracing::debug!("  Added test server: {} ({}:{} as {})", name, ip, port, host);
+            tracing::debug!(
+                "  Added test server: {} ({}:{} as {})",
+                name,
+                ip,
+                port,
+                host
+            );
         }
         tracing::info!("✅ Loaded {} test servers", test_servers.len());
     } else {
-        // Production mode: load from database. 
+        // Production mode: load from database.
         // Discovery will dynamically fill queues from ASN ranges.
         scheduler.load_from_database().await.unwrap_or_else(|e| {
             tracing::warn!("Failed to load servers from database: {}", e);
@@ -350,7 +380,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (h, w, c, d) = scheduler.get_queue_sizes().await;
     tracing::info!(
         "Scheduler initialized with queues: Hot={}, Warm={}, Cold={}, Discovery={}",
-        h, w, c, d
+        h,
+        w,
+        c,
+        d
     );
 
     let scheduler = Arc::new(scheduler);
@@ -362,7 +395,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scanner = Arc::clone(&scanner);
         let stats_repo = Arc::clone(&stats_repo);
         let server_repo_clone = Arc::clone(&server_repo);
-        
+
         // Background filler task
         // Background filler task: alternates between discovery and rescan.
         // Every 3rd tick (15s): heavy discovery (warm + cold ASN ranges).
@@ -389,7 +422,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         tokio::spawn(async move {
-            run_scanner_loop(scanner, scheduler, stats_repo, server_repo_clone, args.target_concurrency).await;
+            run_scanner_loop(
+                scanner,
+                scheduler,
+                stats_repo,
+                server_repo_clone,
+                args.target_concurrency,
+            )
+            .await;
         })
     };
 
@@ -407,7 +447,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             // Give it an initial delay so it doesn't run right at startup
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            
+
             // Initial refresh
             if let Err(e) = stats_repo_ref.refresh_materialized_views().await {
                 tracing::error!("Failed initial refresh of materialized views: {}", e);
@@ -470,13 +510,16 @@ async fn run_scanner_loop(
     server_repo: Arc<ServerRepository>,
     max_concurrency: u32,
 ) {
-    tracing::info!("Scanner loop started (max concurrency: {})", max_concurrency);
+    tracing::info!(
+        "Scanner loop started (max concurrency: {})",
+        max_concurrency
+    );
 
     let hot_count = Arc::new(AtomicU32::new(0));
     let warm_count = Arc::new(AtomicU32::new(0));
     let cold_count = Arc::new(AtomicU32::new(0));
     let active_tasks = Arc::new(AtomicU32::new(0));
-    
+
     // In-memory stats buffer to avoid DB write storm
     let hot_buffer = Arc::new(AtomicU32::new(0));
     let warm_buffer = Arc::new(AtomicU32::new(0));
@@ -487,9 +530,10 @@ async fn run_scanner_loop(
     let mut stats_flush_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
     // Result batching system
-    let (result_tx, mut result_rx) = mpsc::channel::<crate::network::ScanResult>(max_concurrency as usize * 2);
+    let (result_tx, mut result_rx) =
+        mpsc::channel::<crate::network::ScanResult>(max_concurrency as usize * 2);
     let server_repo_clone = Arc::clone(&server_repo);
-    
+
     // Background task for batching DB writes
     tokio::spawn(async move {
         let mut buffer = Vec::with_capacity(100);
@@ -525,10 +569,10 @@ async fn run_scanner_loop(
             _ = status_interval.tick() => {
                 let (h, w, c, d) = scheduler.get_queue_sizes().await;
                 tracing::info!("Queue sizes: Hot={}, Warm={}, Cold={}, Discovery={}", h, w, c, d);
-                tracing::info!("Status: Active Tasks={}, Scans today: Hot={}, Warm={}, Cold={}", 
+                tracing::info!("Status: Active Tasks={}, Scans today: Hot={}, Warm={}, Cold={}",
                     active_tasks.load(Ordering::Relaxed),
-                    hot_count.load(Ordering::Relaxed), 
-                    warm_count.load(Ordering::Relaxed), 
+                    hot_count.load(Ordering::Relaxed),
+                    warm_count.load(Ordering::Relaxed),
                     cold_count.load(Ordering::Relaxed));
             }
             _ = stats_flush_interval.tick() => {
@@ -537,7 +581,7 @@ async fn run_scanner_loop(
                 let w = warm_buffer.swap(0, Ordering::SeqCst);
                 let c = cold_buffer.swap(0, Ordering::SeqCst);
                 let d = discoveries_buffer.swap(0, Ordering::SeqCst);
-                
+
                 if h > 0 || w > 0 || c > 0 || d > 0 {
                     let _ = stats_repo.increment_batch_stats(h as i32, w as i32, c as i32, d as i32).await;
                 }
@@ -557,7 +601,7 @@ async fn run_scanner_loop(
                     let warm_count = Arc::clone(&warm_count);
                     let cold_count = Arc::clone(&cold_count);
                     let active_tasks_clone = Arc::clone(&active_tasks);
-                    
+
                     let hot_buffer = Arc::clone(&hot_buffer);
                     let warm_buffer = Arc::clone(&warm_buffer);
                     let cold_buffer = Arc::clone(&cold_buffer);
@@ -565,10 +609,10 @@ async fn run_scanner_loop(
                     let result_tx = result_tx.clone();
 
                     active_tasks.fetch_add(1, Ordering::SeqCst);
-                    
+
                     tokio::spawn(async move {
                         let priority = server.priority;
-                        
+
                         // Check if it's a brand new discovery target (never scanned)
                         let is_discovery = server.last_scanned.is_none();
 
@@ -603,7 +647,7 @@ async fn run_scanner_loop(
                         if was_online && is_discovery {
                             discoveries_buffer.fetch_add(1, Ordering::Relaxed);
                         }
-                        
+
                         active_tasks_clone.fetch_sub(1, Ordering::SeqCst);
                     });
                 } else {

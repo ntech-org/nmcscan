@@ -145,15 +145,42 @@ impl AsnManager {
     /// Map an ipverse category string to an AsnCategory with a safety keyword override.
     pub fn categorize_from_ipverse(org: &str, category: Option<&str>) -> AsnCategory {
         let org_lower = org.to_lowercase();
-        
+
         // 1. CRITICAL SAFETY BLOCKLIST (Military, Gov, Edu, Infrastructure)
         // These keywords override any external categorization for safety.
         let safety_keywords = [
-            "military", "defense", "dod", "pentagon", "army", "navy", "air force", "marines",
-            "national security", "intelligence", "government", "gov.", "ministry", "federal",
-            "police", "fbi", "cia", "nsa", "university", "college", "school", "academy",
-            "hospital", "medical", "clinic", "nuclear", "atomic", "power plant", "bank",
-            "financial", "securities", "reserve",
+            "military",
+            "defense",
+            "dod",
+            "pentagon",
+            "army",
+            "navy",
+            "air force",
+            "marines",
+            "national security",
+            "intelligence",
+            "government",
+            "gov.",
+            "ministry",
+            "federal",
+            "police",
+            "fbi",
+            "cia",
+            "nsa",
+            "university",
+            "college",
+            "school",
+            "academy",
+            "hospital",
+            "medical",
+            "clinic",
+            "nuclear",
+            "atomic",
+            "power plant",
+            "bank",
+            "financial",
+            "securities",
+            "reserve",
         ];
 
         for keyword in &safety_keywords {
@@ -177,7 +204,15 @@ impl AsnManager {
         let mut tags = Vec::new();
 
         let ddos_keywords = [
-            "ddos", "shield", "protect", "scrub", "mitigation", "voxility", "path.net", "stormwall", "cloudefense",
+            "ddos",
+            "shield",
+            "protect",
+            "scrub",
+            "mitigation",
+            "voxility",
+            "path.net",
+            "stormwall",
+            "cloudefense",
         ];
         for k in &ddos_keywords {
             if org_lower.contains(k) {
@@ -187,7 +222,16 @@ impl AsnManager {
         }
 
         let cloud_keywords = [
-            "amazon", "aws", "google", "microsoft", "azure", "cloud", "compute", "instance", "stack", "lambda",
+            "amazon",
+            "aws",
+            "google",
+            "microsoft",
+            "azure",
+            "cloud",
+            "compute",
+            "instance",
+            "stack",
+            "lambda",
         ];
         for k in &cloud_keywords {
             if org_lower.contains(k) {
@@ -197,7 +241,13 @@ impl AsnManager {
         }
 
         let cdn_keywords = [
-            "cloudflare", "akamai", "fastly", "cdn", "edgecast", "limelight", "bunny",
+            "cloudflare",
+            "akamai",
+            "fastly",
+            "cdn",
+            "edgecast",
+            "limelight",
+            "bunny",
         ];
         for k in &cdn_keywords {
             if org_lower.contains(k) {
@@ -235,18 +285,42 @@ mod tests {
 
     #[test]
     fn test_categorize_from_ipverse() {
-        assert_eq!(AsnManager::categorize_from_ipverse("Digital Ocean", Some("hosting")), AsnCategory::Hosting);
-        assert_eq!(AsnManager::categorize_from_ipverse("Comcast", Some("isp")), AsnCategory::Residential);
-        
+        assert_eq!(
+            AsnManager::categorize_from_ipverse("Digital Ocean", Some("hosting")),
+            AsnCategory::Hosting
+        );
+        assert_eq!(
+            AsnManager::categorize_from_ipverse("Comcast", Some("isp")),
+            AsnCategory::Residential
+        );
+
         // Safety keyword override tests
-        assert_eq!(AsnManager::categorize_from_ipverse("Department of Defense", Some("business")), AsnCategory::Excluded);
-        assert_eq!(AsnManager::categorize_from_ipverse("Harvard University", Some("education_research")), AsnCategory::Excluded);
-        assert_eq!(AsnManager::categorize_from_ipverse("US Air Force", None), AsnCategory::Excluded);
-        
+        assert_eq!(
+            AsnManager::categorize_from_ipverse("Department of Defense", Some("business")),
+            AsnCategory::Excluded
+        );
+        assert_eq!(
+            AsnManager::categorize_from_ipverse("Harvard University", Some("education_research")),
+            AsnCategory::Excluded
+        );
+        assert_eq!(
+            AsnManager::categorize_from_ipverse("US Air Force", None),
+            AsnCategory::Excluded
+        );
+
         // Regular categories
-        assert_eq!(AsnManager::categorize_from_ipverse("Normal Biz", Some("business")), AsnCategory::Residential);
-        assert_eq!(AsnManager::categorize_from_ipverse("Unknown Org", Some("unknown_cat")), AsnCategory::Unknown);
-        assert_eq!(AsnManager::categorize_from_ipverse("Nothing", None), AsnCategory::Unknown);
+        assert_eq!(
+            AsnManager::categorize_from_ipverse("Normal Biz", Some("business")),
+            AsnCategory::Residential
+        );
+        assert_eq!(
+            AsnManager::categorize_from_ipverse("Unknown Org", Some("unknown_cat")),
+            AsnCategory::Unknown
+        );
+        assert_eq!(
+            AsnManager::categorize_from_ipverse("Nothing", None),
+            AsnCategory::Unknown
+        );
     }
 
     #[test]

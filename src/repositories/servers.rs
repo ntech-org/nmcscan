@@ -1,7 +1,7 @@
-use sea_orm::*;
-use sea_orm::sea_query::Expr;
-use crate::models::entities::{servers, server_players, server_history};
+use crate::models::entities::{server_history, server_players, servers};
 use chrono::{NaiveDateTime, Utc};
+use sea_orm::sea_query::Expr;
+use sea_orm::*;
 
 const MAX_HISTORY_ENTRIES: u64 = 500;
 const MAX_FAVICON_SIZE: usize = 2048; // Truncate favicons larger than 2KB
@@ -22,7 +22,10 @@ impl ServerRepository {
             .await
     }
 
-    pub async fn upsert_server(&self, model: servers::ActiveModel) -> Result<servers::Model, DbErr> {
+    pub async fn upsert_server(
+        &self,
+        model: servers::ActiveModel,
+    ) -> Result<servers::Model, DbErr> {
         servers::Entity::insert(model)
             .on_conflict(
                 sea_query::OnConflict::columns([servers::Column::Ip, servers::Column::Port])
@@ -40,8 +43,14 @@ impl ServerRepository {
                         servers::Column::Asn,
                         servers::Column::Country,
                     ])
-                    .value(servers::Column::Favicon, Expr::cust("COALESCE(excluded.favicon, servers.favicon)"))
-                    .value(servers::Column::Brand, Expr::cust("COALESCE(excluded.brand, servers.brand)"))
+                    .value(
+                        servers::Column::Favicon,
+                        Expr::cust("COALESCE(excluded.favicon, servers.favicon)"),
+                    )
+                    .value(
+                        servers::Column::Brand,
+                        Expr::cust("COALESCE(excluded.brand, servers.brand)"),
+                    )
                     .to_owned(),
             )
             .exec_with_returning(&self.db)
@@ -120,17 +129,30 @@ impl ServerRepository {
                     .value(servers::Column::Priority, 1)
                     .value(servers::Column::LastSeen, Expr::cust("CURRENT_TIMESTAMP"))
                     .value(servers::Column::ConsecutiveFailures, 0)
-                    .value(servers::Column::Asn, Expr::cust("COALESCE(servers.asn, excluded.asn)"))
-                    .value(servers::Column::Country, Expr::cust("COALESCE(servers.country, excluded.country)"))
-                    .value(servers::Column::Favicon, Expr::cust("COALESCE(excluded.favicon, servers.favicon)"))
-                    .value(servers::Column::Brand, Expr::cust("COALESCE(excluded.brand, servers.brand)"))
+                    .value(
+                        servers::Column::Asn,
+                        Expr::cust("COALESCE(servers.asn, excluded.asn)"),
+                    )
+                    .value(
+                        servers::Column::Country,
+                        Expr::cust("COALESCE(servers.country, excluded.country)"),
+                    )
+                    .value(
+                        servers::Column::Favicon,
+                        Expr::cust("COALESCE(excluded.favicon, servers.favicon)"),
+                    )
+                    .value(
+                        servers::Column::Brand,
+                        Expr::cust("COALESCE(excluded.brand, servers.brand)"),
+                    )
                     .to_owned(),
             )
             .exec(&txn)
             .await?;
 
         // History (capped)
-        self.insert_history_capped(&txn, ip, port, Utc::now().naive_utc(), players_online).await?;
+        self.insert_history_capped(&txn, ip, port, Utc::now().naive_utc(), players_online)
+            .await?;
 
         // Players
         if let Some(sample) = players_sample {
@@ -147,9 +169,16 @@ impl ServerRepository {
                     };
                     server_players::Entity::insert(p_model)
                         .on_conflict(
-                            sea_query::OnConflict::columns([server_players::Column::Ip, server_players::Column::Port, server_players::Column::PlayerName])
-                                .update_columns([server_players::Column::PlayerUuid, server_players::Column::LastSeen])
-                                .to_owned()
+                            sea_query::OnConflict::columns([
+                                server_players::Column::Ip,
+                                server_players::Column::Port,
+                                server_players::Column::PlayerName,
+                            ])
+                            .update_columns([
+                                server_players::Column::PlayerUuid,
+                                server_players::Column::LastSeen,
+                            ])
+                            .to_owned(),
                         )
                         .exec(&txn)
                         .await?;
@@ -197,7 +226,12 @@ impl ServerRepository {
         Ok(())
     }
 
-    pub async fn insert_server_if_new(&self, ip: &str, port: i16, server_type: &str) -> Result<(), DbErr> {
+    pub async fn insert_server_if_new(
+        &self,
+        ip: &str,
+        port: i16,
+        server_type: &str,
+    ) -> Result<(), DbErr> {
         let server = servers::ActiveModel {
             ip: Set(ip.to_string()),
             port: Set(port),
@@ -208,14 +242,17 @@ impl ServerRepository {
             .on_conflict(
                 sea_query::OnConflict::columns([servers::Column::Ip, servers::Column::Port])
                     .do_nothing()
-                    .to_owned()
+                    .to_owned(),
             )
             .exec(&self.db)
             .await?;
         Ok(())
     }
 
-    pub async fn batch_update_results(&self, results: Vec<crate::network::ScanResult>) -> Result<(), DbErr> {
+    pub async fn batch_update_results(
+        &self,
+        results: Vec<crate::network::ScanResult>,
+    ) -> Result<(), DbErr> {
         if results.is_empty() {
             return Ok(());
         }
@@ -237,7 +274,11 @@ impl ServerRepository {
                         am.status = Set("offline".to_string());
                         am.consecutive_failures = Set(failures);
                         am.last_seen = Set(Some(res.timestamp));
-                        am.priority = Set(if failures >= 5 { 3 } else { am.priority.unwrap() });
+                        am.priority = Set(if failures >= 5 {
+                            3
+                        } else {
+                            am.priority.unwrap()
+                        });
                         am.update(&txn).await?;
                     }
                 }
@@ -282,13 +323,20 @@ impl ServerRepository {
                             servers::Column::Asn,
                             servers::Column::Country,
                         ])
-                        .to_owned()
+                        .to_owned(),
                 )
                 .exec(&txn)
                 .await?;
 
             // Insert into history (capped to prevent unbounded growth)
-            self.insert_history_capped(&txn, &res.ip, res.port.try_into().unwrap(), res.timestamp, res.players_online).await?;
+            self.insert_history_capped(
+                &txn,
+                &res.ip,
+                res.port.try_into().unwrap(),
+                res.timestamp,
+                res.players_online,
+            )
+            .await?;
 
             // Update players
             if let Some(samples) = res.players_sample {
@@ -303,9 +351,16 @@ impl ServerRepository {
                     };
                     server_players::Entity::insert(p_model)
                         .on_conflict(
-                            sea_query::OnConflict::columns([server_players::Column::Ip, server_players::Column::Port, server_players::Column::PlayerName])
-                                .update_columns([server_players::Column::PlayerUuid, server_players::Column::LastSeen])
-                                .to_owned()
+                            sea_query::OnConflict::columns([
+                                server_players::Column::Ip,
+                                server_players::Column::Port,
+                                server_players::Column::PlayerName,
+                            ])
+                            .update_columns([
+                                server_players::Column::PlayerUuid,
+                                server_players::Column::LastSeen,
+                            ])
+                            .to_owned(),
                         )
                         .exec(&txn)
                         .await?;
@@ -341,8 +396,7 @@ impl ServerRepository {
         flags_filter: Vec<String>,
         login_obstacle_filter: Option<&str>,
     ) -> Result<Vec<servers::Model>, DbErr> {
-        let mut query = servers::Entity::find()
-            .filter(servers::Column::Status.ne("ignored"));
+        let mut query = servers::Entity::find().filter(servers::Column::Status.ne("ignored"));
 
         if let Some(status) = status_filter {
             if status != "all" {
@@ -361,7 +415,7 @@ impl ServerRepository {
                 Condition::any()
                     .add(servers::Column::Ip.contains(search))
                     .add(servers::Column::Motd.contains(search))
-                    .add(servers::Column::Version.contains(search))
+                    .add(servers::Column::Version.contains(search)),
             );
         }
 
@@ -397,8 +451,8 @@ impl ServerRepository {
                             .select_only()
                             .column(crate::models::entities::asns::Column::Asn)
                             .filter(crate::models::entities::asns::Column::Category.eq(cat))
-                            .into_query()
-                    )
+                            .into_query(),
+                    ),
                 );
             }
         }
@@ -422,7 +476,9 @@ impl ServerRepository {
         // Flags filter
         for flag in flags_filter {
             let flag = flag.trim();
-            if flag.is_empty() { continue; }
+            if flag.is_empty() {
+                continue;
+            }
             let pattern = format!("%,{},%", flag);
             let pattern_start = format!("{},%", flag);
             let pattern_end = format!("%,{}", flag);
@@ -431,7 +487,7 @@ impl ServerRepository {
                     .add(servers::Column::Flags.like(&pattern))
                     .add(servers::Column::Flags.like(&pattern_start))
                     .add(servers::Column::Flags.like(&pattern_end))
-                    .add(servers::Column::Flags.eq(flag))
+                    .add(servers::Column::Flags.eq(flag)),
             );
         }
 
@@ -456,17 +512,21 @@ impl ServerRepository {
                             query = query.filter(
                                 Condition::any()
                                     .add(servers::Column::PlayersOnline.lt(c_val))
-                                    .add(Condition::all()
-                                        .add(servers::Column::PlayersOnline.eq(c_val))
-                                        .add(servers::Column::Ip.gt(c_ip)))
+                                    .add(
+                                        Condition::all()
+                                            .add(servers::Column::PlayersOnline.eq(c_val))
+                                            .add(servers::Column::Ip.gt(c_ip)),
+                                    ),
                             );
                         } else {
                             query = query.filter(
                                 Condition::any()
                                     .add(servers::Column::PlayersOnline.gt(c_val))
-                                    .add(Condition::all()
-                                        .add(servers::Column::PlayersOnline.eq(c_val))
-                                        .add(servers::Column::Ip.gt(c_ip)))
+                                    .add(
+                                        Condition::all()
+                                            .add(servers::Column::PlayersOnline.eq(c_val))
+                                            .add(servers::Column::Ip.gt(c_ip)),
+                                    ),
                             );
                         }
                     }
@@ -477,17 +537,21 @@ impl ServerRepository {
                             query = query.filter(
                                 Condition::any()
                                     .add(servers::Column::LastSeen.lt(c_val))
-                                    .add(Condition::all()
-                                        .add(servers::Column::LastSeen.eq(c_val))
-                                        .add(servers::Column::Ip.gt(c_ip)))
+                                    .add(
+                                        Condition::all()
+                                            .add(servers::Column::LastSeen.eq(c_val))
+                                            .add(servers::Column::Ip.gt(c_ip)),
+                                    ),
                             );
                         } else {
                             query = query.filter(
                                 Condition::any()
                                     .add(servers::Column::LastSeen.gt(c_val))
-                                    .add(Condition::all()
-                                        .add(servers::Column::LastSeen.eq(c_val))
-                                        .add(servers::Column::Ip.gt(c_ip)))
+                                    .add(
+                                        Condition::all()
+                                            .add(servers::Column::LastSeen.eq(c_val))
+                                            .add(servers::Column::Ip.gt(c_ip)),
+                                    ),
                             );
                         }
                     }
@@ -511,7 +575,11 @@ impl ServerRepository {
             .await
     }
 
-    pub async fn get_server_players(&self, ip: &str, port: i16) -> Result<Vec<server_players::Model>, DbErr> {
+    pub async fn get_server_players(
+        &self,
+        ip: &str,
+        port: i16,
+    ) -> Result<Vec<server_players::Model>, DbErr> {
         server_players::Entity::find()
             .filter(server_players::Column::Ip.eq(ip))
             .filter(server_players::Column::Port.eq(port))
@@ -521,7 +589,12 @@ impl ServerRepository {
             .await
     }
 
-    pub async fn get_server_history(&self, ip: &str, port: i16, limit: u64) -> Result<Vec<server_history::Model>, DbErr> {
+    pub async fn get_server_history(
+        &self,
+        ip: &str,
+        port: i16,
+        limit: u64,
+    ) -> Result<Vec<server_history::Model>, DbErr> {
         server_history::Entity::find()
             .filter(server_history::Column::Ip.eq(ip))
             .filter(server_history::Column::Port.eq(port))
@@ -535,7 +608,12 @@ impl ServerRepository {
             })
     }
 
-    pub async fn get_servers_for_refill(&self, priority: i32, interval_hours: i64, limit: u64) -> Result<Vec<servers::Model>, DbErr> {
+    pub async fn get_servers_for_refill(
+        &self,
+        priority: i32,
+        interval_hours: i64,
+        limit: u64,
+    ) -> Result<Vec<servers::Model>, DbErr> {
         let stale_time = Utc::now() - chrono::Duration::hours(interval_hours);
         servers::Entity::find()
             .filter(servers::Column::Priority.eq(priority))
@@ -543,7 +621,7 @@ impl ServerRepository {
             .filter(
                 Condition::any()
                     .add(servers::Column::LastSeen.is_null())
-                    .add(servers::Column::LastSeen.lt(stale_time))
+                    .add(servers::Column::LastSeen.lt(stale_time)),
             )
             .order_by_asc(servers::Column::LastSeen)
             .limit(limit)
@@ -557,7 +635,7 @@ impl ServerRepository {
             .filter(
                 Condition::any()
                     .add(servers::Column::Status.eq("online"))
-                    .add(servers::Column::Motd.is_not_null())
+                    .add(servers::Column::Motd.is_not_null()),
             )
             .order_by_asc(servers::Column::Priority)
             .order_by_asc(servers::Column::LastSeen)
@@ -584,7 +662,10 @@ impl ServerRepository {
             .await
     }
 
-    pub async fn get_existing_ips(&self, _ips: Vec<String>) -> Result<std::collections::HashSet<String>, DbErr> {
+    pub async fn get_existing_ips(
+        &self,
+        _ips: Vec<String>,
+    ) -> Result<std::collections::HashSet<String>, DbErr> {
         // Deprecated: Scan tracking moved to Redis bitset (ScanTracker).
         // This method is kept as a no-op for backwards compatibility.
         Ok(std::collections::HashSet::new())
@@ -604,8 +685,14 @@ impl ServerRepository {
                 (r.cidr LIKE '%/16' AND servers.ip LIKE REPLACE(r.cidr, '/16', '.%'))
             )
         "#;
-        
-        let result = self.db.execute(Statement::from_string(self.db.get_database_backend(), sql.to_string())).await?;
+
+        let result = self
+            .db
+            .execute(Statement::from_string(
+                self.db.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await?;
         Ok(result.rows_affected())
     }
 
@@ -705,7 +792,7 @@ impl ServerRepository {
                     .add(servers::Column::Flags.like(&pattern))
                     .add(servers::Column::Flags.like(&pattern_start))
                     .add(servers::Column::Flags.like(&pattern_end))
-                    .add(servers::Column::Flags.eq(flag))
+                    .add(servers::Column::Flags.eq(flag)),
             )
             .filter(servers::Column::Status.eq("online"))
             .order_by_desc(servers::Column::PlayersOnline)

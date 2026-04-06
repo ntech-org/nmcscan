@@ -10,24 +10,23 @@ use serde::{Deserialize, Serialize};
 pub const KNOWN_MINECRAFT_SERVERS: &[(&str, u16, &str, &str)] = &[
     // Hypixel
     ("172.65.197.160", 25565, "Hypixel", "mc.hypixel.net"),
-    
     // Wynncraft
     ("172.65.217.91", 25565, "Wynncraft", "play.wynncraft.com"),
-    
     // GommeHD
     ("141.95.62.90", 25565, "Gommehd", "mc.gommehd.net"),
-    
     // ManaCube
     ("51.79.44.42", 25565, "ManaCube", "play.manacube.com"),
-    
     // CubeCraft
     ("193.105.184.227", 25565, "CubeCraft", "play.cubecraft.net"),
-    
     // Herobrine.org
     ("51.89.162.115", 25565, "Herobrine", "herobrine.org"),
-    
     // PikaNetwork
-    ("135.125.131.133", 25565, "PikaNetwork", "play.pika-network.net"),
+    (
+        "135.125.131.133",
+        25565,
+        "PikaNetwork",
+        "play.pika-network.net",
+    ),
 ];
 
 /// Test configuration options.
@@ -79,7 +78,9 @@ impl TestConfig {
         KNOWN_MINECRAFT_SERVERS
             .iter()
             .take(self.max_servers)
-            .map(|(ip, port, name, host)| (ip.to_string(), *port, name.to_string(), host.to_string()))
+            .map(|(ip, port, name, host)| {
+                (ip.to_string(), *port, name.to_string(), host.to_string())
+            })
             .collect()
     }
 }
@@ -93,7 +94,10 @@ pub fn get_quick_test_servers() -> Vec<(String, u16, String, String)> {
         ("141.95.62.90", 25565, "Gommehd", "mc.gommehd.net"),
         ("51.79.44.42", 25565, "ManaCube", "play.manacube.com"),
         ("193.105.184.227", 25565, "CubeCraft", "play.cubecraft.net"),
-    ].into_iter().map(|(ip, port, name, host)| (ip.to_string(), port, name.to_string(), host.to_string())).collect()
+    ]
+    .into_iter()
+    .map(|(ip, port, name, host)| (ip.to_string(), port, name.to_string(), host.to_string()))
+    .collect()
 }
 
 /// Get servers by region/category.
@@ -104,7 +108,9 @@ pub fn get_servers_by_region(region: &str) -> Vec<(String, u16, String, String)>
             .filter(|(_, _, name, _)| {
                 name.contains("Hypixel") || name.contains("Mineplex") || name.contains("Test")
             })
-            .map(|(ip, port, name, host)| (ip.to_string(), *port, name.to_string(), host.to_string()))
+            .map(|(ip, port, name, host)| {
+                (ip.to_string(), *port, name.to_string(), host.to_string())
+            })
             .collect(),
         "eu" | "europe" => KNOWN_MINECRAFT_SERVERS
             .iter()
@@ -114,11 +120,15 @@ pub fn get_servers_by_region(region: &str) -> Vec<(String, u16, String, String)>
                     || name.contains("Hermitcraft")
                     || name.contains("2b2t")
             })
-            .map(|(ip, port, name, host)| (ip.to_string(), *port, name.to_string(), host.to_string()))
+            .map(|(ip, port, name, host)| {
+                (ip.to_string(), *port, name.to_string(), host.to_string())
+            })
             .collect(),
         _ => KNOWN_MINECRAFT_SERVERS
             .iter()
-            .map(|(ip, port, name, host)| (ip.to_string(), *port, name.to_string(), host.to_string()))
+            .map(|(ip, port, name, host)| {
+                (ip.to_string(), *port, name.to_string(), host.to_string())
+            })
             .collect(),
     }
 }
@@ -145,14 +155,18 @@ mod tests {
     fn test_get_servers_by_region_us() {
         let servers = get_servers_by_region("us");
         assert!(!servers.is_empty());
-        assert!(servers.iter().any(|(_, _, name, _)| name.contains("Hypixel")));
+        assert!(servers
+            .iter()
+            .any(|(_, _, name, _)| name.contains("Hypixel")));
     }
 
     #[test]
     fn test_get_servers_by_region_eu() {
         let servers = get_servers_by_region("eu");
         assert!(!servers.is_empty());
-        assert!(servers.iter().any(|(_, _, name, _)| name.contains("Gommehd")));
+        assert!(servers
+            .iter()
+            .any(|(_, _, name, _)| name.contains("Gommehd")));
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use axum::{
-    extract::{Path, State, Extension},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::Json,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::handlers::{AppState, AuthContext};
@@ -65,7 +65,7 @@ pub async fn create_key(
     }
 
     let raw_key = format!("nmc_{}", Uuid::new_v4().simple());
-    
+
     let mut hasher = Sha256::new();
     hasher.update(raw_key.as_bytes());
     let key_hash = format!("{:x}", hasher.finalize());

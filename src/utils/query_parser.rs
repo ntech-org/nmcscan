@@ -42,7 +42,8 @@ pub fn parse(search: &str) -> ParsedQuery {
     for cap in DSL_REGEX.captures_iter(search) {
         let full_match = cap.get(0).unwrap();
         let key = cap.get(1).unwrap().as_str().to_lowercase();
-        let val = cap.get(2)
+        let val = cap
+            .get(2)
             .or(cap.get(3))
             .or(cap.get(4))
             .map(|m| m.as_str().to_string())
@@ -120,7 +121,11 @@ pub fn parse(search: &str) -> ParsedQuery {
     let free_text = {
         let trimmed = remaining.trim().replace(char::is_whitespace, " ");
         let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
-        if collapsed.is_empty() { None } else { Some(collapsed) }
+        if collapsed.is_empty() {
+            None
+        } else {
+            Some(collapsed)
+        }
     };
 
     ParsedQuery {

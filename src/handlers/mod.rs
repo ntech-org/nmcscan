@@ -16,8 +16,8 @@
 //! - GET / - Static dashboard (fallback to assets)
 
 use axum::{
-    extract::{Path, Query, State, Request},
-    http::{StatusCode, HeaderMap},
+    extract::{Path, Query, Request, State},
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Json, Response},
     routing::{get, post},
@@ -68,9 +68,11 @@ pub struct ServerResponse {
 }
 
 use crate::models::entities::servers;
-use crate::repositories::{ServerRepository, AsnRepository, StatsRepository, ApiKeyRepository, MinecraftAccountRepository};
-use crate::services::scheduler::Scheduler;
+use crate::repositories::{
+    ApiKeyRepository, AsnRepository, MinecraftAccountRepository, ServerRepository, StatsRepository,
+};
 use crate::services::login_queue::LoginQueue;
+use crate::services::scheduler::Scheduler;
 use crate::utils::exclude::ExcludeManager;
 
 pub mod api_keys;
@@ -288,16 +290,20 @@ async fn auth_middleware(
         if state.api_key.as_deref() == Some(auth_header) {
             is_master = true;
             // Allow proxy to impersonate user if master key is used
-            if let Some(user_id) = headers.get("X-User-Id").and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<i32>().ok()) {
+            if let Some(user_id) = headers
+                .get("X-User-Id")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<i32>().ok())
+            {
                 authenticated_user_id = Some(user_id);
             }
         } else {
             // Check api_keys table (hash the provided raw key first to compare)
-            use sha2::{Sha256, Digest};
+            use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(auth_header.as_bytes());
             let hash_hex = format!("{:x}", hasher.finalize());
-            
+
             if let Ok(Some(user_id)) = state.api_key_repo.validate_key(&hash_hex).await {
                 authenticated_user_id = Some(user_id);
             }
@@ -337,7 +343,11 @@ pub fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::HeaderName::from_static("x-api-key"), axum::http::header::HeaderName::from_static("x-user-id")]);
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::HeaderName::from_static("x-api-key"),
+            axum::http::header::HeaderName::from_static("x-user-id"),
+        ]);
 
     // Protected API routes
     let protected_routes = Router::new()
@@ -358,9 +368,18 @@ pub fn create_router(state: AppState) -> Router {
         .route("/login-queue/trigger", post(login_queue_trigger))
         .route("/keys", get(api_keys::list_keys).post(api_keys::create_key))
         .route("/keys/{id}", axum::routing::delete(api_keys::revoke_key))
-        .route("/minecraft-accounts", get(minecraft_accounts::list_accounts).post(minecraft_accounts::add_account))
-        .route("/minecraft-accounts/{id}", axum::routing::delete(minecraft_accounts::delete_account))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route(
+            "/minecraft-accounts",
+            get(minecraft_accounts::list_accounts).post(minecraft_accounts::add_account),
+        )
+        .route(
+            "/minecraft-accounts/{id}",
+            axum::routing::delete(minecraft_accounts::delete_account),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // Combine all API routes under /api
     let api_routes = Router::new()
@@ -377,7 +396,12 @@ pub fn create_router(state: AppState) -> Router {
 
 /// GET /health - Health check endpoint.
 async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
-    let total_servers = state.stats_repo.get_global_stats().await.map(|(t, _, _)| t).unwrap_or(0);
+    let total_servers = state
+        .stats_repo
+        .get_global_stats()
+        .await
+        .map(|(t, _, _)| t)
+        .unwrap_or(0);
     Json(HealthResponse {
         status: "ok".to_string(),
         total_servers,
@@ -394,8 +418,16 @@ async fn get_info(State(state): State<AppState>) -> Json<ContactResponse> {
 
 /// GET /api/stats - Get scanner statistics.
 async fn get_stats(State(state): State<AppState>) -> Json<StatsResponse> {
-    let (total_servers, online_servers, total_players) = state.stats_repo.get_global_stats().await.unwrap_or((0, 0, 0));
-    let (asn_hosting, asn_residential, _, asn_unknown) = state.asn_repo.get_asn_stats_counts().await.unwrap_or((0, 0, 0, 0));
+    let (total_servers, online_servers, total_players) = state
+        .stats_repo
+        .get_global_stats()
+        .await
+        .unwrap_or((0, 0, 0));
+    let (asn_hosting, asn_residential, _, asn_unknown) = state
+        .asn_repo
+        .get_asn_stats_counts()
+        .await
+        .unwrap_or((0, 0, 0, 0));
 
     Json(StatsResponse {
         total_servers,
@@ -413,32 +445,53 @@ async fn list_servers(
     Query(query): Query<ServerQuery>,
 ) -> Json<Vec<ServerResponse>> {
     // Parse DSL tokens from the search parameter if present
-    let parsed = query.search.as_deref().map(crate::utils::query_parser::parse);
+    let parsed = query
+        .search
+        .as_deref()
+        .map(crate::utils::query_parser::parse);
 
     // DSL values act as defaults; explicit query params override them
-    let status = query.status.as_deref()
+    let status = query
+        .status
+        .as_deref()
         .or(parsed.as_ref().and_then(|p| p.status.as_deref()));
     // Use free_text from DSL parser (falls back to full search when no DSL tokens found)
     let search_text = parsed.as_ref().and_then(|p| p.free_text.as_deref());
-    let min_players = query.min_players
+    let min_players = query
+        .min_players
         .or(parsed.as_ref().and_then(|p| p.min_players));
-    let max_players = query.max_players
+    let max_players = query
+        .max_players
         .or(parsed.as_ref().and_then(|p| p.max_players));
-    let version = query.version.as_deref()
+    let version = query
+        .version
+        .as_deref()
         .or(parsed.as_ref().and_then(|p| p.version.as_deref()));
-    let asn_category = query.asn_category.as_deref()
+    let asn_category = query
+        .asn_category
+        .as_deref()
         .or(parsed.as_ref().and_then(|p| p.asn_category.as_deref()));
-    let country = query.country.as_deref()
+    let country = query
+        .country
+        .as_deref()
         .or(parsed.as_ref().and_then(|p| p.country.as_deref()));
-    let brand = query.brand.as_deref()
+    let brand = query
+        .brand
+        .as_deref()
         .or(parsed.as_ref().and_then(|p| p.brand.as_deref()));
-    let server_type = query.server_type.as_deref()
+    let server_type = query
+        .server_type
+        .as_deref()
         .or(parsed.as_ref().and_then(|p| p.server_type.as_deref()));
-    let asn = query.asn.as_deref()
+    let asn = query
+        .asn
+        .as_deref()
         .or(parsed.as_ref().and_then(|p| p.asn.as_deref()));
-    let min_max_players = query.min_max_players
+    let min_max_players = query
+        .min_max_players
         .or(parsed.as_ref().and_then(|p| p.min_max_players));
-    let max_max_players = query.max_max_players
+    let max_max_players = query
+        .max_max_players
         .or(parsed.as_ref().and_then(|p| p.max_max_players));
 
     // Support both DSL flags and explicit flag query param
@@ -478,7 +531,7 @@ async fn list_servers(
         .unwrap_or_default();
 
     let asns_list = state.asn_repo.get_all_asns().await.unwrap_or_default();
-    
+
     let responses = servers
         .into_iter()
         .map(|s| {
@@ -488,13 +541,22 @@ async fn list_servers(
             if let Some(asn_num) = &s.asn {
                 if let Some(asn) = asns_list.iter().find(|a| a.asn == *asn_num) {
                     asn_org = Some(asn.org.clone());
-                    asn_tags = asn.tags.as_ref().map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+                    asn_tags = asn
+                        .tags
+                        .as_ref()
+                        .map(|t| {
+                            t.split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
                 }
             }
             enrich_server_response(s, asn_org, asn_tags)
         })
         .collect();
-    
+
     Json(responses)
 }
 
@@ -523,7 +585,16 @@ async fn get_server(
         if let Some(asn_list) = state.asn_repo.get_all_asns().await.ok() {
             if let Some(asn) = asn_list.iter().find(|a| a.asn == *asn_num) {
                 asn_org = Some(asn.org.clone());
-                asn_tags = asn.tags.as_ref().map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+                asn_tags = asn
+                    .tags
+                    .as_ref()
+                    .map(|t| {
+                        t.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
             }
         }
     }
@@ -531,10 +602,20 @@ async fn get_server(
     Ok(Json(enrich_server_response(server, asn_org, asn_tags)))
 }
 
-fn enrich_server_response(server: servers::Model, asn_org: Option<String>, asn_tags: Vec<String>) -> ServerResponse {
-    let flags = server.flags
+fn enrich_server_response(
+    server: servers::Model,
+    asn_org: Option<String>,
+    asn_tags: Vec<String>,
+) -> ServerResponse {
+    let flags = server
+        .flags
         .as_deref()
-        .map(|f| f.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+        .map(|f| {
+            f.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
         .unwrap_or_default();
 
     ServerResponse {
@@ -561,7 +642,6 @@ fn enrich_server_response(server: servers::Model, asn_org: Option<String>, asn_t
         flags,
     }
 }
-
 
 /// GET /api/server/{ip}/history - Get historical player count.
 async fn get_server_history(
@@ -646,19 +726,29 @@ async fn list_asns(
     let page = query.page.unwrap_or(0);
     let limit = query.limit.unwrap_or(50);
 
-    let (asns, total) = state.asn_repo.get_asn_list_paginated(page, limit).await.unwrap_or_else(|_| (Vec::new(), 0));
+    let (asns, total) = state
+        .asn_repo
+        .get_asn_list_paginated(page, limit)
+        .await
+        .unwrap_or_else(|_| (Vec::new(), 0));
 
     let responses: Vec<AsnResponse> = asns
         .into_iter()
-        .map(|asn| {
-            AsnResponse {
-                asn: asn.asn,
-                org: asn.org,
-                category: asn.category,
-                country: asn.country,
-                server_count: asn.server_count,
-                tags: asn.tags.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
-            }
+        .map(|asn| AsnResponse {
+            asn: asn.asn,
+            org: asn.org,
+            category: asn.category,
+            country: asn.country,
+            server_count: asn.server_count,
+            tags: asn
+                .tags
+                .map(|t| {
+                    t.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
         .collect();
 
@@ -675,9 +765,17 @@ async fn get_asn(
     State(state): State<AppState>,
     Path(asn_num): Path<String>,
 ) -> Result<Json<AsnResponse>, StatusCode> {
-    let all_asns = state.asn_repo.get_all_asns().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let all_stats = state.asn_repo.get_asn_list_with_counts().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+    let all_asns = state
+        .asn_repo
+        .get_all_asns()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let all_stats = state
+        .asn_repo
+        .get_asn_list_with_counts()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     if let Some(asn) = all_asns.into_iter().find(|a| a.asn == asn_num) {
         let stats = all_stats.into_iter().find(|s| s.asn == asn_num);
         Ok(Json(AsnResponse {
@@ -686,7 +784,15 @@ async fn get_asn(
             category: asn.category,
             country: asn.country,
             server_count: stats.map(|s| s.server_count).unwrap_or(0),
-            tags: asn.tags.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
+            tags: asn
+                .tags
+                .map(|t| {
+                    t.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         }))
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -756,8 +862,12 @@ async fn add_exclusion(
         .add_exclusion(&payload.network, payload.comment.as_deref())
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    
-    tracing::info!("IP/Network {} excluded via dashboard: {:?}", payload.network, payload.comment);
+
+    tracing::info!(
+        "IP/Network {} excluded via dashboard: {:?}",
+        payload.network,
+        payload.comment
+    );
     Ok(StatusCode::CREATED)
 }
 
@@ -770,7 +880,7 @@ async fn trigger_test_scan(
 
     let quick = payload.quick.unwrap_or(false);
     let count = payload.count.unwrap_or(10);
-    
+
     let test_servers = if quick {
         test_mode::get_quick_test_servers()
     } else if let Some(region) = payload.region {
@@ -781,30 +891,35 @@ async fn trigger_test_scan(
         let servers: Vec<(String, u16, String, String)> = test_mode::KNOWN_MINECRAFT_SERVERS
             .iter()
             .take(count)
-            .map(|(ip, port, name, host)| (ip.to_string(), *port, name.to_string(), host.to_string()))
+            .map(|(ip, port, name, host)| {
+                (ip.to_string(), *port, name.to_string(), host.to_string())
+            })
             .collect();
         servers
     };
 
     for (ip, port, _name, host) in &test_servers {
         let server_type = if *port == 19132 { "bedrock" } else { "java" };
-        let mut target = crate::services::scheduler::ServerTarget::new(ip.clone(), *port, server_type.to_string());
+        let mut target = crate::services::scheduler::ServerTarget::new(
+            ip.clone(),
+            *port,
+            server_type.to_string(),
+        );
         target.category = crate::models::asn::AsnCategory::Hosting;
         target.priority = 1;
         target.hostname = Some(host.clone());
 
         let port_i16: i16 = (*port).try_into().unwrap_or(25565);
-        let _ = state.server_repo.insert_server_if_new(ip, port_i16, server_type).await;
+        let _ = state
+            .server_repo
+            .insert_server_if_new(ip, port_i16, server_type)
+            .await;
         state.scheduler.add_server(target, true).await;
     }
 
     let servers_info: Vec<TestServerInfo> = test_servers
         .into_iter()
-        .map(|(ip, port, name, _host)| TestServerInfo {
-            ip,
-            port,
-            name,
-        })
+        .map(|(ip, port, name, _host)| TestServerInfo { ip, port, name })
         .collect();
 
     Json(TestScanResponse {
@@ -815,9 +930,7 @@ async fn trigger_test_scan(
 }
 
 /// GET /api/login-queue/status - Get login queue status and statistics.
-async fn login_queue_status(
-    State(state): State<AppState>,
-) -> Json<LoginQueueStatusResponse> {
+async fn login_queue_status(State(state): State<AppState>) -> Json<LoginQueueStatusResponse> {
     let stats = state.login_queue.get_stats().await;
     Json(LoginQueueStatusResponse {
         running: stats.running,
@@ -834,9 +947,7 @@ async fn login_queue_status(
 }
 
 /// POST /api/login-queue/start - Start the login queue.
-async fn login_queue_start(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+async fn login_queue_start(State(state): State<AppState>) -> Json<serde_json::Value> {
     if state.login_queue.is_running() {
         return Json(serde_json::json!({
             "status": "already_running"
@@ -849,9 +960,7 @@ async fn login_queue_start(
 }
 
 /// POST /api/login-queue/stop - Stop the login queue.
-async fn login_queue_stop(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+async fn login_queue_stop(State(state): State<AppState>) -> Json<serde_json::Value> {
     state.login_queue.stop();
     Json(serde_json::json!({
         "status": "stopping"
@@ -876,7 +985,10 @@ async fn login_queue_trigger(
 async fn get_scan_progress(
     State(state): State<AppState>,
 ) -> Result<Json<ScanProgressResponse>, StatusCode> {
-    let categories = state.asn_repo.get_scan_progress().await
+    let categories = state
+        .asn_repo
+        .get_scan_progress()
+        .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let queues = state.scheduler.get_queue_stats().await;
     Ok(Json(ScanProgressResponse { categories, queues }))

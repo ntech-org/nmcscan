@@ -4,16 +4,18 @@
 //! for fast, local, and limit-free IP categorization.
 
 use crate::models::asn::{AsnCategory, AsnError, AsnManager, AsnRecord};
+use crate::models::entities::{asn_ranges, asns};
 use crate::repositories::asns::AsnRepository;
-use sea_orm::{DatabaseConnection, EntityTrait, Set, ActiveModelTrait, QueryFilter, ColumnTrait, QuerySelect};
-use crate::models::entities::{asns, asn_ranges};
 use chrono::Utc;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Set,
+};
+use std::net::Ipv4Addr;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time;
 use tracing;
-use std::path::Path;
-use std::net::Ipv4Addr;
 
 /// Convert an IP range (inclusive start, inclusive end) to a list of CIDR blocks.
 /// Uses greedy largest-block-first algorithm to minimize the number of CIDRs.
@@ -43,11 +45,11 @@ fn ip_range_to_cidrs(start: u32, end: u32) -> Vec<String> {
 
     cidrs
 }
+use flate2::read::GzDecoder;
+use maxminddb::Reader;
+use serde::Deserialize;
 use std::fs;
 use std::io::Read;
-use maxminddb::Reader;
-use flate2::read::GzDecoder;
-use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct IpverseAsn {
@@ -67,13 +69,16 @@ const COUNTRY_DB_PATH: &str = "data/maxmind/GeoLite2-Country.mmdb";
 
 /// URL for full ASN database from iptoasn.com
 const FULL_ASN_URL: &str = "https://iptoasn.com/data/ip2asn-v4.tsv.gz";
-const IPVERSE_ASN_URL: &str = "https://raw.githubusercontent.com/ipverse/as-metadata/master/as.json";
+const IPVERSE_ASN_URL: &str =
+    "https://raw.githubusercontent.com/ipverse/as-metadata/master/as.json";
 
 /// URLs for downloading the databases (using a public mirror or requires license key).
 /// Note: Standard GeoLite2 requires a license key now.
 /// We'll use a placeholder URL and provide instructions.
-const ASN_DB_URL: &str = "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-ASN.mmdb";
-const COUNTRY_DB_URL: &str = "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb";
+const ASN_DB_URL: &str =
+    "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-ASN.mmdb";
+const COUNTRY_DB_URL: &str =
+    "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb";
 
 /// ASN Fetcher using local MaxMind databases.
 pub struct AsnFetcher {
@@ -158,7 +163,11 @@ impl AsnFetcher {
     async fn download_db(&self, url: &str, path: &str) -> Result<(), AsnError> {
         let response = self.client.get(url).send().await?;
         if !response.status().is_success() {
-            tracing::error!("Failed to download MaxMind DB from {}: {}", url, response.status());
+            tracing::error!(
+                "Failed to download MaxMind DB from {}: {}",
+                url,
+                response.status()
+            );
             return Err(AsnError::AsnNotFound);
         }
 
@@ -209,7 +218,14 @@ impl AsnFetcher {
                 "excluded" => AsnCategory::Excluded,
                 _ => AsnCategory::Unknown,
             };
-            let tags = asn_model.tags.clone().unwrap_or_default().split(',').map(|s| s.to_string()).filter(|s| !s.is_empty()).collect();
+            let tags = asn_model
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
             manager.add_asn(AsnRecord {
                 asn: asn_model.asn,
                 org: asn_model.org,
@@ -230,7 +246,7 @@ impl AsnFetcher {
     pub async fn fetch_ipverse_map(&self) -> std::collections::HashMap<String, String> {
         tracing::info!("Fetching ipverse ASN category map...");
         let mut ipverse_map = std::collections::HashMap::new();
-        
+
         match self.client.get(IPVERSE_ASN_URL).send().await {
             Ok(ipverse_response) => {
                 if ipverse_response.status().is_success() {
@@ -243,21 +259,27 @@ impl AsnFetcher {
                                     }
                                 }
                             }
-                            tracing::info!("Successfully fetched {} ipverse ASN categories", ipverse_map.len());
+                            tracing::info!(
+                                "Successfully fetched {} ipverse ASN categories",
+                                ipverse_map.len()
+                            );
                         }
                         Err(e) => {
                             tracing::error!("Failed to parse ipverse JSON: {}", e);
                         }
                     }
                 } else {
-                    tracing::error!("ipverse API returned non-success status: {}", ipverse_response.status());
+                    tracing::error!(
+                        "ipverse API returned non-success status: {}",
+                        ipverse_response.status()
+                    );
                 }
             }
             Err(e) => {
                 tracing::error!("Failed to fetch ipverse data: {}", e);
             }
         }
-        
+
         ipverse_map
     }
 
@@ -265,29 +287,44 @@ impl AsnFetcher {
     pub async fn import_full_database(&self) -> Result<(), AsnError> {
         tracing::info!("Downloading ASN categorization metadata from ipverse...");
         let ipverse_map = self.fetch_ipverse_map().await;
-        tracing::info!("ipverse map contains {} categorized ASNs", ipverse_map.len());
+        tracing::info!(
+            "ipverse map contains {} categorized ASNs",
+            ipverse_map.len()
+        );
 
         tracing::info!("Downloading full ASN database from iptoasn.com...");
         let response = self.client.get(FULL_ASN_URL).send().await?;
         if !response.status().is_success() {
-            return Err(AsnError::MaxMindError(format!("Failed to download ASN DB: {}", response.status())));
+            return Err(AsnError::MaxMindError(format!(
+                "Failed to download ASN DB: {}",
+                response.status()
+            )));
         }
 
         let bytes = response.bytes().await?;
         let decoder = GzDecoder::new(&bytes[..]);
         let mut tsv_content = String::new();
         let mut gz_reader = decoder;
-        gz_reader.read_to_string(&mut tsv_content).map_err(|e| AsnError::MaxMindError(format!("Gzip error: {}", e)))?;
+        gz_reader
+            .read_to_string(&mut tsv_content)
+            .map_err(|e| AsnError::MaxMindError(format!("Gzip error: {}", e)))?;
 
-        tracing::info!("Parsing global ASN data ({} entries)...", tsv_content.lines().count());
-        
+        tracing::info!(
+            "Parsing global ASN data ({} entries)...",
+            tsv_content.lines().count()
+        );
+
         // Group entries by ASN to reduce categorization calls
-        let mut asn_map: std::collections::HashMap<String, (String, String, Vec<String>)> = std::collections::HashMap::new();
-        let mut range_dedup: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut asn_map: std::collections::HashMap<String, (String, String, Vec<String>)> =
+            std::collections::HashMap::new();
+        let mut range_dedup: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         for line in tsv_content.lines() {
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 5 { continue; }
+            if parts.len() < 5 {
+                continue;
+            }
 
             let range_start = parts[0];
             let range_end = parts[1];
@@ -296,14 +333,20 @@ impl AsnFetcher {
             let org = parts[4];
 
             if !asn_map.contains_key(&asn) {
-                asn_map.insert(asn.clone(), (org.to_string(), country.to_string(), Vec::new()));
+                asn_map.insert(
+                    asn.clone(),
+                    (org.to_string(), country.to_string(), Vec::new()),
+                );
             }
-            
+
             // Convert IP range to proper CIDR blocks (not just one /24)
-            if let (Ok(start), Ok(end)) = (range_start.parse::<Ipv4Addr>(), range_end.parse::<Ipv4Addr>()) {
+            if let (Ok(start), Ok(end)) = (
+                range_start.parse::<Ipv4Addr>(),
+                range_end.parse::<Ipv4Addr>(),
+            ) {
                 let start_int = u32::from(start);
                 let end_int = u32::from(end);
-                
+
                 for cidr in ip_range_to_cidrs(start_int, end_int) {
                     range_dedup.entry(cidr).or_insert_with(|| asn.clone());
                 }
@@ -311,8 +354,12 @@ impl AsnFetcher {
         }
 
         let ranges: Vec<(String, String)> = range_dedup.into_iter().collect();
-        tracing::info!("Importing {} ASNs and {} discovery ranges (throttled)...", asn_map.len(), ranges.len());
-        
+        tracing::info!(
+            "Importing {} ASNs and {} discovery ranges (throttled)...",
+            asn_map.len(),
+            ranges.len()
+        );
+
         // Prepare ASN models with categorization
         let mut asn_models: Vec<asns::ActiveModel> = Vec::with_capacity(asn_map.len());
         for (asn, (org, country, _)) in asn_map {
@@ -326,7 +373,8 @@ impl AsnFetcher {
                 AsnCategory::Residential => "residential",
                 AsnCategory::Excluded => "excluded",
                 AsnCategory::Unknown => "unknown",
-            }.to_string();
+            }
+            .to_string();
 
             asn_models.push(asns::ActiveModel {
                 asn: Set(asn),
@@ -344,14 +392,26 @@ impl AsnFetcher {
                 .on_conflict(
                     sea_orm::sea_query::OnConflict::column(asns::Column::Asn)
                         .update_columns([asns::Column::Org, asns::Column::Category])
-                        .value(asns::Column::Country, sea_orm::sea_query::Expr::cust("COALESCE(excluded.country, asns.country)"))
-                        .value(asns::Column::Tags, sea_orm::sea_query::Expr::cust("COALESCE(excluded.tags, asns.tags)"))
-                        .value(asns::Column::LastUpdated, sea_orm::sea_query::Expr::cust("CURRENT_TIMESTAMP"))
-                        .to_owned()
+                        .value(
+                            asns::Column::Country,
+                            sea_orm::sea_query::Expr::cust(
+                                "COALESCE(excluded.country, asns.country)",
+                            ),
+                        )
+                        .value(
+                            asns::Column::Tags,
+                            sea_orm::sea_query::Expr::cust("COALESCE(excluded.tags, asns.tags)"),
+                        )
+                        .value(
+                            asns::Column::LastUpdated,
+                            sea_orm::sea_query::Expr::cust("CURRENT_TIMESTAMP"),
+                        )
+                        .to_owned(),
                 )
-                .exec(&*self.db).await
+                .exec(&*self.db)
+                .await
                 .map_err(|e| AsnError::MaxMindError(format!("ASN batch error: {}", e)))?;
-            
+
             // Artificial delay to prevent pegging CPU/DB
             time::sleep(time::Duration::from_millis(50)).await;
         }
@@ -372,26 +432,33 @@ impl AsnFetcher {
                 .on_conflict(
                     sea_orm::sea_query::OnConflict::column(asn_ranges::Column::Cidr)
                         .update_column(asn_ranges::Column::Asn)
-                        .to_owned()
+                        .to_owned(),
                 )
-                .exec(&*self.db).await
+                .exec(&*self.db)
+                .await
                 .map_err(|e| AsnError::MaxMindError(format!("Range batch error: {}", e)))?;
-            
+
             // Artificial delay
             time::sleep(time::Duration::from_millis(50)).await;
         }
 
         tracing::info!("Global ASN discovery sync complete.");
-        
+
         // After full import, run a re-categorization pass
         let _ = self.recategorize_all_asns(&ipverse_map).await;
-        
+
         Ok(())
     }
 
     /// Run a throttled batch re-categorization of "Unknown" ASNs in the database.
-    pub async fn recategorize_all_asns(&self, ipverse_map: &std::collections::HashMap<String, String>) -> Result<usize, AsnError> {
-        tracing::info!("Starting recategorization of Unknown ASNs with ipverse map ({} entries)...", ipverse_map.len());
+    pub async fn recategorize_all_asns(
+        &self,
+        ipverse_map: &std::collections::HashMap<String, String>,
+    ) -> Result<usize, AsnError> {
+        tracing::info!(
+            "Starting recategorization of Unknown ASNs with ipverse map ({} entries)...",
+            ipverse_map.len()
+        );
 
         let mut total_updated = 0;
         let mut processed = 0;
@@ -418,7 +485,11 @@ impl AsnFetcher {
 
             // Wrap the entire batch in a transaction for efficiency
             use sea_orm::TransactionTrait;
-            let tx = self.db.begin().await.map_err(|e| AsnError::MaxMindError(format!("Tx error: {}", e)))?;
+            let tx = self
+                .db
+                .begin()
+                .await
+                .map_err(|e| AsnError::MaxMindError(format!("Tx error: {}", e)))?;
 
             for model in asns_models {
                 processed += 1;
@@ -434,15 +505,15 @@ impl AsnFetcher {
                         AsnCategory::Hosting => {
                             hosting_promoted += 1;
                             "hosting"
-                        },
+                        }
                         AsnCategory::Residential => {
                             residential_promoted += 1;
                             "residential"
-                        },
+                        }
                         AsnCategory::Excluded => {
                             excluded_promoted += 1;
                             "excluded"
-                        },
+                        }
                         _ => "unknown",
                     };
                     active.category = Set(cat_str.to_string());
@@ -453,27 +524,36 @@ impl AsnFetcher {
                 }
 
                 active.last_updated = Set(Some(Utc::now().into()));
-                active.update(&tx).await.map_err(|e| AsnError::MaxMindError(format!("Update error: {}", e)))?;
+                active
+                    .update(&tx)
+                    .await
+                    .map_err(|e| AsnError::MaxMindError(format!("Update error: {}", e)))?;
 
                 if changed {
                     chunk_updated += 1;
                 }
             }
 
-            tx.commit().await.map_err(|e| AsnError::MaxMindError(format!("Commit error: {}", e)))?;
+            tx.commit()
+                .await
+                .map_err(|e| AsnError::MaxMindError(format!("Commit error: {}", e)))?;
 
             total_updated += chunk_updated;
 
             if processed % 5000 == 0 {
-                tracing::info!("Recategorization progress: processed {} ASNs, {} updated so far...", processed, total_updated);
+                tracing::info!(
+                    "Recategorization progress: processed {} ASNs, {} updated so far...",
+                    processed,
+                    total_updated
+                );
             }
 
             // Sleep to reduce CPU/DB pressure
             time::sleep(time::Duration::from_millis(200)).await;
 
-            if processed > 250000 { 
+            if processed > 250000 {
                 tracing::warn!("Recategorization hit processing limit (250k ASNs). Some ASNs may remain uncategorized.");
-                break; 
+                break;
             }
         }
 
@@ -509,7 +589,9 @@ impl AsnFetcher {
             if let Ok(result) = reader.lookup(ip_addr) {
                 if let Ok(Some(asn_db)) = result.decode::<maxminddb::geoip2::Asn>() {
                     asn_val = asn_db.autonomous_system_number.map(|n| format!("AS{}", n));
-                    org_val = asn_db.autonomous_system_organization.map(|s: &str| s.to_string());
+                    org_val = asn_db
+                        .autonomous_system_organization
+                        .map(|s: &str| s.to_string());
                 }
             }
         }
@@ -530,7 +612,7 @@ impl AsnFetcher {
 
         let asn = asn_val.unwrap_or_else(|| "AS0".to_string());
         let org = org_val.unwrap_or_else(|| "Unknown".to_string());
-        
+
         // Try to get category from in-memory manager if we already know it
         let category = {
             let manager = self.asn_manager.read().await;
@@ -549,20 +631,23 @@ impl AsnFetcher {
         };
 
         // Save to cache for fast dashboard listing
-        let _ = self.asn_repo.upsert_asn(
-            &asn,
-            &org,
-            match record.category {
-                AsnCategory::Hosting => "hosting",
-                AsnCategory::Residential => "residential",
-                AsnCategory::Excluded => "excluded",
-                AsnCategory::Unknown => "unknown",
-            },
-            record.country.as_deref(),
-            Some(tags),
-        ).await;
+        let _ = self
+            .asn_repo
+            .upsert_asn(
+                &asn,
+                &org,
+                match record.category {
+                    AsnCategory::Hosting => "hosting",
+                    AsnCategory::Residential => "residential",
+                    AsnCategory::Excluded => "excluded",
+                    AsnCategory::Unknown => "unknown",
+                },
+                record.country.as_deref(),
+                Some(tags),
+            )
+            .await;
 
-        // Add range to manager if it's IPv4. 
+        // Add range to manager if it's IPv4.
         // Since lookup_prefix is missing in this context, we jumpstart by adding a /24 range.
         if let std::net::IpAddr::V4(v4) = ip_addr {
             let octets = v4.octets();
@@ -588,13 +673,13 @@ impl AsnFetcher {
         time::sleep(time::Duration::from_secs(10)).await;
 
         let mut interval = time::interval(time::Duration::from_secs(86400 * 7)); // Weekly
-        
+
         // Consume the first tick which happens immediately
         interval.tick().await;
 
         loop {
             interval.tick().await;
-            
+
             // Check if we already have fresh ASN data (updated within last 3 days)
             // This is more reliable across restarts than just checking a flag.
             let fresh_asns = asns::Entity::find()
@@ -605,12 +690,14 @@ impl AsnFetcher {
                 .unwrap_or_default();
 
             if fresh_asns.is_some() {
-                tracing::info!("ASN data is fresh (updated within last 3 days), skipping background sync.");
+                tracing::info!(
+                    "ASN data is fresh (updated within last 3 days), skipping background sync."
+                );
                 continue;
             }
 
             tracing::info!("Performing weekly ASN intelligence sync...");
-            
+
             let mut updated = false;
             // 1. Update MaxMind
             if let Ok(_) = self.download_db(ASN_DB_URL, ASN_DB_PATH).await {
@@ -673,10 +760,13 @@ mod tests {
             u32::from(Ipv4Addr::new(10, 0, 0, 200)),
         );
         // Should cover the range exactly with multiple CIDRs
-        let total_ips: u32 = cidrs.iter().map(|c| {
-            let prefix: u8 = c.split('/').nth(1).unwrap().parse().unwrap();
-            1u32 << (32 - prefix)
-        }).sum();
+        let total_ips: u32 = cidrs
+            .iter()
+            .map(|c| {
+                let prefix: u8 = c.split('/').nth(1).unwrap().parse().unwrap();
+                1u32 << (32 - prefix)
+            })
+            .sum();
         assert_eq!(total_ips, 101); // 200 - 100 + 1 = 101 IPs
     }
 
@@ -687,10 +777,13 @@ mod tests {
             u32::from(Ipv4Addr::new(10, 0, 0, 200)),
             u32::from(Ipv4Addr::new(10, 0, 1, 50)),
         );
-        let total_ips: u32 = cidrs.iter().map(|c| {
-            let prefix: u8 = c.split('/').nth(1).unwrap().parse().unwrap();
-            1u32 << (32 - prefix)
-        }).sum();
+        let total_ips: u32 = cidrs
+            .iter()
+            .map(|c| {
+                let prefix: u8 = c.split('/').nth(1).unwrap().parse().unwrap();
+                1u32 << (32 - prefix)
+            })
+            .sum();
         // 56 (200-255) + 51 (0-50) = 107 IPs... wait: 256-200=56, 50-0+1=51 = 107
         // Actually: 10.0.0.200 to 10.0.0.255 = 56 IPs, 10.0.1.0 to 10.0.1.50 = 51 IPs
         // Total = 107

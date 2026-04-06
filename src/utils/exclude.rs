@@ -1,5 +1,5 @@
 //! Exclude list module for safe IP filtering.
-//! 
+//!
 //! Parses exclude.conf format (CIDR and single IPs) and provides
 //! efficient lookup to avoid scanning protected IP ranges.
 
@@ -25,7 +25,7 @@ fn range_to_cidrs(start: Ipv4Addr, end: Ipv4Addr) -> Vec<Ipv4Network> {
     let mut networks = Vec::new();
     let start_u32 = u32::from_be_bytes(start.octets());
     let end_u32 = u32::from_be_bytes(end.octets());
-    
+
     // For simplicity, create a /16 or /24 that covers most of the range
     // A full implementation would use proper CIDR aggregation
     if end_u32 - start_u32 > 65535 {
@@ -49,7 +49,7 @@ fn range_to_cidrs(start: Ipv4Addr, end: Ipv4Addr) -> Vec<Ipv4Network> {
             }
         }
     }
-    
+
     networks
 }
 
@@ -62,7 +62,11 @@ fn normalize_ip_line(line: &str) -> String {
             .split('.')
             .map(|octet| {
                 let trimmed = octet.trim_start_matches('0');
-                if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() }
+                if trimmed.is_empty() {
+                    "0".to_string()
+                } else {
+                    trimmed.to_string()
+                }
             })
             .collect::<Vec<_>>()
             .join(".");
@@ -72,7 +76,11 @@ fn normalize_ip_line(line: &str) -> String {
         line.split('.')
             .map(|octet| {
                 let trimmed = octet.trim_start_matches('0');
-                if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() }
+                if trimmed.is_empty() {
+                    "0".to_string()
+                } else {
+                    trimmed.to_string()
+                }
             })
             .collect::<Vec<_>>()
             .join(".")
@@ -88,7 +96,7 @@ pub enum ExcludeListError {
 }
 
 /// Holds a list of excluded IP ranges (CIDR) and single IPs.
-/// 
+///
 /// Before ANY connection attempt, check `if exclude_list.contains(ip)`.
 /// If true, SKIP immediately. Do not log, do not ping.
 pub struct ExcludeList {
@@ -107,9 +115,13 @@ impl ExcludeList {
         let mut networks = Vec::new();
         for line in content.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
             let line = line.split('#').next().unwrap_or(line).trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             if line.contains('-') && !line.contains('/') {
                 if let Some((start, end)) = parse_ip_range(line) {
                     networks.extend(range_to_cidrs(start, end));
@@ -138,9 +150,9 @@ impl ExcludeList {
     }
 }
 
-use tokio::sync::RwLock;
-use std::sync::Arc;
 use std::io::Write;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Manager for dynamic exclusion list.
 pub struct ExcludeManager {
@@ -150,10 +162,10 @@ pub struct ExcludeManager {
 
 impl ExcludeManager {
     pub fn new(file_path: &str) -> Self {
-        let initial = ExcludeList::from_file(file_path).unwrap_or_else(|_| {
-            ExcludeList { networks: Vec::new() }
+        let initial = ExcludeList::from_file(file_path).unwrap_or_else(|_| ExcludeList {
+            networks: Vec::new(),
         });
-        
+
         Self {
             inner: Arc::new(RwLock::new(initial)),
             file_path: file_path.to_string(),
@@ -166,24 +178,31 @@ impl ExcludeManager {
     }
 
     /// Add a new exclusion to the file and reload memory.
-    pub async fn add_exclusion(&self, network: &str, comment: Option<&str>) -> Result<(), ExcludeListError> {
+    pub async fn add_exclusion(
+        &self,
+        network: &str,
+        comment: Option<&str>,
+    ) -> Result<(), ExcludeListError> {
         // 1. Validate the entry first
         let normalized = normalize_ip_line(network.trim());
         if normalized.parse::<Ipv4Network>().is_err() && normalized.parse::<Ipv4Addr>().is_err() {
-            return Err(ExcludeListError::ParseError(format!("Invalid network format: {}", network)));
+            return Err(ExcludeListError::ParseError(format!(
+                "Invalid network format: {}",
+                network
+            )));
         }
 
         // 2. Append to file
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&self.file_path)?;
-        
+
         let entry = if let Some(c) = comment {
             format!("\n{} # {}\n", network, c)
         } else {
             format!("\n{}\n", network)
         };
-        
+
         file.write_all(entry.as_bytes())?;
 
         // 3. Reload in memory

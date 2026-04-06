@@ -7,14 +7,14 @@
 //! On startup, waits 30 minutes before processing servers that were never login-tested.
 //! This gives the scanner time to do its initial SLP pass and populate version data.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{self, Duration};
 
-use crate::repositories::ServerRepository;
 use crate::network::login::{self, LoginObstacle, LoginResult, LATEST_PROTOCOL};
+use crate::repositories::ServerRepository;
 use chrono::{Duration as ChronoDuration, Utc};
 
 /// Login queue statistics.
@@ -124,7 +124,11 @@ impl LoginQueue {
         let port_i16: i16 = port.try_into().unwrap_or(25565);
 
         // Store result
-        if let Err(e) = self.server_repo.update_login_result(ip, port_i16, &obstacle_str).await {
+        if let Err(e) = self
+            .server_repo
+            .update_login_result(ip, port_i16, &obstacle_str)
+            .await
+        {
             tracing::error!("Failed to update login result for {}:{}: {}", ip, port, e);
         }
 
@@ -154,17 +158,22 @@ impl LoginQueue {
                 // If so, the initial delay is already satisfied by previous run
                 let servers = match self.server_repo.get_online_servers(10).await {
                     Ok(s) => s,
-                    Err(_) => { time::sleep(Duration::from_secs(5)).await; continue; }
+                    Err(_) => {
+                        time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
                 };
-                
+
                 let has_recent_login = servers.iter().any(|s| {
-                    s.last_login_at.map(|lt| {
-                        (Utc::now().naive_utc() - lt).num_seconds() < INITIAL_DELAY_SECONDS
-                    }).unwrap_or(false)
+                    s.last_login_at
+                        .map(|lt| {
+                            (Utc::now().naive_utc() - lt).num_seconds() < INITIAL_DELAY_SECONDS
+                        })
+                        .unwrap_or(false)
                 });
-                
+
                 let has_never_tested = servers.iter().all(|s| s.last_login_at.is_none());
-                
+
                 if has_recent_login {
                     tracing::info!("Recent login activity detected, skipping initial delay");
                     initial_delay_done = true;
@@ -230,7 +239,8 @@ impl LoginQueue {
 
             tokio::spawn(async move {
                 let addr = SocketAddr::new(
-                    ip.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                    ip.parse()
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
                     port as u16,
                 );
 
@@ -245,7 +255,10 @@ impl LoginQueue {
                 let obstacle_str = result.obstacle.to_string();
 
                 // Update server record
-                if let Err(e) = server_repo.update_login_result(&ip, port, &obstacle_str).await {
+                if let Err(e) = server_repo
+                    .update_login_result(&ip, port, &obstacle_str)
+                    .await
+                {
                     tracing::error!("Failed to update login result for {}:{}: {}", ip, port, e);
                 }
 
@@ -271,7 +284,9 @@ impl LoginQueue {
                 } else {
                     tracing::debug!(
                         "Login {}: {}:{} - {} (version: {}, protocol: {})",
-                        obstacle_str, ip, port,
+                        obstacle_str,
+                        ip,
+                        port,
                         result.disconnect_reason.as_deref().unwrap_or("no reason"),
                         server_version.as_deref().unwrap_or("unknown"),
                         protocol

@@ -1,7 +1,7 @@
-use sea_orm::*;
-use sea_orm::sea_query::Expr;
-use std::sync::Arc;
 use crate::models::entities::api_keys;
+use sea_orm::sea_query::Expr;
+use sea_orm::*;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct ApiKeyRepository {
@@ -69,7 +69,7 @@ impl ApiKeyRepository {
             if let Err(e) = active_key.update(&self.db).await {
                 tracing::warn!("Failed to update last_used_at for api_key: {}", e);
             }
-            
+
             return Ok(Some(key_model.user_id));
         }
 

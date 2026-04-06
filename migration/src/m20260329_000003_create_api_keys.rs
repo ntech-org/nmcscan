@@ -18,7 +18,12 @@ impl MigrationTrait for Migration {
                             .auto_increment()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(ApiKeys::KeyHash).string().not_null().unique_key())
+                    .col(
+                        ColumnDef::new(ApiKeys::KeyHash)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
                     .col(ColumnDef::new(ApiKeys::Name).string().not_null())
                     .col(ColumnDef::new(ApiKeys::UserId).integer().not_null())
                     .col(
@@ -44,7 +49,7 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-            
+
         Ok(())
     }
 

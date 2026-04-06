@@ -18,12 +18,22 @@ impl MigrationTrait for Migration {
                             .auto_increment()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(MinecraftAccounts::Email).string().not_null().unique_key())
+                    .col(
+                        ColumnDef::new(MinecraftAccounts::Email)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
                     .col(ColumnDef::new(MinecraftAccounts::Password).string())
                     .col(ColumnDef::new(MinecraftAccounts::AccessToken).string())
                     .col(ColumnDef::new(MinecraftAccounts::RefreshToken).string())
                     .col(ColumnDef::new(MinecraftAccounts::ExpiresAt).timestamp())
-                    .col(ColumnDef::new(MinecraftAccounts::Status).string().not_null().default("active"))
+                    .col(
+                        ColumnDef::new(MinecraftAccounts::Status)
+                            .string()
+                            .not_null()
+                            .default("active"),
+                    )
                     .to_owned(),
             )
             .await

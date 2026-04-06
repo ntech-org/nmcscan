@@ -1,8 +1,8 @@
 //! Minecraft Server List Ping (SLP) protocol implementation.
-//! 
+//!
 //! Implements the standard handshake and status request packets manually
 //! using VarInt encoding. Supports both modern (1.7+) and legacy (1.6) SLP.
-//! 
+//!
 //! Protocol: https://wiki.vg/Server_List_Ping
 
 use serde::{Deserialize, Serialize};
@@ -143,7 +143,7 @@ pub fn build_handshake(host: &str, port: u16, protocol_version: i32) -> Vec<u8> 
 pub fn build_status_request() -> Vec<u8> {
     let mut packet = Vec::new();
     write_varint(&mut packet, 0); // Packet ID
-    
+
     let mut final_packet = Vec::new();
     write_varint(&mut final_packet, packet.len() as u32);
     final_packet.extend(packet);
@@ -163,7 +163,10 @@ pub fn build_ping(payload: i64) -> Vec<u8> {
 }
 
 /// Perform a Server List Ping and return server status.
-pub async fn ping_server(addr: SocketAddr, hostname: Option<&str>) -> Result<ServerStatus, SlpError> {
+pub async fn ping_server(
+    addr: SocketAddr,
+    hostname: Option<&str>,
+) -> Result<ServerStatus, SlpError> {
     // 10 second overall timeout for the entire operation
     timeout(Duration::from_secs(10), async {
         // Try Modern SLP first
@@ -174,10 +177,14 @@ pub async fn ping_server(addr: SocketAddr, hostname: Option<&str>) -> Result<Ser
                 ping_server_legacy(addr).await
             }
         }
-    }).await?
+    })
+    .await?
 }
 
-async fn ping_server_modern(addr: SocketAddr, hostname: Option<&str>) -> Result<ServerStatus, SlpError> {
+async fn ping_server_modern(
+    addr: SocketAddr,
+    hostname: Option<&str>,
+) -> Result<ServerStatus, SlpError> {
     let start_time = std::time::Instant::now();
     // 5 second connect timeout
     let mut stream = timeout(Duration::from_secs(5), TcpStream::connect(addr)).await??;
@@ -188,7 +195,7 @@ async fn ping_server_modern(addr: SocketAddr, hostname: Option<&str>) -> Result<
     let handshake_host = hostname.unwrap_or(&ip_str);
     let handshake = build_handshake(handshake_host, addr.port(), 47);
     stream.write_all(&handshake).await?;
-    
+
     let status_request = build_status_request();
     stream.write_all(&status_request).await?;
 
@@ -196,15 +203,24 @@ async fn ping_server_modern(addr: SocketAddr, hostname: Option<&str>) -> Result<
     let mut reader = tokio::io::BufReader::with_capacity(4096, stream);
 
     // Helper to read a VarInt from tokio BufReader
-    async fn read_varint_async<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<u32> {
+    async fn read_varint_async<R: tokio::io::AsyncReadExt + Unpin>(
+        reader: &mut R,
+    ) -> io::Result<u32> {
         let mut result = 0u32;
         let mut shift = 0;
         loop {
             let byte = reader.read_u8().await?;
             result |= ((byte & 0x7F) as u32) << shift;
-            if byte & 0x80 == 0 { break; }
+            if byte & 0x80 == 0 {
+                break;
+            }
             shift += 7;
-            if shift >= 35 { return Err(io::Error::new(io::ErrorKind::InvalidData, "VarInt too long")); }
+            if shift >= 35 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VarInt too long",
+                ));
+            }
         }
         Ok(result)
     }
@@ -215,27 +231,33 @@ async fn ping_server_modern(addr: SocketAddr, hostname: Option<&str>) -> Result<
     // 2. Read Packet ID
     let packet_id = read_varint_async(&mut reader).await?;
     if packet_id != 0 {
-        return Err(SlpError::InvalidResponse(format!("Expected packet ID 0, got {}", packet_id)));
+        return Err(SlpError::InvalidResponse(format!(
+            "Expected packet ID 0, got {}",
+            packet_id
+        )));
     }
 
     // 3. Read JSON Length
     let json_len = read_varint_async(&mut reader).await? as usize;
     if json_len > MAX_PACKET_SIZE {
-        return Err(SlpError::InvalidResponse(format!("JSON too large: {}", json_len)));
+        return Err(SlpError::InvalidResponse(format!(
+            "JSON too large: {}",
+            json_len
+        )));
     }
 
     // 4. Read JSON bytes
     let mut json_bytes = vec![0u8; json_len];
     reader.read_exact(&mut json_bytes).await?;
-    
+
     let mut response: ServerStatus = serde_json::from_slice(&json_bytes)?;
-    
+
     // Optional Ping phase
     let ping_payload = 12345678i64;
     let ping_packet = build_ping(ping_payload);
     let mut stream = reader.into_inner();
     let _ = stream.write_all(&ping_packet).await;
-    
+
     // Try to read pong briefly (2s for high-latency)
     let mut pong_buf = [0u8; 12];
     if let Ok(Ok(n)) = timeout(Duration::from_secs(2), stream.read(&mut pong_buf)).await {
@@ -256,38 +278,43 @@ async fn ping_server_legacy(addr: SocketAddr) -> Result<ServerStatus, SlpError> 
     // 5 second overall timeout for legacy
     timeout(Duration::from_secs(5), async {
         let mut stream = TcpStream::connect(addr).await?;
-        
+
         // Send 0xFE 0x01 (1.4-1.6)
         stream.write_all(&[0xFE, 0x01]).await?;
-        
+
         // Response starts with 0xFF
         let mut header = [0u8; 1];
         stream.read_exact(&mut header).await?;
         if header[0] != 0xFF {
-            return Err(SlpError::InvalidResponse(format!("Legacy: expected 0xFF, got 0x{:02X}", header[0])));
+            return Err(SlpError::InvalidResponse(format!(
+                "Legacy: expected 0xFF, got 0x{:02X}",
+                header[0]
+            )));
         }
-        
+
         // Next is 2 bytes of length (short, number of characters)
         let mut len_buf = [0u8; 2];
         stream.read_exact(&mut len_buf).await?;
         let char_count = u16::from_be_bytes(len_buf) as usize;
-        
+
         if char_count > 1000 {
-            return Err(SlpError::InvalidResponse("Legacy: response too long".to_owned()));
+            return Err(SlpError::InvalidResponse(
+                "Legacy: response too long".to_owned(),
+            ));
         }
 
         // Read string (UTF-16BE)
         let mut string_bytes = vec![0u8; char_count * 2];
         stream.read_exact(&mut string_bytes).await?;
-        
+
         let utf16_chars: Vec<u16> = string_bytes
             .chunks_exact(2)
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
-        
+
         let response_str = String::from_utf16(&utf16_chars)
             .map_err(|_| SlpError::InvalidResponse("Legacy: invalid UTF-16".to_owned()))?;
-        
+
         // Modern Legacy (1.6) starts with §1\0
         if response_str.starts_with("§1") {
             let parts: Vec<&str> = response_str.split('\0').collect();
@@ -309,11 +336,11 @@ async fn ping_server_legacy(addr: SocketAddr) -> Result<ServerStatus, SlpError> 
                 });
             }
         }
-        
+
         // Old Legacy (pre-1.6) format: MOTD§Online§Max
         let parts: Vec<&str> = response_str.split('§').collect();
         if parts.len() >= 3 {
-             Ok(ServerStatus {
+            Ok(ServerStatus {
                 description: serde_json::Value::String(parts[0].to_string()),
                 players: Some(Players {
                     online: parts[1].parse().unwrap_or(0),
@@ -329,9 +356,12 @@ async fn ping_server_legacy(addr: SocketAddr) -> Result<ServerStatus, SlpError> 
                 mod_info: None,
             })
         } else {
-            Err(SlpError::InvalidResponse("Legacy: malformed response".to_owned()))
+            Err(SlpError::InvalidResponse(
+                "Legacy: malformed response".to_owned(),
+            ))
         }
-    }).await?
+    })
+    .await?
 }
 
 /// Extract MOTD text from description, handling complex JSON recursive structures.
@@ -374,14 +404,26 @@ pub fn extract_brand(status: &ServerStatus) -> String {
         }
 
         // True modded (require client-side mods)
-        if name.contains("forge") || name.contains("fml") { return "Forge".to_string(); }
-        if name.contains("fabric") { return "Fabric".to_string(); }
-        if name.contains("neoforge") { return "NeoForge".to_string(); }
+        if name.contains("forge") || name.contains("fml") {
+            return "Forge".to_string();
+        }
+        if name.contains("fabric") {
+            return "Fabric".to_string();
+        }
+        if name.contains("neoforge") {
+            return "NeoForge".to_string();
+        }
 
         // Proxies
-        if name.contains("velocity") { return "Proxy".to_string(); }
-        if name.contains("bungeecord") || name.contains("bungee") { return "Proxy".to_string(); }
-        if name.contains("waterfall") { return "Proxy".to_string(); }
+        if name.contains("velocity") {
+            return "Proxy".to_string();
+        }
+        if name.contains("bungeecord") || name.contains("bungee") {
+            return "Proxy".to_string();
+        }
+        if name.contains("waterfall") {
+            return "Proxy".to_string();
+        }
 
         // Multi-version strings indicate a proxy
         if name.contains(" - ") || name.contains(" to ") {
@@ -441,7 +483,7 @@ mod tests {
         write_varint(&mut buf, 0);
         write_varint(&mut buf, 1);
         write_varint(&mut buf, 127);
-        
+
         let mut cursor = Cursor::new(&buf);
         assert_eq!(read_varint(&mut cursor).unwrap(), 0);
         assert_eq!(read_varint(&mut cursor).unwrap(), 1);
@@ -453,7 +495,7 @@ mod tests {
         let mut buf = Vec::new();
         write_varint(&mut buf, 300);
         write_varint(&mut buf, 16383);
-        
+
         let mut cursor = Cursor::new(&buf);
         assert_eq!(read_varint(&mut cursor).unwrap(), 300);
         assert_eq!(read_varint(&mut cursor).unwrap(), 16383);

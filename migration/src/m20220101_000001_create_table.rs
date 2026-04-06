@@ -81,10 +81,12 @@ impl MigrationTrait for Migration {
         let db = manager.get_connection();
 
         // Trigram extension
-        db.execute_unprepared("CREATE EXTENSION IF NOT EXISTS pg_trgm").await?;
+        db.execute_unprepared("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+            .await?;
 
         // Tables
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE TABLE IF NOT EXISTS servers (
                 ip TEXT,
                 port INTEGER DEFAULT 25565,
@@ -104,9 +106,12 @@ impl MigrationTrait for Migration {
                 brand TEXT,
                 PRIMARY KEY (ip, port)
             )
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE TABLE IF NOT EXISTS server_players (
                 ip TEXT,
                 port INTEGER DEFAULT 25565,
@@ -116,9 +121,12 @@ impl MigrationTrait for Migration {
                 PRIMARY KEY (ip, port, player_name),
                 FOREIGN KEY (ip, port) REFERENCES servers(ip, port) ON DELETE CASCADE
             )
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE TABLE IF NOT EXISTS server_history (
                 ip TEXT,
                 port INTEGER DEFAULT 25565,
@@ -126,9 +134,12 @@ impl MigrationTrait for Migration {
                 players_online INTEGER,
                 FOREIGN KEY (ip, port) REFERENCES servers(ip, port) ON DELETE CASCADE
             )
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE TABLE IF NOT EXISTS asns (
                 asn TEXT PRIMARY KEY,
                 org TEXT NOT NULL,
@@ -137,9 +148,12 @@ impl MigrationTrait for Migration {
                 tags TEXT,
                 last_updated TIMESTAMPTZ
             )
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE TABLE IF NOT EXISTS asn_ranges (
                 cidr TEXT PRIMARY KEY,
                 asn TEXT NOT NULL,
@@ -147,9 +161,12 @@ impl MigrationTrait for Migration {
                 last_scanned_at TIMESTAMP,
                 FOREIGN KEY (asn) REFERENCES asns(asn) ON DELETE CASCADE
             )
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE TABLE IF NOT EXISTS daily_stats (
                 date DATE PRIMARY KEY,
                 scans_total INTEGER DEFAULT 0,
@@ -158,9 +175,12 @@ impl MigrationTrait for Migration {
                 scans_cold INTEGER DEFAULT 0,
                 discoveries INTEGER DEFAULT 0
             )
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
                 name TEXT,
@@ -169,9 +189,12 @@ impl MigrationTrait for Migration {
                 image TEXT,
                 role TEXT NOT NULL DEFAULT 'user'
             )
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE TABLE IF NOT EXISTS accounts (
                 id SERIAL PRIMARY KEY,
                 "userId" INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -187,54 +210,87 @@ impl MigrationTrait for Migration {
                 session_state TEXT,
                 UNIQUE(provider, "providerAccountId")
             )
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE TABLE IF NOT EXISTS sessions (
                 id SERIAL PRIMARY KEY,
                 "sessionToken" TEXT NOT NULL UNIQUE,
                 "userId" INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 expires TIMESTAMPTZ NOT NULL
             )
-        "#).await?;
+        "#,
+        )
+        .await?;
 
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE TABLE IF NOT EXISTS verification_token (
                 identifier TEXT NOT NULL,
                 token TEXT NOT NULL,
                 expires TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY (identifier, token)
             )
-        "#).await?;
+        "#,
+        )
+        .await?;
 
         // Indexes
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_servers_status ON servers(status)").await?;
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_servers_priority ON servers(priority, last_seen)").await?;
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_servers_asn ON servers(asn)").await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_servers_status ON servers(status)")
+            .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_servers_priority ON servers(priority, last_seen)",
+        )
+        .await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_servers_asn ON servers(asn)")
+            .await?;
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_servers_asn_status ON servers(asn, status) INCLUDE (ip)").await?;
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_servers_players ON servers(players_online)").await?;
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_asns_category ON asns(category)").await?;
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_asn_ranges_asn ON asn_ranges(asn)").await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_servers_players ON servers(players_online)",
+        )
+        .await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_asns_category ON asns(category)")
+            .await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_asn_ranges_asn ON asn_ranges(asn)")
+            .await?;
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_asn_ranges_category_scan ON asn_ranges(asn) INCLUDE (last_scanned_at, scan_offset)").await?;
         // Composite index for the main discovery query
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_asn_ranges_lookup ON asn_ranges(last_scanned_at, scan_offset)").await?;
-        
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_player_name ON server_players(player_name)").await?;
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_server_history_ip_port ON server_history(ip, port)").await?;
-        db.execute_unprepared("CREATE INDEX IF NOT EXISTS trgm_idx_servers_ip ON servers USING GIN (ip gin_trgm_ops)").await?;
+
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_player_name ON server_players(player_name)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_server_history_ip_port ON server_history(ip, port)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS trgm_idx_servers_ip ON servers USING GIN (ip gin_trgm_ops)",
+        )
+        .await?;
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS trgm_idx_servers_motd ON servers USING GIN (motd gin_trgm_ops)").await?;
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS trgm_idx_servers_version ON servers USING GIN (version gin_trgm_ops)").await?;
 
         // Materialized Views
-        db.execute_unprepared(r#"
+        db.execute_unprepared(
+            r#"
             CREATE MATERIALIZED VIEW IF NOT EXISTS asn_stats AS
             SELECT a.asn, a.org, a.category, a.country, a.tags, a.last_updated,
                    COUNT(s.ip)::bigint as server_count
             FROM asns a
             LEFT JOIN servers s ON s.asn = a.asn AND s.status != 'ignored'
             GROUP BY a.asn
-        "#).await?;
-        db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_asn_stats_asn ON asn_stats(asn)").await?;
+        "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_asn_stats_asn ON asn_stats(asn)",
+        )
+        .await?;
 
         db.execute_unprepared(r#"
             CREATE MATERIALIZED VIEW IF NOT EXISTS global_stats AS
@@ -244,7 +300,10 @@ impl MigrationTrait for Migration {
                 (SELECT COALESCE(SUM(players_online), 0)::bigint FROM servers WHERE status = 'online') as total_players,
                 1 as id
         "#).await?;
-        db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_global_stats_id ON global_stats(id)").await?;
+        db.execute_unprepared(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_global_stats_id ON global_stats(id)",
+        )
+        .await?;
 
         Ok(())
     }
@@ -252,18 +311,28 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
-        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS global_stats").await?;
-        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS asn_stats").await?;
-        db.execute_unprepared("DROP TABLE IF EXISTS verification_token").await?;
-        db.execute_unprepared("DROP TABLE IF EXISTS sessions").await?;
-        db.execute_unprepared("DROP TABLE IF EXISTS accounts").await?;
+        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS global_stats")
+            .await?;
+        db.execute_unprepared("DROP MATERIALIZED VIEW IF EXISTS asn_stats")
+            .await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS verification_token")
+            .await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS sessions")
+            .await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS accounts")
+            .await?;
         db.execute_unprepared("DROP TABLE IF EXISTS users").await?;
-        db.execute_unprepared("DROP TABLE IF EXISTS daily_stats").await?;
-        db.execute_unprepared("DROP TABLE IF EXISTS asn_ranges").await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS daily_stats")
+            .await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS asn_ranges")
+            .await?;
         db.execute_unprepared("DROP TABLE IF EXISTS asns").await?;
-        db.execute_unprepared("DROP TABLE IF EXISTS server_history").await?;
-        db.execute_unprepared("DROP TABLE IF EXISTS server_players").await?;
-        db.execute_unprepared("DROP TABLE IF EXISTS servers").await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS server_history")
+            .await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS server_players")
+            .await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS servers")
+            .await?;
 
         Ok(())
     }

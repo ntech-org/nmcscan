@@ -10,9 +10,8 @@ impl MigrationTrait for Migration {
 
         // Delete all ignored servers (offline scans tracked in Redis bitset now).
         // CASCADE deletes their server_history and server_players entries too.
-        db.execute_unprepared(
-            "DELETE FROM servers WHERE status = 'ignored'"
-        ).await?;
+        db.execute_unprepared("DELETE FROM servers WHERE status = 'ignored'")
+            .await?;
 
         // Add index on server_history timestamp for efficient capping queries
         db.execute_unprepared(

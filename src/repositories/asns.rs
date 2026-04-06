@@ -1,7 +1,7 @@
-use sea_orm::*;
-use sea_orm::sea_query::Expr;
-use crate::models::entities::{asns, asn_ranges, asn_stats};
+use crate::models::entities::{asn_ranges, asn_stats, asns};
 use chrono::Utc;
+use sea_orm::sea_query::Expr;
+use sea_orm::*;
 
 #[derive(Clone)]
 pub struct AsnRepository {
@@ -13,7 +13,14 @@ impl AsnRepository {
         Self { db }
     }
 
-    pub async fn upsert_asn(&self, asn: &str, org: &str, category: &str, country: Option<&str>, tags: Option<Vec<String>>) -> Result<(), DbErr> {
+    pub async fn upsert_asn(
+        &self,
+        asn: &str,
+        org: &str,
+        category: &str,
+        country: Option<&str>,
+        tags: Option<Vec<String>>,
+    ) -> Result<(), DbErr> {
         let tags_str = tags.map(|t| t.join(","));
         let model = asns::ActiveModel {
             asn: Set(asn.to_string()),
@@ -28,10 +35,16 @@ impl AsnRepository {
             .on_conflict(
                 sea_query::OnConflict::column(asns::Column::Asn)
                     .update_columns([asns::Column::Org, asns::Column::Category])
-                    .value(asns::Column::Country, Expr::cust("COALESCE(excluded.country, asns.country)"))
-                    .value(asns::Column::Tags, Expr::cust("COALESCE(excluded.tags, asns.tags)"))
+                    .value(
+                        asns::Column::Country,
+                        Expr::cust("COALESCE(excluded.country, asns.country)"),
+                    )
+                    .value(
+                        asns::Column::Tags,
+                        Expr::cust("COALESCE(excluded.tags, asns.tags)"),
+                    )
                     .value(asns::Column::LastUpdated, Expr::cust("CURRENT_TIMESTAMP"))
-                    .to_owned()
+                    .to_owned(),
             )
             .exec(&self.db)
             .await?;
@@ -49,7 +62,7 @@ impl AsnRepository {
             .on_conflict(
                 sea_query::OnConflict::column(asn_ranges::Column::Cidr)
                     .update_column(asn_ranges::Column::Asn)
-                    .to_owned()
+                    .to_owned(),
             )
             .exec(&self.db)
             .await?;
@@ -73,12 +86,13 @@ impl AsnRepository {
     }
 
     pub async fn get_stale_asns(&self, days: i64) -> Result<Vec<asns::Model>, DbErr> {
-        let stale_time: chrono::DateTime<chrono::FixedOffset> = (Utc::now() - chrono::Duration::days(days)).into();
+        let stale_time: chrono::DateTime<chrono::FixedOffset> =
+            (Utc::now() - chrono::Duration::days(days)).into();
         asns::Entity::find()
             .filter(
                 Condition::any()
                     .add(asns::Column::LastUpdated.is_null())
-                    .add(asns::Column::LastUpdated.lt(stale_time))
+                    .add(asns::Column::LastUpdated.lt(stale_time)),
             )
             .order_by_asc(asns::Column::LastUpdated)
             .all(&self.db)
@@ -93,7 +107,11 @@ impl AsnRepository {
             .await
     }
 
-    pub async fn get_asn_list_paginated(&self, page: u64, limit: u64) -> Result<(Vec<asn_stats::Model>, u64), DbErr> {
+    pub async fn get_asn_list_paginated(
+        &self,
+        page: u64,
+        limit: u64,
+    ) -> Result<(Vec<asn_stats::Model>, u64), DbErr> {
         let paginator = asn_stats::Entity::find()
             .order_by_desc(asn_stats::Column::ServerCount)
             .order_by_asc(asn_stats::Column::Org)
@@ -106,12 +124,29 @@ impl AsnRepository {
     }
 
     pub async fn get_asn_stats_counts(&self) -> Result<(i64, i64, i64, i64), DbErr> {
-        let hosting = asns::Entity::find().filter(asns::Column::Category.eq("hosting")).count(&self.db).await?;
-        let residential = asns::Entity::find().filter(asns::Column::Category.eq("residential")).count(&self.db).await?;
-        let excluded = asns::Entity::find().filter(asns::Column::Category.eq("excluded")).count(&self.db).await?;
-        let unknown = asns::Entity::find().filter(asns::Column::Category.eq("unknown")).count(&self.db).await?;
-        
-        Ok((hosting as i64, residential as i64, excluded as i64, unknown as i64))
+        let hosting = asns::Entity::find()
+            .filter(asns::Column::Category.eq("hosting"))
+            .count(&self.db)
+            .await?;
+        let residential = asns::Entity::find()
+            .filter(asns::Column::Category.eq("residential"))
+            .count(&self.db)
+            .await?;
+        let excluded = asns::Entity::find()
+            .filter(asns::Column::Category.eq("excluded"))
+            .count(&self.db)
+            .await?;
+        let unknown = asns::Entity::find()
+            .filter(asns::Column::Category.eq("unknown"))
+            .count(&self.db)
+            .await?;
+
+        Ok((
+            hosting as i64,
+            residential as i64,
+            excluded as i64,
+            unknown as i64,
+        ))
     }
 
     pub async fn get_asn_count(&self) -> Result<u64, DbErr> {
@@ -126,11 +161,15 @@ impl AsnRepository {
             .order_by_asc(asns::Column::Org)
             .all(&self.db)
             .await?;
-            
+
         Ok(ranges.into_iter().map(|r| (r.cidr, r.asn)).collect())
     }
 
-    pub async fn get_ranges_to_scan(&self, category: &str, limit: u64) -> Result<Vec<asn_ranges::Model>, DbErr> {
+    pub async fn get_ranges_to_scan(
+        &self,
+        category: &str,
+        limit: u64,
+    ) -> Result<Vec<asn_ranges::Model>, DbErr> {
         // Select ranges with fair round-robin scheduling, then randomize selection.
         //
         // Strategy:
@@ -140,7 +179,8 @@ impl AsnRepository {
         // This means the scanner progresses through the entire category evenly,
         // preventing large ASNs from monopolizing the queue.
         let pool_size = limit * 10;
-        let sql = format!(r#"
+        let sql = format!(
+            r#"
             SELECT cidr, asn, scan_offset, last_scanned_at, scan_epoch FROM (
                 SELECT r.cidr, r.asn, r.scan_offset, r.last_scanned_at, r.scan_epoch
                 FROM asn_ranges r
@@ -153,26 +193,34 @@ impl AsnRepository {
             ) pool
             ORDER BY random()
             LIMIT {}
-        "#, category, pool_size, limit);
+        "#,
+            category, pool_size, limit
+        );
 
         let stmt = Statement::from_string(self.db.get_database_backend(), sql);
         let rows = self.db.query_all(stmt).await?;
 
         use crate::models::entities::asn_ranges::Model as AsnRangeModel;
-        let models: Vec<AsnRangeModel> = rows.into_iter().map(|row| {
-            AsnRangeModel {
+        let models: Vec<AsnRangeModel> = rows
+            .into_iter()
+            .map(|row| AsnRangeModel {
                 cidr: row.try_get("", "cidr").unwrap_or_default(),
                 asn: row.try_get("", "asn").unwrap_or_default(),
                 scan_offset: row.try_get("", "scan_offset").unwrap_or(0),
                 last_scanned_at: row.try_get("", "last_scanned_at").ok(),
                 scan_epoch: row.try_get("", "scan_epoch").unwrap_or(0),
-            }
-        }).collect();
+            })
+            .collect();
 
         Ok(models)
     }
 
-    pub async fn update_range_progress(&self, cidr: &str, new_offset: i64, reset: bool) -> Result<(), DbErr> {
+    pub async fn update_range_progress(
+        &self,
+        cidr: &str,
+        new_offset: i64,
+        reset: bool,
+    ) -> Result<(), DbErr> {
         let mut model: asn_ranges::ActiveModel = asn_ranges::Entity::find_by_id(cidr.to_string())
             .one(&self.db)
             .await?
@@ -190,7 +238,10 @@ impl AsnRepository {
         Ok(())
     }
 
-    pub async fn update_batch_range_progress(&self, updates: Vec<(String, i64, bool, bool)>) -> Result<(), DbErr> {
+    pub async fn update_batch_range_progress(
+        &self,
+        updates: Vec<(String, i64, bool, bool)>,
+    ) -> Result<(), DbErr> {
         let txn = self.db.begin().await?;
         for (cidr, offset, reset, bump_epoch) in updates {
             let sql = if reset && bump_epoch {
@@ -200,13 +251,17 @@ impl AsnRepository {
             } else {
                 "UPDATE asn_ranges SET scan_offset = $1 WHERE cidr = $2"
             };
-            
+
             let stmt = if reset {
                 Statement::from_sql_and_values(self.db.get_database_backend(), sql, [cidr.into()])
             } else {
-                Statement::from_sql_and_values(self.db.get_database_backend(), sql, [offset.into(), cidr.into()])
+                Statement::from_sql_and_values(
+                    self.db.get_database_backend(),
+                    sql,
+                    [offset.into(), cidr.into()],
+                )
             };
-            
+
             txn.execute(stmt).await?;
         }
         txn.commit().await?;
@@ -229,21 +284,24 @@ impl AsnRepository {
         let stmt = Statement::from_string(self.db.get_database_backend(), sql.to_string());
         let rows = self.db.query_all(stmt).await?;
 
-        let progress: Vec<CategoryProgress> = rows.into_iter().map(|row| {
-            let total: i64 = row.try_get("", "total_ranges").unwrap_or(0);
-            let scanned: i64 = row.try_get("", "scanned_ranges").unwrap_or(0);
-            CategoryProgress {
-                category: row.try_get("", "category").unwrap_or_default(),
-                total_ranges: total,
-                scanned_ranges: scanned,
-                total_epochs: row.try_get("", "total_epochs").unwrap_or(0),
-                cycle_progress_pct: if total > 0 {
-                    (scanned as f64 / total as f64) * 100.0
-                } else {
-                    0.0
-                },
-            }
-        }).collect();
+        let progress: Vec<CategoryProgress> = rows
+            .into_iter()
+            .map(|row| {
+                let total: i64 = row.try_get("", "total_ranges").unwrap_or(0);
+                let scanned: i64 = row.try_get("", "scanned_ranges").unwrap_or(0);
+                CategoryProgress {
+                    category: row.try_get("", "category").unwrap_or_default(),
+                    total_ranges: total,
+                    scanned_ranges: scanned,
+                    total_epochs: row.try_get("", "total_epochs").unwrap_or(0),
+                    cycle_progress_pct: if total > 0 {
+                        (scanned as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                }
+            })
+            .collect();
 
         Ok(progress)
     }

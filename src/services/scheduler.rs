@@ -3,14 +3,14 @@
 //! Implements Hot/Warm/Cold tier algorithm with ethical weighted selection.
 //! Discovery uses deterministic hash-based IP shuffle tracked by offset in PostgreSQL.
 
+use crate::models::asn::AsnCategory;
+use crate::repositories::{AsnRepository, ServerRepository};
 use chrono::{DateTime, Utc};
+use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use serde::{Deserialize, Serialize};
-use crate::repositories::{ServerRepository, AsnRepository};
-use crate::models::asn::AsnCategory;
-use rand::seq::SliceRandom;
 
 /// Queue sizes for API reporting.
 #[derive(Debug, Clone, Serialize)]
@@ -63,14 +63,16 @@ impl ServerTarget {
         self.priority = 1; // Move to Hot
         self.consecutive_failures = 0;
         self.scan_count += 1;
-        self.success_rate = (self.success_rate * (self.scan_count - 1) as f32 + 1.0) / self.scan_count as f32;
+        self.success_rate =
+            (self.success_rate * (self.scan_count - 1) as f32 + 1.0) / self.scan_count as f32;
     }
 
     pub fn mark_offline(&mut self) {
         self.consecutive_failures += 1;
         self.scan_count += 1;
-        self.success_rate = (self.success_rate * (self.scan_count - 1) as f32) / self.scan_count as f32;
-        
+        self.success_rate =
+            (self.success_rate * (self.scan_count - 1) as f32) / self.scan_count as f32;
+
         if self.consecutive_failures > 5 {
             self.priority = 3; // Move to Cold
         }
@@ -96,7 +98,9 @@ pub fn ip_at_position(position: u64, base_ip: u32, range_size: u64, seed: u64) -
     }
     while gcd(a, range_size) != 1 {
         a = (a + 1) % range_size;
-        if a == 0 { a = 1; }
+        if a == 0 {
+            a = 1;
+        }
     }
     let b = mix_bits(seed ^ 0x517CC1B727220A95) % range_size;
 
@@ -168,7 +172,9 @@ impl Scheduler {
         // Discovery targets always go to the dedicated discovery queue (always ready).
         if server.is_discovery {
             let mut dq = self.discovery_queue.lock().await;
-            if dq.len() >= MAX_QUEUE_SIZE { return; }
+            if dq.len() >= MAX_QUEUE_SIZE {
+                return;
+            }
             if at_front {
                 dq.push_front(server);
             } else {
@@ -216,10 +222,17 @@ impl Scheduler {
         let cold_info = self.find_earliest_ready(&self.cold_queue, &now).await;
 
         // Collect ready tiers with their earliest scan time
-        let mut ready: Vec<(&Arc<Mutex<VecDeque<ServerTarget>>>, usize, DateTime<Utc>)> = Vec::new();
-        if let Some((idx, t)) = hot_info { ready.push((&self.hot_queue, idx, t)); }
-        if let Some((idx, t)) = warm_info { ready.push((&self.warm_queue, idx, t)); }
-        if let Some((idx, t)) = cold_info { ready.push((&self.cold_queue, idx, t)); }
+        let mut ready: Vec<(&Arc<Mutex<VecDeque<ServerTarget>>>, usize, DateTime<Utc>)> =
+            Vec::new();
+        if let Some((idx, t)) = hot_info {
+            ready.push((&self.hot_queue, idx, t));
+        }
+        if let Some((idx, t)) = warm_info {
+            ready.push((&self.warm_queue, idx, t));
+        }
+        if let Some((idx, t)) = cold_info {
+            ready.push((&self.cold_queue, idx, t));
+        }
 
         if !ready.is_empty() {
             // Pick the tier with the earliest-ready item (most overdue)
@@ -286,16 +299,24 @@ impl Scheduler {
         // INTERLEAVED DISCOVERY: Fetch hosting ranges
         match self.asn_repo.get_ranges_to_scan("hosting", 100).await {
             Ok(ranges) => {
-                if ranges.is_empty() { return; }
+                if ranges.is_empty() {
+                    return;
+                }
                 let count = self.fill_discovery_queue(ranges, 2, 100).await.unwrap_or(0);
                 if count > 0 {
-                    tracing::info!("Discovery: Added {} new targets to discovery queue (from hosting)", count);
+                    tracing::info!(
+                        "Discovery: Added {} new targets to discovery queue (from hosting)",
+                        count
+                    );
                 } else {
                     // Dead tick: all ranges were exhausted. Re-fetch immediately
                     // — ranges now have offset=0 with fresh epoch.
                     match self.asn_repo.get_ranges_to_scan("hosting", 100).await {
                         Ok(ranges2) if !ranges2.is_empty() => {
-                            let count2 = self.fill_discovery_queue(ranges2, 2, 100).await.unwrap_or(0);
+                            let count2 = self
+                                .fill_discovery_queue(ranges2, 2, 100)
+                                .await
+                                .unwrap_or(0);
                             if count2 > 0 {
                                 tracing::info!("Discovery: Recovered from dead tick, added {} targets (hosting)", count2);
                             }
@@ -316,7 +337,8 @@ impl Scheduler {
         // 1. Try to recycle dead/ignored servers (these go to main cold queue)
         if let Ok(dead_servers) = self.server_repo.get_dead_servers(1000).await {
             for server in dead_servers {
-                let mut target = ServerTarget::new(server.ip, server.port as u16, server.server_type);
+                let mut target =
+                    ServerTarget::new(server.ip, server.port as u16, server.server_type);
                 target.priority = 3;
                 if let Some(last) = server.last_seen {
                     target.next_scan_at = Some(last.and_utc() + chrono::Duration::days(7));
@@ -326,7 +348,11 @@ impl Scheduler {
         }
 
         // 2. INTERLEAVED DISCOVERY: Fetch residential and unknown ranges
-        let mut ranges = self.asn_repo.get_ranges_to_scan("residential", 100).await.unwrap_or_default();
+        let mut ranges = self
+            .asn_repo
+            .get_ranges_to_scan("residential", 100)
+            .await
+            .unwrap_or_default();
         let mut source = "residential";
         if ranges.is_empty() {
             if let Ok(r) = self.asn_repo.get_ranges_to_scan("unknown", 100).await {
@@ -338,10 +364,18 @@ impl Scheduler {
         if !ranges.is_empty() {
             let count = self.fill_discovery_queue(ranges, 3, 100).await.unwrap_or(0);
             if count > 0 {
-                tracing::info!("Discovery: Added {} new targets to discovery queue (from {})", count, source);
+                tracing::info!(
+                    "Discovery: Added {} new targets to discovery queue (from {})",
+                    count,
+                    source
+                );
             } else {
                 // Dead tick recovery: re-fetch ranges (now offset=0 with fresh epoch)
-                let mut ranges2 = self.asn_repo.get_ranges_to_scan("residential", 100).await.unwrap_or_default();
+                let mut ranges2 = self
+                    .asn_repo
+                    .get_ranges_to_scan("residential", 100)
+                    .await
+                    .unwrap_or_default();
                 let mut source2 = "residential";
                 if ranges2.is_empty() {
                     if let Ok(r) = self.asn_repo.get_ranges_to_scan("unknown", 100).await {
@@ -350,9 +384,16 @@ impl Scheduler {
                     }
                 }
                 if !ranges2.is_empty() {
-                    let count2 = self.fill_discovery_queue(ranges2, 3, 100).await.unwrap_or(0);
+                    let count2 = self
+                        .fill_discovery_queue(ranges2, 3, 100)
+                        .await
+                        .unwrap_or(0);
                     if count2 > 0 {
-                        tracing::info!("Discovery: Recovered from dead tick, added {} targets ({})", count2, source2);
+                        tracing::info!(
+                            "Discovery: Recovered from dead tick, added {} targets ({})",
+                            count2,
+                            source2
+                        );
                     }
                 }
             }
@@ -405,13 +446,21 @@ impl Scheduler {
                 let ip_str = format_ip(ip_val);
 
                 let mut java_target = ServerTarget::new(ip_str.clone(), 25565, "java".to_string());
-                java_target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
+                java_target.category = if priority == 2 {
+                    AsnCategory::Hosting
+                } else {
+                    AsnCategory::Residential
+                };
                 java_target.priority = priority;
                 java_target.is_discovery = true;
                 all_targets.push(java_target);
 
                 let mut bedrock_target = ServerTarget::new(ip_str, 19132, "bedrock".to_string());
-                bedrock_target.category = if priority == 2 { AsnCategory::Hosting } else { AsnCategory::Residential };
+                bedrock_target.category = if priority == 2 {
+                    AsnCategory::Hosting
+                } else {
+                    AsnCategory::Residential
+                };
                 bedrock_target.priority = priority;
                 bedrock_target.is_discovery = true;
                 all_targets.push(bedrock_target);
@@ -465,7 +514,7 @@ impl Scheduler {
 
         if was_online {
             server.mark_online();
-            
+
             // Progressive Port Scanning Logic (only for Java servers)
             // User requested: "make sure the progressive scanning is in the hot stage instead of the discovery stage"
             // This means we only do it if the server was already in our DB (!is_new_discovery)
@@ -473,13 +522,21 @@ impl Scheduler {
                 if server.direction == 0 {
                     // Start progressive scan from default port
                     if server.port == 25565 {
-                        let mut t_up = ServerTarget::new(server.ip.clone(), server.port + 1, "java".to_string());
+                        let mut t_up = ServerTarget::new(
+                            server.ip.clone(),
+                            server.port + 1,
+                            "java".to_string(),
+                        );
                         t_up.direction = 1;
                         t_up.category = server.category.clone();
                         t_up.priority = server.priority;
                         self.add_server(t_up, false).await;
-                        
-                        let mut t_down = ServerTarget::new(server.ip.clone(), server.port - 1, "java".to_string());
+
+                        let mut t_down = ServerTarget::new(
+                            server.ip.clone(),
+                            server.port - 1,
+                            "java".to_string(),
+                        );
                         t_down.direction = -1;
                         t_down.category = server.category.clone();
                         t_down.priority = server.priority;
@@ -487,14 +544,16 @@ impl Scheduler {
                     }
                 } else if server.direction == 1 && server.port < 65535 {
                     // Continue scanning upwards
-                    let mut t_up = ServerTarget::new(server.ip.clone(), server.port + 1, "java".to_string());
+                    let mut t_up =
+                        ServerTarget::new(server.ip.clone(), server.port + 1, "java".to_string());
                     t_up.direction = 1;
                     t_up.category = server.category.clone();
                     t_up.priority = server.priority;
                     self.add_server(t_up, false).await;
                 } else if server.direction == -1 && server.port > 1 {
                     // Continue scanning downwards
-                    let mut t_down = ServerTarget::new(server.ip.clone(), server.port - 1, "java".to_string());
+                    let mut t_down =
+                        ServerTarget::new(server.ip.clone(), server.port - 1, "java".to_string());
                     t_down.direction = -1;
                     t_down.category = server.category.clone();
                     t_down.priority = server.priority;
@@ -508,7 +567,11 @@ impl Scheduler {
         // If it's a new discovery target and it's offline, don't re-queue it.
         // This prevents the memory queue from being filled with thousands of offline IPs.
         if is_new_discovery && !was_online {
-            tracing::debug!("Dropping offline discovery target: {}:{}", server.ip, server.port);
+            tracing::debug!(
+                "Dropping offline discovery target: {}:{}",
+                server.ip,
+                server.port
+            );
             return;
         }
 
@@ -537,14 +600,19 @@ impl Scheduler {
     /// Get queue sizes as a serializable struct for the API.
     pub async fn get_queue_stats(&self) -> QueueStats {
         let (hot, warm, cold, discovery) = self.get_queue_sizes().await;
-        QueueStats { hot, warm, cold, discovery }
+        QueueStats {
+            hot,
+            warm,
+            cold,
+            discovery,
+        }
     }
 
     /// Periodically refill queues from DB with servers whose scan interval has elapsed.
     /// Only runs when queue is below 25% of threshold to prevent aggressive re-scanning.
     pub async fn try_refill_queues(&self) {
         let configs = vec![
-            (1, 2, 1000, 500u64),   // priority, interval_hours, threshold, limit
+            (1, 2, 1000, 500u64), // priority, interval_hours, threshold, limit
             (2, 24, 500, 300u64),
             (3, 168, 500, 200u64),
         ];
@@ -563,12 +631,18 @@ impl Scheduler {
                 continue;
             }
 
-            let ready_servers = match self.server_repo.get_servers_for_refill(priority, interval_hours, limit).await {
+            let ready_servers = match self
+                .server_repo
+                .get_servers_for_refill(priority, interval_hours, limit)
+                .await
+            {
                 Ok(s) => s,
                 Err(_) => continue,
             };
 
-            if ready_servers.is_empty() { continue; }
+            if ready_servers.is_empty() {
+                continue;
+            }
 
             tracing::info!(
                 "Queue refill: priority={} queue has {} items (threshold: {}), adding {} servers from DB",
@@ -576,7 +650,11 @@ impl Scheduler {
             );
             let mut q = queue.lock().await;
             for server in ready_servers {
-                let mut target = ServerTarget::new(server.ip, server.port.try_into().unwrap_or(25565), server.server_type);
+                let mut target = ServerTarget::new(
+                    server.ip,
+                    server.port.try_into().unwrap_or(25565),
+                    server.server_type,
+                );
                 target.priority = priority;
                 target.last_scanned = server.last_seen.map(|t| t.and_utc());
                 target.next_scan_at = None; // Ready to scan now
@@ -591,7 +669,11 @@ impl Scheduler {
         let servers = self.server_repo.get_servers_for_load(50000).await?;
 
         for server in servers {
-            let mut target = ServerTarget::new(server.ip, server.port.try_into().unwrap_or(25565), server.server_type);
+            let mut target = ServerTarget::new(
+                server.ip,
+                server.port.try_into().unwrap_or(25565),
+                server.server_type,
+            );
             target.priority = server.priority;
             target.consecutive_failures = server.consecutive_failures;
             target.category = AsnCategory::Unknown;
@@ -643,8 +725,17 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for pos in 0..size {
             let ip = ip_at_position(pos, base, size, seed);
-            assert!(ip >= base && ip < base + size as u32, "IP out of range at pos {}", pos);
-            assert!(seen.insert(ip), "Duplicate IP {} at pos {}", format_ip(ip), pos);
+            assert!(
+                ip >= base && ip < base + size as u32,
+                "IP out of range at pos {}",
+                pos
+            );
+            assert!(
+                seen.insert(ip),
+                "Duplicate IP {} at pos {}",
+                format_ip(ip),
+                pos
+            );
         }
         assert_eq!(seen.len(), size as usize, "Should cover all {} IPs", size);
     }
@@ -682,14 +773,23 @@ mod tests {
         // Spot check: all should be in range
         for pos in [0, 1000, 32768, 65535] {
             let ip = ip_at_position(pos, base, size, seed);
-            assert!(ip >= base && ip < base + size as u32, "IP out of range at pos {}", pos);
+            assert!(
+                ip >= base && ip < base + size as u32,
+                "IP out of range at pos {}",
+                pos
+            );
         }
 
         // Verify first 1000 are unique
         let mut seen = std::collections::HashSet::new();
         for pos in 0..1000u64 {
             let ip = ip_at_position(pos, base, size, seed);
-            assert!(seen.insert(ip), "Duplicate IP {} at pos {}", format_ip(ip), pos);
+            assert!(
+                seen.insert(ip),
+                "Duplicate IP {} at pos {}",
+                format_ip(ip),
+                pos
+            );
         }
         assert_eq!(seen.len(), 1000);
     }
@@ -704,8 +804,17 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for pos in 0..size {
             let ip = ip_at_position(pos, base, size, seed);
-            assert!(ip >= base && ip < base + size as u32, "IP out of range at pos {}", pos);
-            assert!(seen.insert(ip), "Duplicate IP {} at pos {}", format_ip(ip), pos);
+            assert!(
+                ip >= base && ip < base + size as u32,
+                "IP out of range at pos {}",
+                pos
+            );
+            assert!(
+                seen.insert(ip),
+                "Duplicate IP {} at pos {}",
+                format_ip(ip),
+                pos
+            );
         }
         assert_eq!(seen.len(), size as usize);
     }
@@ -720,7 +829,11 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for pos in 0..size {
             let ip = ip_at_position(pos, base, size, seed);
-            assert!(ip >= base && ip < base + size as u32, "IP out of range at pos {}", pos);
+            assert!(
+                ip >= base && ip < base + size as u32,
+                "IP out of range at pos {}",
+                pos
+            );
             assert!(seen.insert(ip), "Duplicate IP at pos {}", pos);
         }
     }

@@ -12,69 +12,96 @@ impl MigrationTrait for Migration {
 
         // 1. Convert IP columns from TEXT to INET
         println!("Converting IP columns from TEXT to INET...");
-        
+
         // servers.ip
-        db.execute_unprepared("
+        db.execute_unprepared(
+            "
             ALTER TABLE servers 
             ALTER COLUMN ip TYPE INET USING ip::INET
-        ").await?;
+        ",
+        )
+        .await?;
 
         // server_players.ip
-        db.execute_unprepared("
+        db.execute_unprepared(
+            "
             ALTER TABLE server_players 
             ALTER COLUMN ip TYPE INET USING ip::INET
-        ").await?;
+        ",
+        )
+        .await?;
 
         // server_history.ip
-        db.execute_unprepared("
+        db.execute_unprepared(
+            "
             ALTER TABLE server_history 
             ALTER COLUMN ip TYPE INET USING ip::INET
-        ").await?;
+        ",
+        )
+        .await?;
 
         println!("IP columns converted to INET.");
 
         // 2. Convert port columns from INTEGER to SMALLINT
         println!("Converting port columns from INTEGER to SMALLINT...");
-        
+
         // servers.port
-        db.execute_unprepared("
+        db.execute_unprepared(
+            "
             ALTER TABLE servers 
             ALTER COLUMN port TYPE SMALLINT USING port::SMALLINT
-        ").await?;
+        ",
+        )
+        .await?;
 
         // server_players.port
-        db.execute_unprepared("
+        db.execute_unprepared(
+            "
             ALTER TABLE server_players 
             ALTER COLUMN port TYPE SMALLINT USING port::SMALLINT
-        ").await?;
+        ",
+        )
+        .await?;
 
         // server_history.port
-        db.execute_unprepared("
+        db.execute_unprepared(
+            "
             ALTER TABLE server_history 
             ALTER COLUMN port TYPE SMALLINT USING port::SMALLINT
-        ").await?;
+        ",
+        )
+        .await?;
 
         println!("Port columns converted to SMALLINT.");
 
         // 3. Add trigram index for player name substring searches
         println!("Creating optimized indexes...");
-        
-        db.execute_unprepared("
+
+        db.execute_unprepared(
+            "
             CREATE INDEX IF NOT EXISTS trgm_idx_server_players_player_name 
             ON server_players USING GIN (player_name gin_trgm_ops)
-        ").await?;
+        ",
+        )
+        .await?;
 
         // 4. Add GIN index for ASN tags (improve tag-based filtering)
-        db.execute_unprepared("
+        db.execute_unprepared(
+            "
             CREATE INDEX IF NOT EXISTS idx_asns_tags_gin 
             ON asns USING GIN (to_tsvector('simple', COALESCE(tags, '')))
-        ").await?;
+        ",
+        )
+        .await?;
 
         // 5. Add composite index for server flags filtering
-        db.execute_unprepared("
+        db.execute_unprepared(
+            "
             CREATE INDEX IF NOT EXISTS idx_servers_flags_status 
             ON servers (status) WHERE flags IS NOT NULL AND flags != ''
-        ").await?;
+        ",
+        )
+        .await?;
 
         println!("Database optimization complete!");
         println!("Storage savings:");
@@ -96,19 +123,38 @@ impl MigrationTrait for Migration {
         println!("Rolling back database optimization...");
 
         // Revert ports back to INTEGER
-        db.execute_unprepared("ALTER TABLE server_history ALTER COLUMN port TYPE INTEGER USING port::INTEGER").await?;
-        db.execute_unprepared("ALTER TABLE server_players ALTER COLUMN port TYPE INTEGER USING port::INTEGER").await?;
-        db.execute_unprepared("ALTER TABLE servers ALTER COLUMN port TYPE INTEGER USING port::INTEGER").await?;
+        db.execute_unprepared(
+            "ALTER TABLE server_history ALTER COLUMN port TYPE INTEGER USING port::INTEGER",
+        )
+        .await?;
+        db.execute_unprepared(
+            "ALTER TABLE server_players ALTER COLUMN port TYPE INTEGER USING port::INTEGER",
+        )
+        .await?;
+        db.execute_unprepared(
+            "ALTER TABLE servers ALTER COLUMN port TYPE INTEGER USING port::INTEGER",
+        )
+        .await?;
 
         // Revert IPs back to TEXT
-        db.execute_unprepared("ALTER TABLE server_history ALTER COLUMN ip TYPE TEXT USING ip::TEXT").await?;
-        db.execute_unprepared("ALTER TABLE server_players ALTER COLUMN ip TYPE TEXT USING ip::TEXT").await?;
-        db.execute_unprepared("ALTER TABLE servers ALTER COLUMN ip TYPE TEXT USING ip::TEXT").await?;
+        db.execute_unprepared(
+            "ALTER TABLE server_history ALTER COLUMN ip TYPE TEXT USING ip::TEXT",
+        )
+        .await?;
+        db.execute_unprepared(
+            "ALTER TABLE server_players ALTER COLUMN ip TYPE TEXT USING ip::TEXT",
+        )
+        .await?;
+        db.execute_unprepared("ALTER TABLE servers ALTER COLUMN ip TYPE TEXT USING ip::TEXT")
+            .await?;
 
         // Drop new indexes
-        db.execute_unprepared("DROP INDEX IF EXISTS trgm_idx_server_players_player_name").await?;
-        db.execute_unprepared("DROP INDEX IF EXISTS idx_asns_tags_gin").await?;
-        db.execute_unprepared("DROP INDEX IF EXISTS idx_servers_flags_status").await?;
+        db.execute_unprepared("DROP INDEX IF EXISTS trgm_idx_server_players_player_name")
+            .await?;
+        db.execute_unprepared("DROP INDEX IF EXISTS idx_asns_tags_gin")
+            .await?;
+        db.execute_unprepared("DROP INDEX IF EXISTS idx_servers_flags_status")
+            .await?;
 
         println!("Database optimization rollback complete.");
 

@@ -1,5 +1,5 @@
 //! Rate-limited concurrent scanner.
-//! 
+//!
 //! Hardcoded limits:
 //! - Max 200 simultaneous tasks
 //! - ~100 new connections per second
@@ -46,10 +46,10 @@ impl RateLimiter {
 
             loop {
                 interval.tick().await;
-                
+
                 fractional_permits += rps_per_tick;
                 let to_add = fractional_permits.floor() as usize;
-                
+
                 if to_add > 0 {
                     let current_permits = semaphore.available_permits();
                     // Don't burst more than 1 second worth of permits
@@ -97,11 +97,19 @@ impl Scanner {
     }
 
     /// Scan a single server with safety checks.
-    /// 
+    ///
     /// # Safety
     /// - Checks exclude list BEFORE any connection
     /// - If excluded, SKIP immediately (no log, no ping)
-    pub async fn scan_server(&self, ip: &str, port: u16, hostname: Option<&str>, priority: i32, _is_discovery: bool, server_type: &str) -> Option<crate::network::ScanResult> {
+    pub async fn scan_server(
+        &self,
+        ip: &str,
+        port: u16,
+        hostname: Option<&str>,
+        priority: i32,
+        _is_discovery: bool,
+        server_type: &str,
+    ) -> Option<crate::network::ScanResult> {
         // Parse IP
         let ip_addr: IpAddr = match ip.parse() {
             Ok(addr) => addr,
@@ -132,9 +140,13 @@ impl Scanner {
         let addr = SocketAddr::new(ip_addr, port);
 
         let ping_result = if server_type == "bedrock" {
-            crate::network::raknet::ping_server(addr).await.map_err(|e| e.to_string())
+            crate::network::raknet::ping_server(addr)
+                .await
+                .map_err(|e| e.to_string())
         } else {
-            crate::network::slp::ping_server(addr, hostname).await.map_err(|e| e.to_string())
+            crate::network::slp::ping_server(addr, hostname)
+                .await
+                .map_err(|e| e.to_string())
         };
 
         // DATA ENRICHMENT: Fetch ASN info
@@ -166,12 +178,19 @@ impl Scanner {
             Ok(status) => {
                 let players_online = status.players.as_ref().map(|p| p.online).unwrap_or(0);
                 let players_max = status.players.as_ref().map(|p| p.max).unwrap_or(0);
-                let players_sample = status.players.as_ref().and_then(|p| p.sample.clone()).map(|s| {
-                    s.into_iter().map(|p| crate::network::PlayerSample {
-                        name: p.name,
-                        uuid: p.id,
-                    }).collect()
-                });
+                let players_sample =
+                    status
+                        .players
+                        .as_ref()
+                        .and_then(|p| p.sample.clone())
+                        .map(|s| {
+                            s.into_iter()
+                                .map(|p| crate::network::PlayerSample {
+                                    name: p.name,
+                                    uuid: p.id,
+                                })
+                                .collect()
+                        });
                 let motd = Some(crate::network::slp::extract_motd(&status));
                 let version = status.version.as_ref().map(|v| v.name.clone());
                 let favicon = status.favicon.clone();
@@ -194,24 +213,22 @@ impl Scanner {
                     timestamp,
                 })
             }
-            Err(_) => {
-                Some(crate::network::ScanResult {
-                    ip: ip.to_string(),
-                    port,
-                    server_type: server_type.to_string(),
-                    online: false,
-                    players_online: 0,
-                    players_max: 0,
-                    motd: None,
-                    version: None,
-                    favicon: None,
-                    brand: None,
-                    asn,
-                    country: Some(country),
-                    players_sample: None,
-                    timestamp,
-                })
-            }
+            Err(_) => Some(crate::network::ScanResult {
+                ip: ip.to_string(),
+                port,
+                server_type: server_type.to_string(),
+                online: false,
+                players_online: 0,
+                players_max: 0,
+                motd: None,
+                version: None,
+                favicon: None,
+                brand: None,
+                asn,
+                country: Some(country),
+                players_sample: None,
+                timestamp,
+            }),
         }
     }
 }
