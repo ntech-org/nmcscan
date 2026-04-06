@@ -512,7 +512,8 @@ impl ServerRepository {
         };
 
         // Cursor-based pagination
-        if let Some(c_ip) = cursor_ip {
+        if let Some(c_ip_str) = cursor_ip {
+            let c_ip = parse_ip(c_ip_str);
             match sort_by {
                 Some("players") => {
                     if let Some(c_val) = cursor_players {
