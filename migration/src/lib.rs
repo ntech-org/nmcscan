@@ -7,6 +7,7 @@ mod m20260329_000004_cleanup_ignored_servers;
 mod m20260331_000005_add_scan_epoch;
 mod m20260402_000006_add_login_and_flags;
 mod m20260406_000007_create_minecraft_accounts;
+mod m20260406_000008_optimize_database_types;
 
 pub struct Migrator;
 
@@ -21,6 +22,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260331_000005_add_scan_epoch::Migration),
             Box::new(m20260402_000006_add_login_and_flags::Migration),
             Box::new(m20260406_000007_create_minecraft_accounts::Migration),
+            Box::new(m20260406_000008_optimize_database_types::Migration),
         ]
     }
 }

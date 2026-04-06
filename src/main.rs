@@ -169,13 +169,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     asn_fetcher.initialize().await?;
     
     // STARTUP SCRUB: Recategorize "unknown" ASNs with latest heuristics.
-    // Only runs if no ASN (any category) was updated in the last 7 days.
+    // Only runs if no ASN (any category) was updated in the last 7 days,
+    // OR if there's a high percentage of unknown ASNs (> 50%).
     // The weekly background refresh (run_background_refresh) handles full
     // re-categorization of ALL ASNs from the iptoasn.com database, so this
     // startup scrub is just a safety net for when the weekly import hasn't run.
     // The timer persists across restarts via the last_updated column in asns.
     {
-        use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, QuerySelect};
+        use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, QuerySelect, PaginatorTrait};
+        
+        // Check if any ASN was recently updated
         let any_recent = crate::models::entities::asns::Entity::find()
             .filter(
                 crate::models::entities::asns::Column::LastUpdated
@@ -186,12 +189,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .unwrap_or_default();
 
-        if any_recent.is_some() {
-            tracing::info!("ASN data was updated within 7 days, skipping startup scrub.");
+        // Count unknown ASNs to determine if we need recategorization
+        let unknown_count = crate::models::entities::asns::Entity::find()
+            .filter(crate::models::entities::asns::Column::Category.eq("unknown"))
+            .count(&*db)
+            .await
+            .unwrap_or(0);
+        
+        let total_count = crate::models::entities::asns::Entity::find()
+            .count(&*db)
+            .await
+            .unwrap_or(1); // Avoid division by zero
+
+        let unknown_percentage = if total_count > 0 {
+            (unknown_count as f64 / total_count as f64) * 100.0
         } else {
-            tracing::info!("Running startup ASN recategorization (no updates in > 7 days)...");
+            0.0
+        };
+
+        if any_recent.is_some() && unknown_percentage < 50.0 {
+            tracing::info!(
+                "ASN data was updated within 7 days ({}% unknown), skipping startup scrub.",
+                unknown_percentage
+            );
+        } else {
+            if unknown_percentage >= 50.0 {
+                tracing::warn!(
+                    "High unknown ASN percentage detected: {}% ({}/{} ASNs). Running recategorization...",
+                    unknown_percentage,
+                    unknown_count,
+                    total_count
+                );
+            } else {
+                tracing::info!(
+                    "Running startup ASN recategorization (no updates in > 7 days, {}% unknown)...",
+                    unknown_percentage
+                );
+            }
+            
             let ipverse_map = asn_fetcher.fetch_ipverse_map().await;
-            let _ = asn_fetcher.recategorize_all_asns(&ipverse_map).await;
+            tracing::info!("Fetched ipverse category map with {} entries", ipverse_map.len());
+            
+            match asn_fetcher.recategorize_all_asns(&ipverse_map).await {
+                Ok(updated) => {
+                    tracing::info!("Startup recategorization complete: {} ASNs reclassified", updated);
+                }
+                Err(e) => {
+                    tracing::error!("Startup recategorization failed: {}", e);
+                }
+            }
         }
     }
 
@@ -279,8 +325,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             target.category = AsnCategory::Hosting;
             target.priority = 1; // Hot priority for test servers
             target.hostname = Some(host.clone());
-            
-            let _ = server_repo.insert_server_if_new(ip, *port as i32, &server_type).await;
+
+            let port_i16: i16 = (*port).try_into().unwrap_or(25565);
+            let _ = server_repo.insert_server_if_new(ip, port_i16, &server_type).await;
             
             scheduler.add_server(target, false).await;
             tracing::debug!("  Added test server: {} ({}:{} as {})", name, ip, port, host);

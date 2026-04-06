@@ -68,6 +68,64 @@ touch nmcscan.db
 - **Tier 2 (Warm)**: Known hosting ASN ranges, not scanned in 7 days
 - **Tier 3 (Cold)**: High-failure servers (>5 failures), very slow scan
 
+## 🌐 ASN Intelligence System
+
+NMCScan uses a sophisticated ASN (Autonomous System Number) classification system to prioritize scanning:
+
+### ASN Categories
+
+- **Hosting**: Cloud providers, VPS hosts, data centers (scanned frequently)
+- **Residential**: Home ISP networks (scanned rarely)
+- **Excluded**: Military, government, education, sensitive infrastructure (NEVER scanned)
+- **Unknown**: Unclassified (default until categorized)
+
+### ASN Data Sources
+
+1. **MaxMind GeoLite2**: Local ASN and country databases
+2. **iptoasn.com**: Full IPv4 ASN range database
+3. **ipverse/as-metadata**: Community-maintained ASN categorization (hosting/isp/business/education_research)
+
+### Recategorization
+
+The system automatically recategorizes unknown ASNs on startup if:
+- No ASN data was updated in the last 7 days, OR
+- More than 50% of ASNs are still uncategorized
+
+**Force a full ASN re-import** (useful when adding new providers like ipverse):
+
+```bash
+# Using CLI flag
+./target/release/nmcscan --force-asn-import
+
+# Or via environment variable
+FORCE_ASN_IMPORT=true ./target/release/nmcscan
+
+# Or in docker compose
+FORCE_ASN_IMPORT=true docker compose up
+```
+
+This will:
+1. Download the latest ipverse category map
+2. Download the full iptoasn.com database
+3. Import all ASN ranges with proper categorization
+4. Recategorize all previously unknown ASNs
+
+**Monitor ASN statistics**:
+
+```sql
+-- Check ASN category distribution
+SELECT category, COUNT(*) as count 
+FROM asns 
+GROUP BY category;
+
+-- Check how many ASNs are still unknown
+SELECT 
+    COUNT(*) as total,
+    COUNT(CASE WHEN category = 'unknown' THEN 1 END) as unknown,
+    ROUND(100.0 * COUNT(CASE WHEN category = 'unknown' THEN 1 END) / COUNT(*), 2) as pct_unknown
+FROM asns;
+```
+
 ## 📊 Database Schema
 
 ```sql

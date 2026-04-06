@@ -117,9 +117,10 @@ impl LoginQueue {
         // Use latest protocol version for manual attempts
         let result = login::attempt_login(addr, 775).await;
         let obstacle_str = result.obstacle.to_string();
+        let port_i16: i16 = port.try_into().unwrap_or(25565);
 
         // Store result
-        if let Err(e) = self.server_repo.update_login_result(ip, port as i32, &obstacle_str).await {
+        if let Err(e) = self.server_repo.update_login_result(ip, port_i16, &obstacle_str).await {
             tracing::error!("Failed to update login result for {}:{}: {}", ip, port, e);
         }
 

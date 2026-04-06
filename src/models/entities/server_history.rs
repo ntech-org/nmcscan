@@ -5,8 +5,8 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub ip: String,
-    #[sea_orm(primary_key)]
-    pub port: i32,
+    #[sea_orm(primary_key, column_type = "SmallInteger")]
+    pub port: i16,
     #[sea_orm(primary_key)]
     pub timestamp: DateTime,
     pub players_online: i32,

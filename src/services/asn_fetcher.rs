@@ -228,20 +228,36 @@ impl AsnFetcher {
     }
 
     pub async fn fetch_ipverse_map(&self) -> std::collections::HashMap<String, String> {
+        tracing::info!("Fetching ipverse ASN category map...");
         let mut ipverse_map = std::collections::HashMap::new();
-        if let Ok(ipverse_response) = self.client.get(IPVERSE_ASN_URL).send().await {
-            if ipverse_response.status().is_success() {
-                if let Ok(ipverse_asns) = ipverse_response.json::<Vec<IpverseAsn>>().await {
-                    for item in ipverse_asns {
-                        if let Some(meta) = item.metadata {
-                            if let Some(cat) = meta.category {
-                                ipverse_map.insert(format!("AS{}", item.asn), cat);
+        
+        match self.client.get(IPVERSE_ASN_URL).send().await {
+            Ok(ipverse_response) => {
+                if ipverse_response.status().is_success() {
+                    match ipverse_response.json::<Vec<IpverseAsn>>().await {
+                        Ok(ipverse_asns) => {
+                            for item in ipverse_asns {
+                                if let Some(meta) = item.metadata {
+                                    if let Some(cat) = meta.category {
+                                        ipverse_map.insert(format!("AS{}", item.asn), cat);
+                                    }
+                                }
                             }
+                            tracing::info!("Successfully fetched {} ipverse ASN categories", ipverse_map.len());
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to parse ipverse JSON: {}", e);
                         }
                     }
+                } else {
+                    tracing::error!("ipverse API returned non-success status: {}", ipverse_response.status());
                 }
             }
+            Err(e) => {
+                tracing::error!("Failed to fetch ipverse data: {}", e);
+            }
         }
+        
         ipverse_map
     }
 
@@ -249,6 +265,7 @@ impl AsnFetcher {
     pub async fn import_full_database(&self) -> Result<(), AsnError> {
         tracing::info!("Downloading ASN categorization metadata from ipverse...");
         let ipverse_map = self.fetch_ipverse_map().await;
+        tracing::info!("ipverse map contains {} categorized ASNs", ipverse_map.len());
 
         tracing::info!("Downloading full ASN database from iptoasn.com...");
         let response = self.client.get(FULL_ASN_URL).send().await?;
@@ -302,7 +319,7 @@ impl AsnFetcher {
             let tags = AsnManager::extract_tags(&org);
             let category_str = ipverse_map.get(&asn).map(|s| s.as_str());
             let category = AsnManager::categorize_from_ipverse(&org, category_str);
-            
+
             let tags_str = tags.join(",");
             let cat_str = match category {
                 AsnCategory::Hosting => "hosting",
@@ -310,7 +327,7 @@ impl AsnFetcher {
                 AsnCategory::Excluded => "excluded",
                 AsnCategory::Unknown => "unknown",
             }.to_string();
-            
+
             asn_models.push(asns::ActiveModel {
                 asn: Set(asn),
                 org: Set(org),
@@ -374,10 +391,14 @@ impl AsnFetcher {
 
     /// Run a throttled batch re-categorization of "Unknown" ASNs in the database.
     pub async fn recategorize_all_asns(&self, ipverse_map: &std::collections::HashMap<String, String>) -> Result<usize, AsnError> {
-        tracing::info!("Recategorizing Unknown ASNs in database (throttled)...");
-        
+        tracing::info!("Starting recategorization of Unknown ASNs with ipverse map ({} entries)...", ipverse_map.len());
+
         let mut total_updated = 0;
         let mut processed = 0;
+        let mut unknown_remaining = 0;
+        let mut hosting_promoted = 0;
+        let mut residential_promoted = 0;
+        let mut excluded_promoted = 0;
         let batch_size = 500;
 
         loop {
@@ -388,13 +409,13 @@ impl AsnFetcher {
                 .all(&*self.db)
                 .await
                 .map_err(|e| AsnError::MaxMindError(format!("DB error: {}", e)))?;
-            
+
             if asns_models.is_empty() {
                 break;
             }
 
             let mut chunk_updated = 0;
-            
+
             // Wrap the entire batch in a transaction for efficiency
             use sea_orm::TransactionTrait;
             let tx = self.db.begin().await.map_err(|e| AsnError::MaxMindError(format!("Tx error: {}", e)))?;
@@ -404,50 +425,74 @@ impl AsnFetcher {
                 let tags = AsnManager::extract_tags(&model.org);
                 let category_str = ipverse_map.get(&model.asn).map(|s| s.as_str());
                 let category = AsnManager::categorize_from_ipverse(&model.org, category_str);
-                
+
                 let mut active: asns::ActiveModel = model.into();
                 let mut changed = false;
 
                 if category != AsnCategory::Unknown {
                     let cat_str = match category {
-                        AsnCategory::Hosting => "hosting",
-                        AsnCategory::Residential => "residential",
-                        AsnCategory::Excluded => "excluded",
+                        AsnCategory::Hosting => {
+                            hosting_promoted += 1;
+                            "hosting"
+                        },
+                        AsnCategory::Residential => {
+                            residential_promoted += 1;
+                            "residential"
+                        },
+                        AsnCategory::Excluded => {
+                            excluded_promoted += 1;
+                            "excluded"
+                        },
                         _ => "unknown",
                     };
                     active.category = Set(cat_str.to_string());
                     active.tags = Set(Some(tags.join(",")));
                     changed = true;
+                } else {
+                    unknown_remaining += 1;
                 }
 
                 active.last_updated = Set(Some(Utc::now().into()));
                 active.update(&tx).await.map_err(|e| AsnError::MaxMindError(format!("Update error: {}", e)))?;
-                
+
                 if changed {
                     chunk_updated += 1;
                 }
             }
-            
+
             tx.commit().await.map_err(|e| AsnError::MaxMindError(format!("Commit error: {}", e)))?;
 
             total_updated += chunk_updated;
-            
+
             if processed % 5000 == 0 {
-                tracing::info!("Recategorization progress: processed {} ASNs...", processed);
+                tracing::info!("Recategorization progress: processed {} ASNs, {} updated so far...", processed, total_updated);
             }
-            
+
             // Sleep to reduce CPU/DB pressure
             time::sleep(time::Duration::from_millis(200)).await;
-            
-            if processed > 250000 { break; }
+
+            if processed > 250000 { 
+                tracing::warn!("Recategorization hit processing limit (250k ASNs). Some ASNs may remain uncategorized.");
+                break; 
+            }
         }
 
         if processed > 0 {
-            tracing::info!("Recategorization complete: processed {} total, {} promoted from Unknown.", processed, total_updated);
+            tracing::info!(
+                "Recategorization complete: processed {} total, {} promoted from Unknown ({} hosting, {} residential, {} excluded), {} still unknown.",
+                processed,
+                total_updated,
+                hosting_promoted,
+                residential_promoted,
+                excluded_promoted,
+                unknown_remaining
+            );
             // Refresh in-memory manager
             let _ = self.load_from_database().await;
+        } else {
+            tracing::info!("No unknown ASNs found to recategorize.");
         }
-        
+
         Ok(total_updated)
     }
 
