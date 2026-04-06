@@ -347,19 +347,13 @@ impl Scheduler {
             }
         }
 
-        // 2. INTERLEAVED DISCOVERY: Fetch residential and unknown ranges
-        let mut ranges = self
+        // 2. DISCOVERY: Fetch residential ranges only (unknown ranges are not worth scanning)
+        let ranges = self
             .asn_repo
             .get_ranges_to_scan("residential", 100)
             .await
             .unwrap_or_default();
-        let mut source = "residential";
-        if ranges.is_empty() {
-            if let Ok(r) = self.asn_repo.get_ranges_to_scan("unknown", 100).await {
-                ranges = r;
-                source = "unknown";
-            }
-        }
+        let source = "residential";
 
         if !ranges.is_empty() {
             let count = self.fill_discovery_queue(ranges, 3, 100).await.unwrap_or(0);
@@ -371,18 +365,11 @@ impl Scheduler {
                 );
             } else {
                 // Dead tick recovery: re-fetch ranges (now offset=0 with fresh epoch)
-                let mut ranges2 = self
+                let ranges2 = self
                     .asn_repo
                     .get_ranges_to_scan("residential", 100)
                     .await
                     .unwrap_or_default();
-                let mut source2 = "residential";
-                if ranges2.is_empty() {
-                    if let Ok(r) = self.asn_repo.get_ranges_to_scan("unknown", 100).await {
-                        ranges2 = r;
-                        source2 = "unknown";
-                    }
-                }
                 if !ranges2.is_empty() {
                     let count2 = self
                         .fill_discovery_queue(ranges2, 3, 100)
@@ -392,7 +379,7 @@ impl Scheduler {
                         tracing::info!(
                             "Discovery: Recovered from dead tick, added {} targets ({})",
                             count2,
-                            source2
+                            source
                         );
                     }
                 }
