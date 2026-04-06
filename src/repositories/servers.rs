@@ -418,11 +418,12 @@ impl ServerRepository {
         }
 
         if let Some(search) = search_query {
+            let pattern = format!("%{}%", search);
             query = query.filter(
                 Condition::any()
-                    .add(servers::Column::Ip.contains(search))
-                    .add(servers::Column::Motd.contains(search))
-                    .add(servers::Column::Version.contains(search)),
+                    .add(Expr::cust_with_values("ip::text ILIKE ?", vec![pattern.clone()]))
+                    .add(Expr::cust_with_values("motd ILIKE ?", vec![pattern.clone()]))
+                    .add(Expr::cust_with_values("version ILIKE ?", vec![pattern])),
             );
         }
 
@@ -661,8 +662,9 @@ impl ServerRepository {
     }
 
     pub async fn search_players(&self, name: &str) -> Result<Vec<server_players::Model>, DbErr> {
+        let pattern = format!("%{}%", name);
         server_players::Entity::find()
-            .filter(server_players::Column::PlayerName.contains(name))
+            .filter(Expr::cust_with_values("player_name ILIKE ?", vec![pattern]))
             .order_by_desc(server_players::Column::LastSeen)
             .limit(50)
             .all(&self.db)
