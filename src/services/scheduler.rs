@@ -541,10 +541,10 @@ impl Scheduler {
     }
 
     /// Periodically refill queues from DB with servers whose scan interval has elapsed.
-    /// Prevents scanner from stalling when in-memory queues drain after initial batch.
+    /// Only runs when queue is below 25% of threshold to prevent aggressive re-scanning.
     pub async fn try_refill_queues(&self) {
         let configs = vec![
-            (1, 2, 1000, 500u64), // priority, interval_hours, threshold, limit
+            (1, 2, 1000, 500u64),   // priority, interval_hours, threshold, limit
             (2, 24, 500, 300u64),
             (3, 168, 500, 200u64),
         ];
@@ -556,7 +556,12 @@ impl Scheduler {
                 _ => &self.cold_queue,
             };
 
-            if queue.lock().await.len() >= threshold { continue; }
+            let current_len = queue.lock().await.len();
+            // Only refill when queue is below 25% of threshold
+            let refill_threshold = threshold / 4;
+            if current_len >= refill_threshold {
+                continue;
+            }
 
             let ready_servers = match self.server_repo.get_servers_for_refill(priority, interval_hours, limit).await {
                 Ok(s) => s,
@@ -565,7 +570,10 @@ impl Scheduler {
 
             if ready_servers.is_empty() { continue; }
 
-            tracing::info!("Queue refill: adding {} priority={} servers from DB", ready_servers.len(), priority);
+            tracing::info!(
+                "Queue refill: priority={} queue has {} items (threshold: {}), adding {} servers from DB",
+                priority, current_len, refill_threshold, ready_servers.len()
+            );
             let mut q = queue.lock().await;
             for server in ready_servers {
                 let mut target = ServerTarget::new(server.ip, server.port.try_into().unwrap_or(25565), server.server_type);

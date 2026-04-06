@@ -376,12 +376,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 interval.tick().await;
                 tick += 1;
                 if !scheduler_filler.test_mode {
-                    // Every 3rd tick: run discovery (adds to discovery_queue)
+                    // Every 3rd tick (15s): run discovery (adds to discovery_queue)
                     if tick % 3 == 0 {
                         scheduler_filler.fill_warm_queue_if_needed().await;
                         scheduler_filler.fill_cold_queue_if_needed().await;
                     }
-                    // Always run refill (re-queues known servers whose interval elapsed)
+                    // Refill queues from DB only when they're getting low (< 25% of threshold)
+                    // This prevents re-scanning servers too aggressively when queues still have plenty of work
                     scheduler_filler.try_refill_queues().await;
                 }
             }

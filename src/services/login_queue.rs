@@ -3,6 +3,9 @@
 //! Iterates through online servers, attempts offline login with "NMCScan",
 //! and stores the result (obstacle type) directly on the server record.
 //! Rate-limited to ~60 attempts/second with low concurrency.
+//!
+//! On startup, waits 30 minutes before processing servers that were never login-tested.
+//! This gives the scanner time to do its initial SLP pass and populate version data.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,7 +14,8 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{self, Duration};
 
 use crate::repositories::ServerRepository;
-use crate::network::login::{self, LoginObstacle, LoginResult};
+use crate::network::login::{self, LoginObstacle, LoginResult, LATEST_PROTOCOL};
+use chrono::{Duration as ChronoDuration, Utc};
 
 /// Login queue statistics.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -132,12 +136,52 @@ impl LoginQueue {
     async fn run_loop(&self) {
         tracing::info!("Login queue loop started");
 
+        // Give the scanner 30 minutes to do initial SLP pass before we start login testing.
+        // This ensures servers have version data populated from SLP first.
+        let mut initial_delay_done = false;
+        const INITIAL_DELAY_SECONDS: i64 = 1800; // 30 minutes
+
         // Token bucket: refill every 16.6ms for ~60/sec rate
         let mut interval = time::interval(Duration::from_micros(16667));
         let mut server_index = 0usize;
 
         while self.running.load(Ordering::Relaxed) {
             interval.tick().await;
+
+            // Check initial delay on first iteration
+            if !initial_delay_done {
+                // Check if any server has been login-tested recently (within last 30 min)
+                // If so, the initial delay is already satisfied by previous run
+                let servers = match self.server_repo.get_online_servers(10).await {
+                    Ok(s) => s,
+                    Err(_) => { time::sleep(Duration::from_secs(5)).await; continue; }
+                };
+                
+                let has_recent_login = servers.iter().any(|s| {
+                    s.last_login_at.map(|lt| {
+                        (Utc::now().naive_utc() - lt).num_seconds() < INITIAL_DELAY_SECONDS
+                    }).unwrap_or(false)
+                });
+                
+                let has_never_tested = servers.iter().all(|s| s.last_login_at.is_none());
+                
+                if has_recent_login {
+                    tracing::info!("Recent login activity detected, skipping initial delay");
+                    initial_delay_done = true;
+                } else if has_never_tested {
+                    tracing::info!(
+                        "No servers have been login-tested yet. Waiting {} minutes before starting...",
+                        INITIAL_DELAY_SECONDS / 60
+                    );
+                    time::sleep(Duration::from_secs(INITIAL_DELAY_SECONDS as u64)).await;
+                    tracing::info!("Initial delay complete, starting login queue");
+                    initial_delay_done = true;
+                    continue;
+                } else {
+                    // Mix of tested and untested servers - proceed normally
+                    initial_delay_done = true;
+                }
+            }
 
             // Fetch a batch of online servers
             let servers = match self.server_repo.get_online_servers(500).await {
@@ -172,6 +216,7 @@ impl LoginQueue {
 
             let ip = server.ip.clone();
             let port = server.port;
+            let server_version = server.version.clone(); // SLP-reported version string
 
             // Acquire concurrency permit
             let permit = match self.semaphore.clone().acquire_owned().await {
@@ -189,8 +234,14 @@ impl LoginQueue {
                     port as u16,
                 );
 
-                // Try with the latest protocol version
-                let result = login::attempt_login(addr, 775).await;
+                // Extract protocol version from SLP-reported version string if available
+                let protocol = server_version
+                    .as_ref()
+                    .and_then(|v| login::version_to_protocol(v))
+                    .unwrap_or(LATEST_PROTOCOL);
+
+                // Use smart login that extracts version from disconnect messages
+                let result = login::attempt_login_smart(addr, protocol).await;
                 let obstacle_str = result.obstacle.to_string();
 
                 // Update server record
@@ -219,9 +270,11 @@ impl LoginQueue {
                     tracing::info!("Login SUCCESS: {}:{}", ip, port);
                 } else {
                     tracing::debug!(
-                        "Login {}: {}:{} - {}",
+                        "Login {}: {}:{} - {} (version: {}, protocol: {})",
                         obstacle_str, ip, port,
-                        result.disconnect_reason.as_deref().unwrap_or("no reason")
+                        result.disconnect_reason.as_deref().unwrap_or("no reason"),
+                        server_version.as_deref().unwrap_or("unknown"),
+                        protocol
                     );
                 }
 

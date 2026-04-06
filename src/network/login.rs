@@ -8,11 +8,13 @@
 //! 1. Handshake with next_state = 2 (Login)
 //! 2. Login Start with username "NMCScan"
 //! 3. Read server response:
-//!    - 0x00 Disconnect → classify reason (whitelist/banned/rejected)
+//!    - 0x00 Disconnect → classify reason (whitelist/banned/rejected/version mismatch)
 //!    - 0x01 Encryption Request → online-mode only (premium)
 //!    - 0x02 Login Success → offline mode enabled (cracked)
 //!    - 0x03 Set Compression → read threshold, then expect Login Success
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::io;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,6 +26,155 @@ const OFFLINE_USERNAME: &str = "NMCScan";
 
 /// Maximum packet size for safety (256KB).
 const MAX_PACKET_SIZE: usize = 256 * 1024;
+
+/// Latest supported protocol version.
+pub const LATEST_PROTOCOL: i32 = 775;
+
+/// Mapping of version name patterns to protocol versions.
+/// Source: https://minecraft.wiki/w/Protocol_version and https://wiki.vg/Protocol_version_numbers
+/// Ordered from newest to oldest for efficient lookup.
+const VERSION_PROTOCOL_MAP: &[(i32, &[&str])] = &[
+    // 2026 - Year-based versioning (Mojang changed scheme)
+    (775, &["26.1", "26.1.1"]),
+    // 1.21.x series
+    (774, &["1.21.11"]),
+    (773, &["1.21.10"]),
+    (772, &["1.21.9"]),
+    (771, &["1.21.8"]),
+    (770, &["1.21.7"]),
+    (769, &["1.21.6"]),
+    (768, &["1.21.5"]),
+    (767, &["1.21.4", "1.21.3", "1.21.2", "1.21", "1.21.1"]),
+    // 1.20.x series
+    (766, &["1.20.6", "1.20.5"]),
+    (765, &["1.20.4", "1.20.3"]),
+    (764, &["1.20.2"]),
+    (763, &["1.20.1", "1.20"]),
+    // 1.19.x series
+    (762, &["1.19.4"]),
+    (761, &["1.19.3"]),
+    (760, &["1.19.2", "1.19.1"]),
+    (759, &["1.19"]),
+    // 1.18.x series
+    (758, &["1.18.2"]),
+    (757, &["1.18.1", "1.18"]),
+    // 1.17.x series
+    (756, &["1.17.1"]),
+    (755, &["1.17"]),
+    // 1.16.x series
+    (754, &["1.16.5", "1.16.4"]),
+    (753, &["1.16.3"]),
+    (751, &["1.16.2"]),
+    (736, &["1.16.1"]),
+    (735, &["1.16"]),
+    // 1.15.x series
+    (578, &["1.15.2"]),
+    (575, &["1.15.1"]),
+    (573, &["1.15"]),
+    // 1.14.x series
+    (498, &["1.14.4"]),
+    (490, &["1.14.3"]),
+    (485, &["1.14.2"]),
+    (480, &["1.14.1"]),
+    (477, &["1.14"]),
+    // 1.13.x series
+    (404, &["1.13.2"]),
+    (401, &["1.13.1"]),
+    (393, &["1.13"]),
+    // 1.12.x series
+    (340, &["1.12.2"]),
+    (338, &["1.12.1"]),
+    (335, &["1.12"]),
+    // 1.11.x series
+    (316, &["1.11.2", "1.11.1"]),
+    (315, &["1.11"]),
+    // 1.10.x series (all share protocol 210)
+    (210, &["1.10.2", "1.10.1", "1.10"]),
+    // 1.9.x series
+    (110, &["1.9.4", "1.9.3"]),
+    (109, &["1.9.2"]),
+    (108, &["1.9.1"]),
+    (107, &["1.9"]),
+    // 1.8.x series (all share protocol 47)
+    (
+        47,
+        &[
+            "1.8.9", "1.8.8", "1.8.7", "1.8.6", "1.8.5", "1.8.4", "1.8.3", "1.8.2", "1.8.1", "1.8",
+        ],
+    ),
+    // 1.7.x series
+    (5, &["1.7.10", "1.7.9", "1.7.8", "1.7.7", "1.7.6"]),
+    (4, &["1.7.5", "1.7.4", "1.7.3", "1.7.2"]),
+    // Legacy (pre-Netty, rarely seen)
+    (0, &["1.6", "1.5", "1.4", "legacy"]),
+];
+
+/// Regex patterns for extracting version from disconnect messages.
+static OUTDATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:outdated\s*server!?\s*(?:I'?m|I am)\s*still\s*on\s*|Incompatible\s*client!?\s*Please\s*use\s*|Please\s*use\s*Minecraft\s*)([0-9]+(?:\.[0-9]+)+(?:\.[0-9]+)*)").unwrap()
+});
+
+/// Try to extract a version string from a disconnect reason and map it to a protocol version.
+///
+/// Parses messages like:
+/// - "Outdated server! I'm still on 1.20.1"
+/// - "Incompatible client! Please use Minecraft 1.19.4"
+/// - "Please use version 1.18.2"
+///
+/// Returns the protocol version if successfully parsed and mapped.
+pub fn extract_protocol_from_disconnect(reason: &str) -> Option<i32> {
+    let captured = OUTDATED_PATTERN.captures(reason)?;
+    let version_str = captured.get(1)?.as_str();
+
+    tracing::debug!(
+        "Extracted version '{}' from disconnect reason: {}",
+        version_str,
+        reason
+    );
+
+    version_to_protocol(version_str)
+}
+
+/// Convert a version string like "1.20.1" or "1.19.4" to a protocol version.
+///
+/// Does fuzzy matching against known version patterns.
+/// Handles both exact versions ("1.20.1") and embedded versions ("Paper 1.20.1").
+pub fn version_to_protocol(version: &str) -> Option<i32> {
+    let normalized = version.trim().to_lowercase();
+
+    // Try exact match first
+    for &(proto, patterns) in VERSION_PROTOCOL_MAP {
+        for &pattern in patterns {
+            if pattern == normalized {
+                return Some(proto);
+            }
+        }
+    }
+
+    // Try fuzzy match: look for known version patterns within the string
+    // e.g., "Paper 1.20.1" contains "1.20.1"
+    let mut best_match: Option<(i32, usize)> = None;
+
+    for &(proto, patterns) in VERSION_PROTOCOL_MAP {
+        for &pattern in patterns {
+            // Check if the string contains the pattern (embedded version)
+            if normalized.contains(pattern) {
+                let match_len = pattern.len();
+                match best_match {
+                    Some((_, best_len)) if match_len > best_len => {
+                        best_match = Some((proto, match_len));
+                    }
+                    None => {
+                        best_match = Some((proto, match_len));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    best_match.map(|(proto, _)| proto)
+}
 
 /// Result of a login attempt.
 #[derive(Debug, Clone)]
@@ -94,7 +245,10 @@ async fn read_varint<R: tokio::io::AsyncReadExt + Unpin>(reader: &mut R) -> io::
         }
         shift += 7;
         if shift >= 35 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "VarInt too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VarInt too long",
+            ));
         }
     }
     Ok(result)
@@ -333,14 +487,12 @@ async fn attempt_login_inner(addr: SocketAddr, protocol_version: i32) -> LoginRe
                 latency_ms: 0,
             }
         }
-        other => {
-            LoginResult {
-                obstacle: LoginObstacle::Rejected,
-                disconnect_reason: Some(format!("unexpected packet ID: 0x{:02X}", other)),
-                protocol_used: protocol_version,
-                latency_ms: 0,
-            }
-        }
+        other => LoginResult {
+            obstacle: LoginObstacle::Rejected,
+            disconnect_reason: Some(format!("unexpected packet ID: 0x{:02X}", other)),
+            protocol_used: protocol_version,
+            latency_ms: 0,
+        },
     }
 }
 
@@ -377,22 +529,53 @@ fn classify_disconnect(reason: &str) -> LoginObstacle {
     LoginObstacle::Rejected
 }
 
-/// Attempt login with protocol fallback.
+/// Attempt login with protocol version extraction from disconnect messages.
 ///
-/// First tries the server's reported protocol version.
-/// If the connection is rejected with an unexpected packet, tries the latest
-/// protocol version (775) as a fallback.
-#[allow(dead_code)]
-pub async fn attempt_login_with_fallback(addr: SocketAddr, protocol_version: i32) -> LoginResult {
+/// First tries the provided protocol version.
+/// If the server rejects with a version mismatch message (e.g., "Outdated server! I'm still on 1.20.1"),
+/// extracts the version, maps it to a protocol version, and retries once.
+/// If that also fails, returns the second result.
+///
+/// Returns the successful or final failed result.
+pub async fn attempt_login_smart(addr: SocketAddr, protocol_version: i32) -> LoginResult {
     let result = attempt_login(addr, protocol_version).await;
 
-    // If we got a protocol error or unexpected rejection, and the protocol version
-    // differs from the latest, try with the latest protocol version
-    if result.obstacle == LoginObstacle::Rejected && protocol_version != 775 {
-        let fallback = attempt_login(addr, 775).await;
-        // Only use fallback result if it's more informative
-        if fallback.obstacle != LoginObstacle::Rejected {
-            return fallback;
+    // If rejected, check if it's a version mismatch we can recover from
+    if result.obstacle == LoginObstacle::Rejected {
+        if let Some(ref reason) = result.disconnect_reason {
+            if let Some(extracted_protocol) = extract_protocol_from_disconnect(reason) {
+                if extracted_protocol != protocol_version {
+                    tracing::debug!(
+                        "Protocol mismatch detected for {}: extracted protocol {} from '{}', retrying...",
+                        addr, extracted_protocol, reason
+                    );
+                    let retry_result = attempt_login(addr, extracted_protocol).await;
+
+                    // Log the retry outcome
+                    if retry_result.obstacle == LoginObstacle::Success {
+                        tracing::info!(
+                            "Login SUCCEEDED for {} after protocol correction: {} → {}",
+                            addr,
+                            protocol_version,
+                            extracted_protocol
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Login still failed for {} after protocol retry ({} → {}): {:?} - {}",
+                            addr,
+                            protocol_version,
+                            extracted_protocol,
+                            retry_result.obstacle,
+                            retry_result
+                                .disconnect_reason
+                                .as_deref()
+                                .unwrap_or("no reason")
+                        );
+                    }
+
+                    return retry_result;
+                }
+            }
         }
     }
 
@@ -436,9 +619,114 @@ mod tests {
 
     #[test]
     fn test_classify_disconnect() {
-        assert_eq!(classify_disconnect("You are not whitelisted"), LoginObstacle::Whitelist);
-        assert_eq!(classify_disconnect("You are banned from this server"), LoginObstacle::Banned);
-        assert_eq!(classify_disconnect("Connection throttled!"), LoginObstacle::Rejected);
-        assert_eq!(classify_disconnect("You have been allowlisted"), LoginObstacle::Whitelist);
+        assert_eq!(
+            classify_disconnect("You are not whitelisted"),
+            LoginObstacle::Whitelist
+        );
+        assert_eq!(
+            classify_disconnect("You are banned from this server"),
+            LoginObstacle::Banned
+        );
+        assert_eq!(
+            classify_disconnect("Connection throttled!"),
+            LoginObstacle::Rejected
+        );
+        assert_eq!(
+            classify_disconnect("You have been allowlisted"),
+            LoginObstacle::Whitelist
+        );
+    }
+
+    #[test]
+    fn test_version_to_protocol_exact() {
+        assert_eq!(version_to_protocol("26.1"), Some(775));
+        assert_eq!(version_to_protocol("26.1.1"), Some(775));
+        assert_eq!(version_to_protocol("1.21.11"), Some(774));
+        assert_eq!(version_to_protocol("1.21"), Some(767));
+        assert_eq!(version_to_protocol("1.20.1"), Some(763));
+        assert_eq!(version_to_protocol("1.20.2"), Some(764));
+        assert_eq!(version_to_protocol("1.19.4"), Some(762));
+        assert_eq!(version_to_protocol("1.16.5"), Some(754));
+        assert_eq!(version_to_protocol("1.16.1"), Some(736));
+        assert_eq!(version_to_protocol("1.8.9"), Some(47));
+        assert_eq!(version_to_protocol("1.7.10"), Some(5));
+        assert_eq!(version_to_protocol("1.7.2"), Some(4));
+    }
+
+    #[test]
+    fn test_version_to_protocol_fuzzy() {
+        // "Paper 1.20.1" should match "1.20.1" → 763
+        assert_eq!(version_to_protocol("Paper 1.20.1"), Some(763));
+        // "Spigot 1.19.4" should match "1.19.4" → 762
+        assert_eq!(version_to_protocol("Spigot 1.19.4"), Some(762));
+        // "1.8" partial match → 47 (all 1.8.x share protocol 47)
+        assert_eq!(version_to_protocol("1.8"), Some(47));
+        // "1.18.2" → 758
+        assert_eq!(version_to_protocol("1.18.2"), Some(758));
+        // "Fabric 1.16.5" → 754
+        assert_eq!(version_to_protocol("Fabric 1.16.5"), Some(754));
+    }
+
+    #[test]
+    fn test_extract_protocol_from_disconnect() {
+        // Standard "Outdated server" messages
+        assert_eq!(
+            extract_protocol_from_disconnect("Outdated server! I'm still on 1.20.1"),
+            Some(763)
+        );
+        assert_eq!(
+            extract_protocol_from_disconnect("Outdated server! I'm still on 1.19.4"),
+            Some(762)
+        );
+        assert_eq!(
+            extract_protocol_from_disconnect("Outdated server! I am still on 1.16.5"),
+            Some(754)
+        );
+
+        // "Incompatible client" messages
+        assert_eq!(
+            extract_protocol_from_disconnect("Incompatible client! Please use 1.21.4"),
+            Some(767)
+        );
+        assert_eq!(
+            extract_protocol_from_disconnect("Incompatible client! Please use Minecraft 1.20.4"),
+            Some(765)
+        );
+
+        // No version info → None
+        assert_eq!(
+            extract_protocol_from_disconnect("You are not whitelisted"),
+            None
+        );
+        assert_eq!(
+            extract_protocol_from_disconnect("Connection throttled!"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_version_to_protocol_unknown() {
+        // Version not in map → None
+        assert_eq!(version_to_protocol("99.99.99"), None);
+    }
+
+    #[test]
+    fn test_version_protocol_map_consistency() {
+        // Verify that all protocol numbers are positive and patterns are non-empty
+        for &(proto, patterns) in VERSION_PROTOCOL_MAP {
+            assert!(proto >= 0, "Protocol {} should be non-negative", proto);
+            assert!(
+                !patterns.is_empty(),
+                "Patterns for protocol {} should not be empty",
+                proto
+            );
+            for &pattern in patterns {
+                assert!(
+                    !pattern.is_empty(),
+                    "Pattern should not be empty for protocol {}",
+                    proto
+                );
+            }
+        }
     }
 }

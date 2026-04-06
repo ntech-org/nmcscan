@@ -38,6 +38,7 @@ flate2 = { version = "1.0", default-features = false, features = ["rust_backend"
 sha2 = "0.10"
 uuid = { version = "1.11", features = ["v3", "v4", "fast-rng"] }
 regex = "1"
+once_cell = "1"
 
 # CLI argument parsing (minimal features)
 clap = { version = "4.5", default-features = false, features = ["derive", "env", "std", "help", "usage"] }
