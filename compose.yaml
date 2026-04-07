@@ -25,12 +25,21 @@ services:
         "-c",
         "work_mem=16MB",
       ]
-  nmcscan:
-    build: .
-    container_name: nmcscan
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nmcscan"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nmcscan-api:
+    build:
+      context: .
+      dockerfile: packages/api/Dockerfile
+    container_name: nmcscan_api
     restart: unless-stopped
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     ulimits:
       nofile:
         soft: 65536
@@ -43,6 +52,37 @@ services:
       - LISTEN_ADDR=${LISTEN_ADDR:-0.0.0.0:3000}
       - DATABASE_URL=postgres://nmcscan:nmcscan_secret@postgres:5432/nmcscan
       - EXCLUDE_FILE=/app/exclude.conf
+      - FORCE_ASN_IMPORT=${FORCE_ASN_IMPORT:-false}
+    volumes:
+      - ./exclude.conf:/app/exclude.conf:ro
+      - ./honeypots.conf:/app/honeypots.conf:ro
+    working_dir: /app
+    ports:
+      - "${API_PORT:-3001}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  nmcscan-scanner:
+    build:
+      context: .
+      dockerfile: packages/scanner/Dockerfile
+    container_name: nmcscan_scanner
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      - DATABASE_URL=postgres://nmcscan:nmcscan_secret@postgres:5432/nmcscan
+      - EXCLUDE_FILE=/app/exclude.conf
       - TARGET_RPS=${TARGET_RPS:-100}
       - TARGET_CONCURRENCY=${TARGET_CONCURRENCY:-1000}
       - TARGET_COLD_RPS
@@ -52,23 +92,21 @@ services:
       - TEST_REGIONS
       - FORCE_ASN_IMPORT=${FORCE_ASN_IMPORT:-false}
     volumes:
-      - ./data:/app/data
-      - ./exclude.conf:/app/exclude.conf
-    working_dir: /app
-    command: ["/app/nmcscan"]
+      - ./exclude.conf:/app/exclude.conf:ro
+      - ./honeypots.conf:/app/honeypots.conf:ro
 
   dashboard:
     build: ./dashboard
     container_name: nmcscan_dashboard
     restart: unless-stopped
     depends_on:
-      - nmcscan
+      - nmcscan-api
     ports:
       - "${PORT:-3000}:5173"
     environment:
       - NODE_ENV=production
       - PORT=5173
-      - BACKEND_URL=http://nmcscan:3000
+      - BACKEND_URL=http://nmcscan-api:3000
       - DATABASE_URL=postgres://nmcscan:nmcscan_secret@postgres:5432/nmcscan
       - AUTH_SECRET=${AUTH_SECRET}
       - AUTH_TRUST_HOST=true
@@ -81,5 +119,4 @@ services:
       - PUBLIC_API_URL=${PUBLIC_API_URL:-}
 
 volumes:
-  data:
   postgres_data:

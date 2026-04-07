@@ -1,0 +1,42 @@
+[package]
+name = "nmcscan-api"
+version = "0.1.0"
+edition = "2024"
+description = "NMCScan API service - web interface and database management"
+license = "MIT"
+
+[dependencies]
+# Shared library
+nmcscan-shared = { path = "../shared" }
+migration = { path = "../../migration" }
+
+# Async runtime
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "signal"] }
+
+# Web server
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "macros", "tokio", "query"] }
+tower-http = { version = "0.6", default-features = false, features = ["compression-gzip", "cors", "fs"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Database (via shared, but need SeaORM types)
+sea-orm = { version = "1.1", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono", "with-ipnetwork"] }
+sea-orm-migration = { version = "1.1", default-features = false, features = ["runtime-tokio-rustls", "sqlx-postgres"] }
+
+# HTTP client (for ASN API calls)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi", "std"] }
+
+# CLI argument parsing
+clap = { version = "4.5", default-features = false, features = ["derive", "env", "std", "help", "usage"] }
+
+# Utilities
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+dotenvy = "0.15.7"
+sha2 = "0.10"
+uuid = { version = "1.18", features = ["v3", "v4", "fast-rng"] }
