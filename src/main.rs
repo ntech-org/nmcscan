@@ -139,12 +139,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Load exclude list
     tracing::info!("Loading exclude list from {}...", args.exclude_file);
-    let exclude_list = ExcludeList::from_file(&args.exclude_file).unwrap_or_else(|e| {
+    let mut exclude_content = std::fs::read_to_string(&args.exclude_file).unwrap_or_else(|e| {
         tracing::warn!("Could not load {}: {}", args.exclude_file, e);
-        tracing::warn!("Using empty exclude list - BE CAREFUL!");
+        String::new()
+    });
+    
+    // 1.5. Load honeypot exclusions and merge with main exclude list
+    let honeypot_file = "honeypots.conf";
+    if std::path::Path::new(honeypot_file).exists() {
+        tracing::info!("Loading honeypot exclusions from {}...", honeypot_file);
+        let honeypot_content = std::fs::read_to_string(honeypot_file).unwrap_or_else(|e| {
+            tracing::warn!("Could not load {}: {}", honeypot_file, e);
+            String::new()
+        });
+        
+        // Append honeypot exclusions to the main exclude list
+        if !honeypot_content.is_empty() {
+            exclude_content.push_str("\n# Honeypot exclusions from honeypots.conf\n");
+            exclude_content.push_str(&honeypot_content);
+            tracing::info!("Merged honeypot exclusions into main exclude list");
+        }
+    } else {
+        tracing::info!("No honeypots.conf found, skipping honeypot exclusions");
+    }
+    
+    let exclude_list = ExcludeList::from_str(&exclude_content).unwrap_or_else(|e| {
+        tracing::warn!("Failed to parse exclude list: {}", e);
         ExcludeList::from_str("").unwrap()
     });
-    tracing::info!("Loaded {} exclude networks", exclude_list.len());
+    tracing::info!("Loaded {} exclude networks (including honeypots)", exclude_list.len());
+
+
 
     // 2. Initialize database
     tracing::info!("Initializing database at {}...", args.database);

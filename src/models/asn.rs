@@ -146,9 +146,10 @@ impl AsnManager {
     pub fn categorize_from_ipverse(org: &str, category: Option<&str>) -> AsnCategory {
         let org_lower = org.to_lowercase();
 
-        // 1. CRITICAL SAFETY BLOCKLIST (Military, Gov, Edu, Infrastructure)
+        // 1. CRITICAL SAFETY BLOCKLIST (Military, Gov, Edu, Infrastructure, Honeypots, Scanners)
         // These keywords override any external categorization for safety.
         let safety_keywords = [
+            // Military, Government, Defense
             "military",
             "defense",
             "dod",
@@ -167,6 +168,8 @@ impl AsnManager {
             "fbi",
             "cia",
             "nsa",
+            
+            // Education & Healthcare
             "university",
             "college",
             "school",
@@ -174,6 +177,8 @@ impl AsnManager {
             "hospital",
             "medical",
             "clinic",
+            
+            // Critical Infrastructure
             "nuclear",
             "atomic",
             "power plant",
@@ -181,6 +186,76 @@ impl AsnManager {
             "financial",
             "securities",
             "reserve",
+            
+            // HONEYPOTS & SECURITY RESEARCH (CRITICAL - Must Never Scan)
+            "honeypot",
+            "honey pot",
+            "honey-net",
+            "honeynet",
+            "research network",
+            "background noise",
+            "security research",
+            "threat intel",
+            "threat intelligence",
+            "grey noise",
+            "gray noise",
+            "project honey",
+            "censys",
+            "shodan",
+            "zmap",
+            "rapid7",
+            "fofa",
+            "quake",
+            "360 netlab",
+            "netlab360",
+            "antiscan",
+            "internet census",
+            "sensor network",
+            "monitoring service",
+            "abuse monitoring",
+            "skhron",
+            "datalix",
+            "cloudflare radar",
+            "bgpstream",
+            "shadowserver",
+            "spamhaus",
+            "abuseipdb",
+            "team cymru",
+            "binaryedge",
+            "fullhunt",
+            "zoomeye",
+            "leakix",
+            "onyphe",
+            "pulsedive",
+            "virustotal",
+            "urlscan",
+            "internet scanning",
+            "mass scanner",
+            "port scanner",
+            "vulnerability scanner",
+            "attack surface",
+            "scanning service",
+            "internet scanner",
+            "research project",
+            "security scanner",
+            "network monitor",
+            
+            // Additional Scanner Organizations (specific names, NOT generic CDN/hosting)
+            "sonar research",
+            "opendns",
+            "umbrella security",
+            
+            // Research & Census Projects
+            "isc",
+            "internet systems consortium",
+            "caida",
+            "routeviews",
+            "ripe ncc",
+            
+            // IP Geolocation/Intelligence Services (often used for scanning)
+            "maxmind",
+            "ip2location",
+            "db-ip",
         ];
 
         for keyword in &safety_keywords {

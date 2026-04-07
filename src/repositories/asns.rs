@@ -176,9 +176,17 @@ impl AsnRepository {
         // 1. Inner query selects a pool (10x limit) ordered by last scanned time.
         //    This ensures ALL ranges eventually get picked without starvation.
         // 2. Outer query randomly picks from that pool.
+        // 3. CRITICAL: Epoch cooldown filter prevents ranges from being rescanned
+        //    too frequently. Hosting: 12h min (2x/day), Residential: 56h min (3x/week).
+        //
         // This means the scanner progresses through the entire category evenly,
-        // preventing large ASNs from monopolizing the queue.
+        // preventing large ASNs from monopolizing the queue AND preventing the same
+        // range from being rescanned immediately after epoch reset.
         let pool_size = limit * 10;
+        
+        // Epoch cooldown: prevent ranges from being picked again too soon
+        let min_hours = if category == "hosting" { 12 } else { 56 };
+        
         let sql = format!(
             r#"
             SELECT cidr, asn, scan_offset, last_scanned_at, scan_epoch FROM (
@@ -186,6 +194,8 @@ impl AsnRepository {
                 FROM asn_ranges r
                 JOIN asns a ON r.asn = a.asn
                 WHERE a.category = '{}'
+                  AND (r.last_scanned_at IS NULL 
+                       OR r.last_scanned_at < NOW() - INTERVAL '{} HOURS')
                 ORDER BY
                     r.last_scanned_at ASC NULLS FIRST,
                     r.scan_offset ASC
@@ -194,7 +204,7 @@ impl AsnRepository {
             ORDER BY random()
             LIMIT {}
         "#,
-            category, pool_size, limit
+            category, min_hours, pool_size, limit
         );
 
         let stmt = Statement::from_string(self.db.get_database_backend(), sql);
