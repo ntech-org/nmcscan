@@ -10,8 +10,8 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::time::Instant;
+use tokio::sync::Mutex;
 
 /// Queue sizes for API reporting.
 #[derive(Debug, Clone, Serialize)]
@@ -135,11 +135,11 @@ fn mix_bits(x: u64) -> u64 {
 }
 
 /// Maximum items per queue to prevent unbounded memory growth.
-const MAX_QUEUE_SIZE: usize = 10000;
+const MAX_QUEUE_SIZE: usize = 100_000;
 
-/// TTL for discovery deduplication: 5 minutes.
+/// TTL for discovery deduplication: 1 hour.
 /// Prevents the same IP:port from being added to the discovery queue within this window.
-const DISCOVERY_DEDUP_TTL_SECS: u64 = 300;
+const DISCOVERY_DEDUP_TTL_SECS: u64 = 3600;
 
 pub struct Scheduler {
     hot_queue: Arc<Mutex<VecDeque<ServerTarget>>>,
@@ -183,20 +183,22 @@ impl Scheduler {
             // Deduplication check: skip if this IP:port was recently added
             let key = format!("{}:{}", server.ip, server.port);
             let mut dedup = self.discovery_dedup.lock().await;
-            
+
             // Clean up expired entries and check if this target is still valid
             let now = Instant::now();
-            dedup.retain(|_, instant| now.duration_since(*instant).as_secs() < DISCOVERY_DEDUP_TTL_SECS);
-            
+            dedup.retain(|_, instant| {
+                now.duration_since(*instant).as_secs() < DISCOVERY_DEDUP_TTL_SECS
+            });
+
             if dedup.contains_key(&key) {
                 tracing::debug!("Skipping duplicate discovery target: {}", key);
                 return;
             }
-            
+
             // Add to dedup map and queue
             dedup.insert(key, now);
             drop(dedup);
-            
+
             let mut dq = self.discovery_queue.lock().await;
             if dq.len() >= MAX_QUEUE_SIZE {
                 return;
@@ -323,20 +325,24 @@ impl Scheduler {
         // This prevents the stall where all main queue items have future next_scan_at.
 
         // INTERLEAVED DISCOVERY: Fetch hosting ranges
-        match self.asn_repo.get_ranges_to_scan("hosting", 100).await {
+        match self.asn_repo.get_ranges_to_scan("hosting", 500).await {
             Ok(ranges) => {
                 if ranges.is_empty() {
-                    tracing::debug!("Discovery: No hosting ranges available (all in cooldown or scanned)");
+                    tracing::debug!(
+                        "Discovery: No hosting ranges available (all in cooldown or scanned)"
+                    );
                     return;
                 }
-                let count = self.fill_discovery_queue(ranges, 2, 100).await.unwrap_or(0);
+                let count = self.fill_discovery_queue(ranges, 2, 200).await.unwrap_or(0);
                 if count > 0 {
                     tracing::info!(
                         "Discovery: Added {} new targets to discovery queue (from hosting)",
                         count
                     );
                 } else {
-                    tracing::debug!("Discovery: Hosting ranges returned but no IPs generated (ranges exhausted or in cooldown)");
+                    tracing::debug!(
+                        "Discovery: Hosting ranges returned but no IPs generated (ranges exhausted or in cooldown)"
+                    );
                 }
             }
             Err(e) => {
@@ -351,8 +357,11 @@ impl Scheduler {
         // 1. Try to recycle dead/ignored servers (these go to main cold queue)
         if let Ok(dead_servers) = self.server_repo.get_dead_servers(1000).await {
             for server in dead_servers {
-                let mut target =
-                    ServerTarget::new(server.ip.to_string(), server.port as i32 as u16, server.server_type);
+                let mut target = ServerTarget::new(
+                    server.ip.to_string(),
+                    server.port as i32 as u16,
+                    server.server_type,
+                );
                 target.priority = 3;
                 if let Some(last) = server.last_seen {
                     target.next_scan_at = Some(last.and_utc() + chrono::Duration::days(7));
@@ -364,13 +373,13 @@ impl Scheduler {
         // 2. DISCOVERY: Fetch residential ranges only (unknown ranges are not worth scanning)
         let ranges = self
             .asn_repo
-            .get_ranges_to_scan("residential", 100)
+            .get_ranges_to_scan("residential", 500)
             .await
             .unwrap_or_default();
         let source = "residential";
 
         if !ranges.is_empty() {
-            let count = self.fill_discovery_queue(ranges, 3, 100).await.unwrap_or(0);
+            let count = self.fill_discovery_queue(ranges, 3, 200).await.unwrap_or(0);
             if count > 0 {
                 tracing::info!(
                     "Discovery: Added {} new targets to discovery queue (from {})",
@@ -378,7 +387,9 @@ impl Scheduler {
                     source
                 );
             } else {
-                tracing::debug!("Discovery: Residential ranges returned but no IPs generated (ranges exhausted or in cooldown)");
+                tracing::debug!(
+                    "Discovery: Residential ranges returned but no IPs generated (ranges exhausted or in cooldown)"
+                );
             }
         }
     }
@@ -443,7 +454,9 @@ impl Scheduler {
                         "Range {} skipped (epoch {}), only {}h since last scan (need {}h)",
                         range.cidr,
                         range.scan_epoch,
-                        range.last_scanned_at.map_or(0, |t| (now - t.and_utc()).num_hours()),
+                        range
+                            .last_scanned_at
+                            .map_or(0, |t| (now - t.and_utc()).num_hours()),
                         min_epoch_hours
                     );
                 }
@@ -501,7 +514,7 @@ impl Scheduler {
                 is_done,
                 is_done, // increment epoch when range is exhausted
             ));
-            
+
             if is_done {
                 ranges_reset += 1;
                 tracing::debug!(
@@ -520,7 +533,11 @@ impl Scheduler {
                 "Discovery: {} ranges reset, {} ranges skipped cooldown (category: {}, min interval: {}h)",
                 ranges_reset,
                 ranges_skipped_cooldown,
-                if priority == 2 { "hosting" } else { "residential" },
+                if priority == 2 {
+                    "hosting"
+                } else {
+                    "residential"
+                },
                 min_epoch_hours
             );
         }
@@ -530,7 +547,7 @@ impl Scheduler {
             self.asn_repo.update_batch_range_progress(updates).await?;
         }
 
-        let added_count = all_targets.len();
+        let generated_count = all_targets.len();
 
         // GLOBAL SHUFFLE & ADD
         if !all_targets.is_empty() {
@@ -539,12 +556,30 @@ impl Scheduler {
                 all_targets.shuffle(&mut rng);
             }
 
+            let mut queued_count = 0usize;
             for target in all_targets {
-                self.add_server(target, true).await;
+                let queue = match target.priority {
+                    1 if !target.is_discovery => &self.hot_queue,
+                    2 if !target.is_discovery => &self.warm_queue,
+                    _ if !target.is_discovery => &self.cold_queue,
+                    _ => &self.discovery_queue,
+                };
+                let mut dq = queue.lock().await;
+                if dq.len() < MAX_QUEUE_SIZE {
+                    dq.push_back(target);
+                    queued_count += 1;
+                }
             }
+
+            tracing::debug!(
+                "Discovery: {}/{} targets queued ({} dropped due to queue cap)",
+                queued_count,
+                generated_count,
+                generated_count.saturating_sub(queued_count)
+            );
         }
 
-        Ok(added_count)
+        Ok(generated_count)
     }
 
     pub async fn requeue_server(&self, mut server: ServerTarget, was_online: bool) {
@@ -658,9 +693,9 @@ impl Scheduler {
     /// Only runs when queue is below 25% of threshold to prevent aggressive re-scanning.
     pub async fn try_refill_queues(&self) {
         let configs = vec![
-            (1, 2, 1000, 500u64), // priority, interval_hours, threshold, limit
-            (2, 24, 500, 300u64),
-            (3, 168, 500, 200u64),
+            (1, 2, 10_000, 5_000u64),  // priority, interval_hours, threshold, limit
+            (2, 24, 5_000, 3_000u64),
+            (3, 168, 5_000, 2_000u64),
         ];
 
         for (priority, interval_hours, threshold, limit) in configs {
@@ -692,7 +727,10 @@ impl Scheduler {
 
             tracing::info!(
                 "Queue refill: priority={} queue has {} items (threshold: {}), adding {} servers from DB",
-                priority, current_len, refill_threshold, ready_servers.len()
+                priority,
+                current_len,
+                refill_threshold,
+                ready_servers.len()
             );
             let mut q = queue.lock().await;
             for server in ready_servers {
@@ -712,7 +750,7 @@ impl Scheduler {
     pub async fn load_from_database(&self) -> Result<(), sea_orm::DbErr> {
         // Only load servers that are currently online or have been online in the past.
         // We filter out 'unknown' status servers which were likely just potential discovery targets.
-        let servers = self.server_repo.get_servers_for_load(50000).await?;
+        let servers = self.server_repo.get_servers_for_load(999999999).await?;
 
         for server in servers {
             let mut target = ServerTarget::new(
@@ -923,17 +961,20 @@ mod tests {
     fn test_epoch_cooldown_logic_hosting() {
         // Test that hosting ranges require 12 hours minimum between epochs
         let min_epoch_hours = 12i64; // hosting
-        
+
         // Simulate a range scanned 6 hours ago (should NOT reset)
         let hours_since_scan = 6i64;
         let can_reset = hours_since_scan >= min_epoch_hours;
-        assert!(!can_reset, "Range scanned 6h ago should not reset (need 12h)");
-        
+        assert!(
+            !can_reset,
+            "Range scanned 6h ago should not reset (need 12h)"
+        );
+
         // Simulate a range scanned 13 hours ago (should reset)
         let hours_since_scan = 13i64;
         let can_reset = hours_since_scan >= min_epoch_hours;
         assert!(can_reset, "Range scanned 13h ago should reset (need 12h)");
-        
+
         // Simulate a range never scanned (should reset)
         let can_reset = true; // None.map_or(true, ...) returns true
         assert!(can_reset, "Range never scanned should reset");
@@ -943,12 +984,15 @@ mod tests {
     fn test_epoch_cooldown_logic_residential() {
         // Test that residential ranges require 56 hours minimum between epochs
         let min_epoch_hours = 56i64; // residential
-        
+
         // Simulate a range scanned 24 hours ago (should NOT reset)
         let hours_since_scan = 24i64;
         let can_reset = hours_since_scan >= min_epoch_hours;
-        assert!(!can_reset, "Range scanned 24h ago should not reset (need 56h)");
-        
+        assert!(
+            !can_reset,
+            "Range scanned 24h ago should not reset (need 56h)"
+        );
+
         // Simulate a range scanned 60 hours ago (should reset)
         let hours_since_scan = 60i64;
         let can_reset = hours_since_scan >= min_epoch_hours;
@@ -959,22 +1003,22 @@ mod tests {
     fn test_dedup_ttl_expiration() {
         // Test that dedup entries expire after TTL
         let _ttl_secs = 300u64; // 5 minutes
-        
+
         // Simulate instant creation
         let now = Instant::now();
         let mut map = HashMap::new();
         map.insert("10.0.0.1:25565".to_string(), now);
-        
+
         // Check entry exists
         assert!(map.contains_key("10.0.0.1:25565"));
-        
+
         // Simulate time passing (less than TTL)
         // In real code, we'd check: now.duration_since(instant).as_secs() < ttl_secs
         // Here we just verify the logic structure
-        
+
         // Entry should still exist
         assert!(map.contains_key("10.0.0.1:25565"));
-        
+
         // After TTL expires, entry should be removed by retain()
         // map.retain(|_, instant| now.duration_since(*instant).as_secs() < ttl_secs);
     }
@@ -1064,11 +1108,13 @@ mod tests {
             let same_position_count = {
                 let seed0 = compute_seed(cidr, 0);
                 let seed1 = compute_seed(cidr, 1);
-                (0..total_ips).filter(|&pos| {
-                    let ip0 = ip_at_position(pos, base_ip, total_ips, seed0);
-                    let ip1 = ip_at_position(pos, base_ip, total_ips, seed1);
-                    ip0 == ip1
-                }).count()
+                (0..total_ips)
+                    .filter(|&pos| {
+                        let ip0 = ip_at_position(pos, base_ip, total_ips, seed0);
+                        let ip1 = ip_at_position(pos, base_ip, total_ips, seed1);
+                        ip0 == ip1
+                    })
+                    .count()
             };
 
             // Most positions should differ between epochs
@@ -1080,7 +1126,10 @@ mod tests {
             );
         }
 
-        println!("✓ Successfully tested {} epochs across {} IPs", epochs_to_test, total_ips);
+        println!(
+            "✓ Successfully tested {} epochs across {} IPs",
+            epochs_to_test, total_ips
+        );
         println!("✓ Total unique IPs seen: {}", all_ips_seen.len());
         println!("✓ No duplicates within or across epochs");
     }
@@ -1093,7 +1142,7 @@ mod tests {
         // Simulate a hosting range that was just fully scanned
         let min_epoch_hours = 12i64;
         let now = Utc::now();
-        
+
         // Scenario 1: Range scanned 1 hour ago (should NOT reset)
         let last_scan_time = (now - ChronoDuration::hours(1)).naive_utc();
         let hours_since = (now - last_scan_time.and_utc()).num_hours();
@@ -1135,16 +1184,15 @@ mod tests {
 
         // Scenario 5: Range never scanned (SHOULD reset)
         let last_scan_time: Option<chrono::NaiveDateTime> = None;
-        let can_reset = last_scan_time.map_or(true, |t| {
-            (now - t.and_utc()).num_hours() >= min_epoch_hours
-        });
-        assert!(
-            can_reset,
-            "Range never scanned SHOULD reset"
-        );
+        let can_reset =
+            last_scan_time.map_or(true, |t| (now - t.and_utc()).num_hours() >= min_epoch_hours);
+        assert!(can_reset, "Range never scanned SHOULD reset");
 
         println!("✓ Cooldown logic correctly prevents premature resets");
-        println!("✓ Hosting ranges require {}h minimum between epochs", min_epoch_hours);
+        println!(
+            "✓ Hosting ranges require {}h minimum between epochs",
+            min_epoch_hours
+        );
     }
 
     /// Integration test: Simulates realistic discovery cycle with cooldown enforcement
@@ -1175,7 +1223,7 @@ mod tests {
             // Range 2: Partially scanned 2 hours ago (should NOT reset if exhausted)
             MockRange {
                 cidr: "10.0.1.0/30".to_string(), // 4 IPs
-                offset: 2, // Halfway through
+                offset: 2,                       // Halfway through
                 epoch: 0,
                 last_scanned: Some((now - ChronoDuration::hours(2)).naive_utc()),
                 total_ips: 4,
@@ -1183,7 +1231,7 @@ mod tests {
             // Range 3: Fully scanned 13 hours ago (SHOULD reset for hosting)
             MockRange {
                 cidr: "10.0.2.0/30".to_string(), // 4 IPs
-                offset: 4, // Exhausted
+                offset: 4,                       // Exhausted
                 epoch: 0,
                 last_scanned: Some((now - ChronoDuration::hours(13)).naive_utc()),
                 total_ips: 4,
@@ -1211,7 +1259,12 @@ mod tests {
                     range.epoch += 1;
                     range.last_scanned = Some(now.naive_utc());
                     ranges_reset += 1;
-                    println!("✓ Range {} reset from epoch {} to {}", range.cidr, range.epoch - 1, range.epoch);
+                    println!(
+                        "✓ Range {} reset from epoch {} to {}",
+                        range.cidr,
+                        range.epoch - 1,
+                        range.epoch
+                    );
                 } else {
                     ranges_skipped += 1;
                     println!("✓ Range {} skipped (cooldown not met)", range.cidr);
@@ -1227,7 +1280,7 @@ mod tests {
 
             let start_offset = range.offset as u64;
             let end_offset = (start_offset + batch_size).min(range.total_ips as u64);
-            
+
             for pos in start_offset..end_offset {
                 let ip_val = ip_at_position(pos, base_ip, range.total_ips as u64, seed);
                 let _ip_str = format_ip(ip_val);
@@ -1239,12 +1292,24 @@ mod tests {
         }
 
         // Verify expectations
-        assert_eq!(ranges_reset, 1, "Range 3 should have reset (13h > 12h cooldown)");
-        assert_eq!(ranges_skipped, 0, "No ranges should be skipped in this scenario");
-        assert!(ips_generated > 0, "Should have generated IPs from non-exhausted ranges");
+        assert_eq!(
+            ranges_reset, 1,
+            "Range 3 should have reset (13h > 12h cooldown)"
+        );
+        assert_eq!(
+            ranges_skipped, 0,
+            "No ranges should be skipped in this scenario"
+        );
+        assert!(
+            ips_generated > 0,
+            "Should have generated IPs from non-exhausted ranges"
+        );
 
         println!("✓ Discovery cycle generated {} IPs", ips_generated);
-        println!("✓ {} ranges reset, {} ranges skipped", ranges_reset, ranges_skipped);
+        println!(
+            "✓ {} ranges reset, {} ranges skipped",
+            ranges_reset, ranges_skipped
+        );
         println!("✓ Cooldown enforcement working correctly");
     }
 }

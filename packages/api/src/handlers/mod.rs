@@ -97,6 +97,7 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct AuthContext {
     pub user_id: Option<i32>,
+    #[allow(dead_code)]
     pub is_master: bool,
 }
 
@@ -182,18 +183,21 @@ pub struct AddExcludeRequest {
 
 /// Login queue trigger request.
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct LoginTriggerRequest {
     pub ip: String,
     #[serde(default = "default_login_port")]
     pub port: u16,
 }
 
+#[allow(dead_code)]
 fn default_login_port() -> u16 {
     25565
 }
 
 /// Login queue status response.
 #[derive(Serialize)]
+#[allow(dead_code)]
 pub struct LoginQueueStatusResponse {
     pub running: bool,
     pub total_attempts: u64,
@@ -209,6 +213,7 @@ pub struct LoginQueueStatusResponse {
 
 /// Login trigger response.
 #[derive(Serialize)]
+#[allow(dead_code)]
 pub struct LoginTriggerResponse {
     pub obstacle: String,
     pub disconnect_reason: Option<String>,

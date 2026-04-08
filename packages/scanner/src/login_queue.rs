@@ -15,7 +15,8 @@ use tokio::time::{self, Duration};
 
 use nmcscan_shared::network::login::{self, LoginObstacle, LoginResult, LATEST_PROTOCOL};
 use nmcscan_shared::repositories::ServerRepository;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
+use sea_orm::prelude::IpNetwork;
 
 /// Login queue statistics.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -41,6 +42,7 @@ pub struct LoginQueue {
     semaphore: Arc<Semaphore>,
 }
 
+#[allow(dead_code)]
 impl LoginQueue {
     pub fn new(server_repo: Arc<ServerRepository>) -> Self {
         Self {
@@ -147,7 +149,12 @@ impl LoginQueue {
 
         // Token bucket: refill every 16.6ms for ~60/sec rate
         let mut interval = time::interval(Duration::from_micros(16667));
+
+        // Cursor-based pagination state — cycles through ALL online servers.
+        let mut cursor_ip: Option<IpNetwork> = None;
+        let mut cursor_port: Option<i16> = None;
         let mut server_index = 0usize;
+        let mut current_batch: Vec<nmcscan_shared::models::entities::servers::Model> = Vec::new();
 
         while self.running.load(Ordering::Relaxed) {
             interval.tick().await;
@@ -192,27 +199,49 @@ impl LoginQueue {
                 }
             }
 
-            // Fetch a batch of online servers
-            let servers = match self.server_repo.get_online_servers(500).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Failed to fetch online servers: {}", e);
-                    time::sleep(Duration::from_secs(5)).await;
+            // Fetch next batch using cursor pagination if we've exhausted the current batch
+            if server_index >= current_batch.len() {
+                server_index = 0;
+                match self
+                    .server_repo
+                    .get_online_servers_cursor(500, cursor_ip, cursor_port)
+                    .await
+                {
+                    Ok(batch) => {
+                        if batch.is_empty() {
+                            // We've cycled through all servers — reset cursor and start over
+                            cursor_ip = None;
+                            cursor_port = None;
+                            match self.server_repo.get_online_servers_cursor(500, None, None).await {
+                                Ok(b) => current_batch = b,
+                                Err(e) => {
+                                    tracing::error!("Failed to fetch online servers: {}", e);
+                                    time::sleep(Duration::from_secs(5)).await;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            current_batch = batch;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to fetch online servers: {}", e);
+                        time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }
+
+                if current_batch.is_empty() {
+                    time::sleep(Duration::from_secs(10)).await;
                     continue;
                 }
-            };
-
-            if servers.is_empty() {
-                time::sleep(Duration::from_secs(10)).await;
-                continue;
             }
 
-            // Cycle through servers
-            if server_index >= servers.len() {
-                server_index = 0;
-            }
+            let server = &current_batch[server_index];
 
-            let server = &servers[server_index];
+            // Update cursor to this server's position for the next batch fetch
+            cursor_ip = Some(server.ip.clone());
+            cursor_port = Some(server.port);
             server_index += 1;
 
             // Skip if recently tested (within 1 hour)

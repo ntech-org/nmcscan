@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-use nmcscan_shared::network::ScanResult;
 use crate::scanner::Scanner;
 use nmcscan_shared::repositories::{ServerRepository, StatsRepository};
 use nmcscan_shared::services::scheduler::Scheduler;

@@ -252,29 +252,48 @@ impl AsnRepository {
         &self,
         updates: Vec<(String, i64, bool, bool)>,
     ) -> Result<(), DbErr> {
-        let txn = self.db.begin().await?;
-        for (cidr, offset, reset, bump_epoch) in updates {
-            let sql = if reset && bump_epoch {
-                "UPDATE asn_ranges SET scan_offset = 0, last_scanned_at = CURRENT_TIMESTAMP, scan_epoch = scan_epoch + 1 WHERE cidr = $1"
-            } else if reset {
-                "UPDATE asn_ranges SET scan_offset = 0, last_scanned_at = CURRENT_TIMESTAMP WHERE cidr = $1"
-            } else {
-                "UPDATE asn_ranges SET scan_offset = $1 WHERE cidr = $2"
-            };
-
-            let stmt = if reset {
-                Statement::from_sql_and_values(self.db.get_database_backend(), sql, [cidr.into()])
-            } else {
-                Statement::from_sql_and_values(
-                    self.db.get_database_backend(),
-                    sql,
-                    [offset.into(), cidr.into()],
-                )
-            };
-
-            txn.execute(stmt).await?;
+        if updates.is_empty() {
+            return Ok(());
         }
-        txn.commit().await?;
+
+        // Single bulk UPDATE using PostgreSQL VALUES / unnest to avoid per-row transactions.
+        // Uses CASE expressions to handle the three different update patterns:
+        // 1. reset + bump_epoch: offset=0, last_scanned_at=now, epoch+1
+        // 2. reset only: offset=0, last_scanned_at=now
+        // 3. normal: offset=new_value
+        let sql = r#"
+            UPDATE asn_ranges
+            SET
+                scan_offset = CASE WHEN v.reset THEN 0 ELSE v.offset END,
+                last_scanned_at = CASE WHEN v.reset THEN CURRENT_TIMESTAMP ELSE asn_ranges.last_scanned_at END,
+                scan_epoch = CASE WHEN v.reset AND v.bump_epoch THEN asn_ranges.scan_epoch + 1 ELSE asn_ranges.scan_epoch END
+            FROM (
+                SELECT unnest($1::text[]) AS cidr,
+                       unnest($2::bigint[]) AS offset,
+                       unnest($3::boolean[]) AS reset,
+                       unnest($4::boolean[]) AS bump_epoch
+            ) v
+            WHERE asn_ranges.cidr = v.cidr
+        "#;
+
+        let cidrs: Vec<String> = updates.iter().map(|(c, _, _, _)| c.clone()).collect();
+        let offsets: Vec<i64> = updates.iter().map(|(_, o, _, _)| *o).collect();
+        let resets: Vec<bool> = updates.iter().map(|(_, _, r, _)| *r).collect();
+        let bumps: Vec<bool> = updates.iter().map(|(_, _, _, b)| *b).collect();
+
+        self.db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                [
+                    cidrs.into(),
+                    offsets.into(),
+                    resets.into(),
+                    bumps.into(),
+                ],
+            ))
+            .await?;
+
         Ok(())
     }
 

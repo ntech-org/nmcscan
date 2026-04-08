@@ -82,6 +82,41 @@ impl ServerRepository {
             .await
     }
 
+    /// Paginate through online servers for login testing.
+    /// Uses cursor-based pagination on (ip, port) to ensure every server
+    /// gets tested exactly once per full cycle, even with 500K+ servers.
+    /// Pass `cursor_ip = None` to start from the beginning.
+    pub async fn get_online_servers_cursor(
+        &self,
+        limit: u64,
+        cursor_ip: Option<IpNetwork>,
+        cursor_port: Option<i16>,
+    ) -> Result<Vec<servers::Model>, DbErr> {
+        let mut query = servers::Entity::find()
+            .filter(servers::Column::Status.eq("online"))
+            .order_by_asc(servers::Column::Ip)
+            .order_by_asc(servers::Column::Port)
+            .limit(limit);
+
+        if let Some(ip) = cursor_ip {
+            let port = cursor_port.unwrap_or(0);
+            query = query.filter(
+                Condition::all()
+                    .add(
+                        Condition::any()
+                            .add(servers::Column::Ip.gt(ip))
+                            .add(
+                                Condition::all()
+                                    .add(servers::Column::Ip.eq(ip))
+                                    .add(servers::Column::Port.gt(port)),
+                            ),
+                    ),
+            );
+        }
+
+        query.all(&self.db).await
+    }
+
     pub async fn mark_online(
         &self,
         ip: &str,
@@ -270,7 +305,6 @@ impl ServerRepository {
             if !res.online {
                 // Skip offline results entirely - they are tracked in Redis bitset only.
                 // Only update existing servers that were previously online.
-                let port_i16: i16 = res.port.try_into().unwrap_or(25565);
                 let existing = servers::Entity::find_by_id((parse_ip(&res.ip), res.port as i16))
                     .one(&txn)
                     .await?;

@@ -235,9 +235,6 @@ impl Scanner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::Arc;
-
     #[tokio::test]
     #[ignore = "Requires postgres db"]
     async fn test_scanner_build() {

@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Initialize database and run migrations
     tracing::info!("Initializing database at {}...", args.database);
     let mut opt = ConnectOptions::new(&args.database);
-    opt.max_connections(100)
+    opt.max_connections(200)
         .acquire_timeout(std::time::Duration::from_secs(30))
         .sqlx_logging(false);
 

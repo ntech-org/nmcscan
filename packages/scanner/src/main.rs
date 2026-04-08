@@ -128,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Initialize database
     let mut opt = ConnectOptions::new(&args.database);
-    opt.max_connections(100)
+    opt.max_connections(200)
         .acquire_timeout(std::time::Duration::from_secs(30))
         .sqlx_logging(false);
 
@@ -190,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         tracing::info!("Loading {} test servers...", test_servers.len());
-        for (ip, port, name, host) in &test_servers {
+        for (ip, port, _name, host) in &test_servers {
             let server_type: String = if *port == 19132 { "bedrock".to_string() } else { "java".to_string() };
             let mut target = ServerTarget::new(ip.clone(), *port, server_type.clone());
             target.category = AsnCategory::Hosting;
@@ -201,11 +201,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = server_repo.insert_server_if_new(ip, port_i16, &server_type).await;
             scheduler.add_server(target, false).await;
         }
-    } else {
-        scheduler.load_from_database().await.unwrap_or_else(|e| {
-            tracing::warn!("Failed to load servers from database: {}", e);
-        });
     }
+    // Non-test mode: queues start empty and fill naturally via background tasks
+    // (try_refill_queues, fill_warm_queue_if_needed, fill_cold_queue_if_needed)
 
     let (h, w, c, d) = scheduler.get_queue_sizes().await;
     tracing::info!("Scheduler queues: Hot={}, Warm={}, Cold={}, Discovery={}", h, w, c, d);

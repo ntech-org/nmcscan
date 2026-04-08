@@ -1,7 +1,6 @@
 use crate::models::entities::api_keys;
 use sea_orm::sea_query::Expr;
 use sea_orm::*;
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct ApiKeyRepository {
