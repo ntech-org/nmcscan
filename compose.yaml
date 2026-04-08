@@ -34,7 +34,8 @@ services:
   nmcscan-api:
     build:
       context: .
-      dockerfile: packages/api/Dockerfile
+      dockerfile: Dockerfile
+      target: api-runtime
     container_name: nmcscan_api
     restart: unless-stopped
     depends_on:
@@ -69,7 +70,8 @@ services:
   nmcscan-scanner:
     build:
       context: .
-      dockerfile: packages/scanner/Dockerfile
+      dockerfile: Dockerfile
+      target: scanner-runtime
     container_name: nmcscan_scanner
     restart: unless-stopped
     depends_on:
