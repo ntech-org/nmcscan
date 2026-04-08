@@ -166,7 +166,7 @@ NMCScan uses three data sources to categor every IP:
 | **Hosting** | Cloud providers, VPS, data centers | Every 2 hours |
 | **Residential** | Home ISPs | Every 7 days |
 | **Excluded** | Military, government, education, sensitive infrastructure | Never scanned |
-| **Unknown** | Unclassified (default until categorized) | Falls back to cold queue |
+| **Unknown** | Unclassified (default until categorized) | Also excluded |
 
 ### Forcing ASN Re-import
 
@@ -231,9 +231,11 @@ GET /api/servers?search=brand:Paper country:US players:>10 category:hosting flag
 | Flag | `flag:X` | `flag:cracked`, `flag:vanilla`, `flag:active` |
 | Login | `login:X` | `login:success`, `login:premium`, `login:whitelist` |
 
+Anything else: searches description/MOTD, incase-sensitive.
+
 ## 🗄️ Database
 
-NMCScan uses PostgreSQL with the following schema:
+NMCScan uses PostgreSQL with SeaORM with the following schema:
 
 | Table | Purpose |
 |-------|---------|
