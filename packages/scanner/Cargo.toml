@@ -8,14 +8,12 @@ license = "MIT"
 [dependencies]
 # Shared library
 nmcscan-shared = { path = "../shared" }
-migration = { path = "../../migration" }
 
 # Async runtime
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 
 # Database (via shared, but need SeaORM types)
 sea-orm = { version = "1.1", default-features = false, features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "with-chrono", "with-ipnetwork"] }
-sea-orm-migration = { version = "1.1", default-features = false, features = ["runtime-tokio-rustls", "sqlx-postgres"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

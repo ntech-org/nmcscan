@@ -8,7 +8,6 @@ mod scanner;
 mod scanner_loop;
 
 use crate::scanner::Scanner;
-use migration::Migrator;
 use nmcscan_shared::models::asn::AsnCategory;
 use nmcscan_shared::repositories::{AsnRepository, ServerRepository, StatsRepository};
 use nmcscan_shared::services::asn_fetcher::AsnFetcher;
@@ -16,7 +15,6 @@ use nmcscan_shared::services::scheduler::{Scheduler, ServerTarget};
 use nmcscan_shared::utils::exclude::{ExcludeList, ExcludeManager};
 use nmcscan_shared::utils::test_mode;
 use sea_orm::{ConnectOptions, Database};
-use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -134,8 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sqlx_logging(false);
 
     let db = Database::connect(opt).await?;
-    tracing::info!("Running migrations...");
-    Migrator::up(&db, None).await?;
+    // Migrations are handled by the API service. The scanner depends on the API
+    // healthcheck, so migrations are guaranteed to be applied before startup.
+    tracing::info!("Skipping migrations (handled by API service).");
     let db = Arc::new(db);
 
     // 3. Initialize repositories

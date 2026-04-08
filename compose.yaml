@@ -57,6 +57,7 @@ services:
     volumes:
       - ./exclude.conf:/app/exclude.conf:ro
       - ./honeypots.conf:/app/honeypots.conf:ro
+      - geoip_data:/app/data/maxmind
     working_dir: /app
     ports:
       - "${API_PORT:-3001}:3000"
@@ -77,6 +78,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      nmcscan-api:
+        condition: service_healthy
     ulimits:
       nofile:
         soft: 65536
@@ -96,6 +99,7 @@ services:
     volumes:
       - ./exclude.conf:/app/exclude.conf:ro
       - ./honeypots.conf:/app/honeypots.conf:ro
+      - geoip_data:/app/data/maxmind
 
   dashboard:
     build: ./dashboard
@@ -122,3 +126,4 @@ services:
 
 volumes:
   postgres_data:
+  geoip_data:
