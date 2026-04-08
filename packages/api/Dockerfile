@@ -1,5 +1,5 @@
 # NMCScan API Service Dockerfile
-FROM rust:1.84-slim AS builder
+FROM rust:1-slim-trixie AS builder
 
 WORKDIR /app
 
@@ -33,7 +33,7 @@ RUN cargo build -p nmcscan-api --release && \
     cp /app/target/release/nmcscan-api /usr/local/bin/
 
 # Runtime image
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
