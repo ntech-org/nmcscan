@@ -432,10 +432,16 @@ impl Scheduler {
             // If the range is exhausted, check if enough time has passed before resetting.
             // This prevents the same IPs from being rescanned immediately after epoch reset.
             if current_offset >= total_ips {
-                // Check cooldown: only reset if enough time has passed since last scan
+                // SAFETY: Clamp future timestamps to "now" to prevent permanent cooldown stalls
+                // (e.g. from clock drift, manual DB edits, or timezone bugs).
+                // If last_scanned_at is in the future, treat it as None (never scanned = always eligible).
                 let can_reset = range.last_scanned_at.map_or(true, |last_scan| {
-                    let hours_since = (now - last_scan.and_utc()).num_hours();
-                    hours_since >= min_epoch_hours as i64
+                    if last_scan.and_utc() > now {
+                        true  // future timestamp: treat as never scanned, always eligible
+                    } else {
+                        let hours_since = (now - last_scan.and_utc()).num_hours();
+                        hours_since >= min_epoch_hours as i64
+                    }
                 });
 
                 if can_reset {
@@ -450,13 +456,14 @@ impl Scheduler {
                     );
                 } else {
                     ranges_skipped_cooldown += 1;
+                    let hours_since = range.last_scanned_at.map_or(0, |t| {
+                        if t.and_utc() > now { 0 } else { (now - t.and_utc()).num_hours() }
+                    });
                     tracing::debug!(
                         "Range {} skipped (epoch {}), only {}h since last scan (need {}h)",
                         range.cidr,
                         range.scan_epoch,
-                        range
-                            .last_scanned_at
-                            .map_or(0, |t| (now - t.and_utc()).num_hours()),
+                        hours_since,
                         min_epoch_hours
                     );
                 }

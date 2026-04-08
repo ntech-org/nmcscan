@@ -194,7 +194,8 @@ impl AsnRepository {
                 FROM asn_ranges r
                 JOIN asns a ON r.asn = a.asn
                 WHERE a.category = '{}'
-                  AND (r.last_scanned_at IS NULL 
+                  AND (r.last_scanned_at IS NULL
+                       OR r.last_scanned_at > NOW()  -- future timestamps: treat as eligible
                        OR r.last_scanned_at < NOW() - INTERVAL '{} HOURS')
                 ORDER BY
                     r.last_scanned_at ASC NULLS FIRST,
