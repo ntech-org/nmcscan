@@ -155,18 +155,22 @@ mod tests {
     fn test_get_servers_by_region_us() {
         let servers = get_servers_by_region("us");
         assert!(!servers.is_empty());
-        assert!(servers
-            .iter()
-            .any(|(_, _, name, _)| name.contains("Hypixel")));
+        assert!(
+            servers
+                .iter()
+                .any(|(_, _, name, _)| name.contains("Hypixel"))
+        );
     }
 
     #[test]
     fn test_get_servers_by_region_eu() {
         let servers = get_servers_by_region("eu");
         assert!(!servers.is_empty());
-        assert!(servers
-            .iter()
-            .any(|(_, _, name, _)| name.contains("Gommehd")));
+        assert!(
+            servers
+                .iter()
+                .any(|(_, _, name, _)| name.contains("Gommehd"))
+        );
     }
 
     #[test]

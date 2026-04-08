@@ -168,7 +168,6 @@ impl AsnManager {
             "fbi",
             "cia",
             "nsa",
-            
             // Education & Healthcare
             "university",
             "college",
@@ -177,7 +176,6 @@ impl AsnManager {
             "hospital",
             "medical",
             "clinic",
-            
             // Critical Infrastructure
             "nuclear",
             "atomic",
@@ -186,7 +184,6 @@ impl AsnManager {
             "financial",
             "securities",
             "reserve",
-            
             // HONEYPOTS & SECURITY RESEARCH (CRITICAL - Must Never Scan)
             "honeypot",
             "honey pot",
@@ -239,19 +236,16 @@ impl AsnManager {
             "research project",
             "security scanner",
             "network monitor",
-            
             // Additional Scanner Organizations (specific names, NOT generic CDN/hosting)
             "sonar research",
             "opendns",
             "umbrella security",
-            
             // Research & Census Projects
             "isc",
             "internet systems consortium",
             "caida",
             "routeviews",
             "ripe ncc",
-            
             // IP Geolocation/Intelligence Services (often used for scanning)
             "maxmind",
             "ip2location",

@@ -55,10 +55,8 @@ impl MigrationTrait for Migration {
         // ── Step 1: Convert IP columns from TEXT to INET ─────────────────────
         println!("Converting IP columns from TEXT to INET...");
 
-        db.execute_unprepared(
-            "ALTER TABLE servers ALTER COLUMN ip TYPE INET USING ip::INET",
-        )
-        .await?;
+        db.execute_unprepared("ALTER TABLE servers ALTER COLUMN ip TYPE INET USING ip::INET")
+            .await?;
         db.execute_unprepared(
             "ALTER TABLE server_players ALTER COLUMN ip TYPE INET USING ip::INET",
         )
@@ -257,10 +255,8 @@ impl MigrationTrait for Migration {
             "ALTER TABLE server_players ALTER COLUMN ip TYPE TEXT USING ip::TEXT",
         )
         .await?;
-        db.execute_unprepared(
-            "ALTER TABLE servers ALTER COLUMN ip TYPE TEXT USING ip::TEXT",
-        )
-        .await?;
+        db.execute_unprepared("ALTER TABLE servers ALTER COLUMN ip TYPE TEXT USING ip::TEXT")
+            .await?;
 
         // Recreate FKs
         db.execute_unprepared(

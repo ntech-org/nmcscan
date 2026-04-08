@@ -8,14 +8,14 @@
 //! This gives the scanner time to do its initial SLP pass and populate version data.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{self, Duration};
 
-use nmcscan_shared::network::login::{self, LoginObstacle, LoginResult, LATEST_PROTOCOL};
-use nmcscan_shared::repositories::ServerRepository;
 use chrono::Utc;
+use nmcscan_shared::network::login::{self, LATEST_PROTOCOL, LoginObstacle, LoginResult};
+use nmcscan_shared::repositories::ServerRepository;
 use sea_orm::prelude::IpNetwork;
 
 /// Login queue statistics.
@@ -212,7 +212,11 @@ impl LoginQueue {
                             // We've cycled through all servers — reset cursor and start over
                             cursor_ip = None;
                             cursor_port = None;
-                            match self.server_repo.get_online_servers_cursor(500, None, None).await {
+                            match self
+                                .server_repo
+                                .get_online_servers_cursor(500, None, None)
+                                .await
+                            {
                                 Ok(b) => current_batch = b,
                                 Err(e) => {
                                     tracing::error!("Failed to fetch online servers: {}", e);

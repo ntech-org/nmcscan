@@ -3,20 +3,18 @@
 //! High-performance Minecraft server scanning service.
 //! This service can run independently of the API service.
 
+mod login_queue;
 mod scanner;
 mod scanner_loop;
-mod login_queue;
 
-use nmcscan_shared::models::asn::AsnCategory;
 use crate::scanner::Scanner;
-use nmcscan_shared::repositories::{
-    AsnRepository, ServerRepository, StatsRepository,
-};
+use migration::Migrator;
+use nmcscan_shared::models::asn::AsnCategory;
+use nmcscan_shared::repositories::{AsnRepository, ServerRepository, StatsRepository};
 use nmcscan_shared::services::asn_fetcher::AsnFetcher;
 use nmcscan_shared::services::scheduler::{Scheduler, ServerTarget};
 use nmcscan_shared::utils::exclude::{ExcludeList, ExcludeManager};
 use nmcscan_shared::utils::test_mode;
-use migration::Migrator;
 use sea_orm::{ConnectOptions, Database};
 use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
@@ -26,7 +24,11 @@ use clap::Parser;
 
 /// NMCScan Scanner Service arguments
 #[derive(Parser, Debug)]
-#[command(author, version, about = "NMCScan Scanner Service - High-performance Minecraft server scanning")]
+#[command(
+    author,
+    version,
+    about = "NMCScan Scanner Service - High-performance Minecraft server scanning"
+)]
 struct Args {
     /// Enable test mode (scan only known servers)
     #[arg(short, long, env = "TEST_MODE", default_value = "false")]
@@ -81,7 +83,6 @@ struct Args {
     #[arg(long, env = "FORCE_ASN_IMPORT", default_value = "false")]
     force_asn_import: bool,
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -191,14 +192,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing::info!("Loading {} test servers...", test_servers.len());
         for (ip, port, _name, host) in &test_servers {
-            let server_type: String = if *port == 19132 { "bedrock".to_string() } else { "java".to_string() };
+            let server_type: String = if *port == 19132 {
+                "bedrock".to_string()
+            } else {
+                "java".to_string()
+            };
             let mut target = ServerTarget::new(ip.clone(), *port, server_type.clone());
             target.category = AsnCategory::Hosting;
             target.priority = 1;
             target.hostname = Some(host.clone());
 
             let port_i16: i16 = (*port).try_into().unwrap_or(25565);
-            let _ = server_repo.insert_server_if_new(ip, port_i16, &server_type).await;
+            let _ = server_repo
+                .insert_server_if_new(ip, port_i16, &server_type)
+                .await;
             scheduler.add_server(target, false).await;
         }
     }
@@ -206,7 +213,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (try_refill_queues, fill_warm_queue_if_needed, fill_cold_queue_if_needed)
 
     let (h, w, c, d) = scheduler.get_queue_sizes().await;
-    tracing::info!("Scheduler queues: Hot={}, Warm={}, Cold={}, Discovery={}", h, w, c, d);
+    tracing::info!(
+        "Scheduler queues: Hot={}, Warm={}, Cold={}, Discovery={}",
+        h,
+        w,
+        c,
+        d
+    );
 
     let scheduler = Arc::new(scheduler);
     let scanner = Arc::new(scanner);

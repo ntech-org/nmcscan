@@ -28,7 +28,7 @@ impl MigrationTrait for Migration {
 
         // Index for discovery range queries: get_ranges_to_scan joins
         // asn_ranges → asns and filters by category, then orders by last_scanned_at.
-        // The category filter comes from the ASNs table, but indexing asn, 
+        // The category filter comes from the ASNs table, but indexing asn,
         // last_scanned_at helps the join and sort.
         db.execute_unprepared(
             "CREATE INDEX IF NOT EXISTS idx_asn_ranges_asn_lastscanned \

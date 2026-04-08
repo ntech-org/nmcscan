@@ -552,7 +552,9 @@ impl AsnFetcher {
             time::sleep(time::Duration::from_millis(200)).await;
 
             if processed > 250000 {
-                tracing::warn!("Recategorization hit processing limit (250k ASNs). Some ASNs may remain uncategorized.");
+                tracing::warn!(
+                    "Recategorization hit processing limit (250k ASNs). Some ASNs may remain uncategorized."
+                );
                 break;
             }
         }

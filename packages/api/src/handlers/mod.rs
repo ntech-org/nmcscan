@@ -16,12 +16,12 @@
 //! - GET / - Static dashboard (fallback to assets)
 
 use axum::{
+    Router,
     extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Json, Response},
     routing::{get, post},
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

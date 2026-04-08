@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 const MAX_PACKET_SIZE: usize = 256 * 1024; // 256KB limit for safety
 

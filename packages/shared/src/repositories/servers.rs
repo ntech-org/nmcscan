@@ -101,16 +101,13 @@ impl ServerRepository {
         if let Some(ip) = cursor_ip {
             let port = cursor_port.unwrap_or(0);
             query = query.filter(
-                Condition::all()
-                    .add(
-                        Condition::any()
-                            .add(servers::Column::Ip.gt(ip))
-                            .add(
-                                Condition::all()
-                                    .add(servers::Column::Ip.eq(ip))
-                                    .add(servers::Column::Port.gt(port)),
-                            ),
+                Condition::all().add(
+                    Condition::any().add(servers::Column::Ip.gt(ip)).add(
+                        Condition::all()
+                            .add(servers::Column::Ip.eq(ip))
+                            .add(servers::Column::Port.gt(port)),
                     ),
+                ),
             );
         }
 

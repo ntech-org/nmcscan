@@ -183,10 +183,10 @@ impl AsnRepository {
         // preventing large ASNs from monopolizing the queue AND preventing the same
         // range from being rescanned immediately after epoch reset.
         let pool_size = limit * 10;
-        
+
         // Epoch cooldown: prevent ranges from being picked again too soon
         let min_hours = if category == "hosting" { 12 } else { 56 };
-        
+
         let sql = format!(
             r#"
             SELECT cidr, asn, scan_offset, last_scanned_at, scan_epoch FROM (
@@ -285,12 +285,7 @@ impl AsnRepository {
             .execute(Statement::from_sql_and_values(
                 self.db.get_database_backend(),
                 sql,
-                [
-                    cidrs.into(),
-                    offsets.into(),
-                    resets.into(),
-                    bumps.into(),
-                ],
+                [cidrs.into(), offsets.into(), resets.into(), bumps.into()],
             ))
             .await?;
 

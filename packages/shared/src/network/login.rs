@@ -19,7 +19,7 @@ use std::io;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// The username used for offline login attempts.
 const OFFLINE_USERNAME: &str = "NMCScan";
@@ -547,7 +547,9 @@ pub async fn attempt_login_smart(addr: SocketAddr, protocol_version: i32) -> Log
                 if extracted_protocol != protocol_version {
                     tracing::debug!(
                         "Protocol mismatch detected for {}: extracted protocol {} from '{}', retrying...",
-                        addr, extracted_protocol, reason
+                        addr,
+                        extracted_protocol,
+                        reason
                     );
                     let retry_result = attempt_login(addr, extracted_protocol).await;
 

@@ -1,10 +1,10 @@
+use crate::scanner::Scanner;
+use nmcscan_shared::repositories::{ServerRepository, StatsRepository};
+use nmcscan_shared::services::scheduler::Scheduler;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
-use crate::scanner::Scanner;
-use nmcscan_shared::repositories::{ServerRepository, StatsRepository};
-use nmcscan_shared::services::scheduler::Scheduler;
 
 // Background scanner loop with tiered rate limiting and concurrency.
 pub async fn run_scanner_loop(

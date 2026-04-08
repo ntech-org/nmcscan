@@ -3,14 +3,16 @@
 //! Web API and database management service for Minecraft server scanning.
 //! This service can run independently of the scanner service.
 
+use migration::Migrator;
 use nmcscan_shared::models::entities::{asns, servers};
 use nmcscan_shared::repositories::{
     ApiKeyRepository, AsnRepository, ServerRepository, StatsRepository,
 };
 use nmcscan_shared::services::asn_fetcher::AsnFetcher;
 use nmcscan_shared::utils::exclude::{ExcludeList, ExcludeManager};
-use migration::Migrator;
-use sea_orm::{ColumnTrait, ConnectOptions, Database, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect};
+use sea_orm::{
+    ColumnTrait, ConnectOptions, Database, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect,
+};
 use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -21,7 +23,11 @@ mod handlers;
 
 /// NMCScan API Service arguments
 #[derive(Parser, Debug)]
-#[command(author, version, about = "NMCScan API Service - Web interface and database management")]
+#[command(
+    author,
+    version,
+    about = "NMCScan API Service - Web interface and database management"
+)]
 struct Args {
     /// Log level (debug, info, warn, error)
     #[arg(short, long, env = "RUST_LOG", default_value = "info")]
@@ -104,7 +110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Failed to parse exclude list: {}", e);
         ExcludeList::from_str("").unwrap()
     });
-    tracing::info!("Loaded {} exclude networks (including honeypots)", exclude_list.len());
+    tracing::info!(
+        "Loaded {} exclude networks (including honeypots)",
+        exclude_list.len()
+    );
 
     // 2. Initialize database and run migrations
     tracing::info!("Initializing database at {}...", args.database);
@@ -126,12 +135,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let asn_repo = Arc::new(AsnRepository::new((*db).clone()));
     let stats_repo = Arc::new(StatsRepository::new((*db).clone()));
     let api_key_repo = Arc::new(ApiKeyRepository::new((*db).clone()));
-    let minecraft_account_repo = Arc::new(nmcscan_shared::repositories::MinecraftAccountRepository::new((*db).clone()));
+    let minecraft_account_repo =
+        Arc::new(nmcscan_shared::repositories::MinecraftAccountRepository::new((*db).clone()));
 
     // 4. Initialize ASN fetcher and import/update ASN data
     tracing::info!("Initializing ASN fetcher...");
     let asn_fetcher = Arc::new(AsnFetcher::new(Arc::clone(&db), Arc::clone(&asn_repo)));
-    
+
     // Full import if forced or if data is missing
     let range_count = asn_fetcher.asn_manager().read().await.range_count();
     let asn_count = asn_fetcher.asn_manager().read().await.asn_count();
@@ -162,10 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .unwrap_or(0);
 
-        let total_count = asns::Entity::find()
-            .count(&*db)
-            .await
-            .unwrap_or(1);
+        let total_count = asns::Entity::find().count(&*db).await.unwrap_or(1);
 
         let unknown_percentage = if total_count > 0 {
             (unknown_count as f64 / total_count as f64) * 100.0
@@ -183,7 +190,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ipverse_map = asn_fetcher.fetch_ipverse_map().await;
             match asn_fetcher.recategorize_all_asns(&ipverse_map).await {
                 Ok(updated) => {
-                    tracing::info!("Startup recategorization complete: {} ASNs reclassified", updated);
+                    tracing::info!(
+                        "Startup recategorization complete: {} ASNs reclassified",
+                        updated
+                    );
                 }
                 Err(e) => {
                     tracing::error!("Startup recategorization failed: {}", e);
@@ -195,19 +205,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Backfill ASN data for existing servers
     {
         let db_clone = Arc::clone(&db);
-        let servers_res: Result<Vec<servers::Model>, sea_orm::DbErr> =
-            servers::Entity::find()
-                .filter(servers::Column::Asn.is_null())
-                .filter(servers::Column::Status.ne("ignored"))
-                .limit(5000)
-                .all(&*db_clone)
-                .await;
+        let servers_res: Result<Vec<servers::Model>, sea_orm::DbErr> = servers::Entity::find()
+            .filter(servers::Column::Asn.is_null())
+            .filter(servers::Column::Status.ne("ignored"))
+            .limit(5000)
+            .all(&*db_clone)
+            .await;
         if let Ok(srvs) = servers_res {
             if !srvs.is_empty() {
                 tracing::info!("Backfilling ASN data for {} servers...", srvs.len());
                 // Note: Full backfill would require the ASN fetcher to look up each IP
                 // This is a lighter version for the API service
-                tracing::info!("Backfill skipped in API-only mode (scanner will handle on startup)");
+                tracing::info!(
+                    "Backfill skipped in API-only mode (scanner will handle on startup)"
+                );
             }
         }
     }
@@ -259,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         contact_email: args.contact_email.clone(),
         discord_link: args.discord_link.clone(),
     };
-    
+
     let listen_addr = args.listen_addr.clone();
     let listen_addr_log = listen_addr.clone();
     let api_handle = tokio::spawn(async move {
@@ -268,7 +279,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("✅ API Service started on {}", listen_addr_log);
     tracing::info!("   Database: connected");
-    tracing::info!("   ASN Manager: initialized ({} ASNs, {} ranges)", asn_count, range_count);
+    tracing::info!(
+        "   ASN Manager: initialized ({} ASNs, {} ranges)",
+        asn_count,
+        range_count
+    );
     tracing::info!("   Scanner: NOT running (separate nmcscan-scanner service)");
     tracing::info!("   Login queue: NOT running (part of scanner service)");
 

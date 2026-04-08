@@ -693,7 +693,7 @@ impl Scheduler {
     /// Only runs when queue is below 25% of threshold to prevent aggressive re-scanning.
     pub async fn try_refill_queues(&self) {
         let configs = vec![
-            (1, 2, 10_000, 5_000u64),  // priority, interval_hours, threshold, limit
+            (1, 2, 10_000, 5_000u64), // priority, interval_hours, threshold, limit
             (2, 24, 5_000, 3_000u64),
             (3, 168, 5_000, 2_000u64),
         ];
