@@ -284,7 +284,22 @@ impl AsnFetcher {
     }
 
     /// Import the full ASN database from iptoasn.com to discover all providers globally.
-    pub async fn import_full_database(&self) -> Result<(), AsnError> {
+    ///
+    /// If `clean_slate` is true, all existing ASN data is dropped before importing.
+    /// Categorization happens during import using ipverse — no separate recategorization pass needed.
+    pub async fn import_full_database(&self, clean_slate: bool) -> Result<(), AsnError> {
+        if clean_slate {
+            tracing::info!("Dropping existing ASN data for clean import...");
+            self.asn_repo
+                .drop_all_asn_data()
+                .await
+                .map_err(|e| AsnError::MaxMindError(format!("Drop error: {}", e)))?;
+            // Clear in-memory cache too
+            let mut manager = self.asn_manager.write().await;
+            *manager = AsnManager::new();
+            drop(manager);
+        }
+
         tracing::info!("Downloading ASN categorization metadata from ipverse...");
         let ipverse_map = self.fetch_ipverse_map().await;
         tracing::info!(
@@ -386,8 +401,8 @@ impl AsnFetcher {
             });
         }
 
-        // Batch upsert ASNs with throttling
-        for chunk in asn_models.chunks(200) {
+        // Batch upsert ASNs
+        for chunk in asn_models.chunks(1000) {
             asns::Entity::insert_many(chunk.to_vec())
                 .on_conflict(
                     sea_orm::sea_query::OnConflict::column(asns::Column::Asn)
@@ -411,9 +426,6 @@ impl AsnFetcher {
                 .exec(&*self.db)
                 .await
                 .map_err(|e| AsnError::MaxMindError(format!("ASN batch error: {}", e)))?;
-
-            // Artificial delay to prevent pegging CPU/DB
-            time::sleep(time::Duration::from_millis(50)).await;
         }
 
         // Prepare range models
@@ -426,8 +438,8 @@ impl AsnFetcher {
             });
         }
 
-        // Batch upsert ranges with throttling
-        for chunk in range_models.chunks(500) {
+        // Batch upsert ranges
+        for chunk in range_models.chunks(5000) {
             asn_ranges::Entity::insert_many(chunk.to_vec())
                 .on_conflict(
                     sea_orm::sea_query::OnConflict::column(asn_ranges::Column::Cidr)
@@ -437,20 +449,19 @@ impl AsnFetcher {
                 .exec(&*self.db)
                 .await
                 .map_err(|e| AsnError::MaxMindError(format!("Range batch error: {}", e)))?;
-
-            // Artificial delay
-            time::sleep(time::Duration::from_millis(50)).await;
         }
 
         tracing::info!("Global ASN discovery sync complete.");
 
-        // After full import, run a re-categorization pass
-        let _ = self.recategorize_all_asns(&ipverse_map).await;
+        // Reload in-memory manager from the freshly imported database
+        self.load_from_database().await?;
 
         Ok(())
     }
 
-    /// Run a throttled batch re-categorization of "Unknown" ASNs in the database.
+    /// Run a targeted batch re-categorization of "Unknown" ASNs using the ipverse map.
+    /// Only processes ASNs that actually exist in the ipverse map to avoid iterating
+    /// millions of unknowns that will never be categorized.
     pub async fn recategorize_all_asns(
         &self,
         ipverse_map: &std::collections::HashMap<String, String>,
@@ -460,28 +471,39 @@ impl AsnFetcher {
             ipverse_map.len()
         );
 
+        // Build the list of ASNs we can actually categorize (unknown + in ipverse map).
+        // We filter the ipverse map keys to only those starting with "AS" for valid ASN format.
+        let target_asns: Vec<String> = ipverse_map
+            .keys()
+            .filter(|k| k.starts_with("AS"))
+            .cloned()
+            .collect();
+
+        if target_asns.is_empty() {
+            tracing::info!("No target ASNs in ipverse map, skipping recategorization.");
+            return Ok(0);
+        }
+
+        // Only fetch unknown ASNs that are in the ipverse map via SQL.
+        // This avoids loading millions of rows into memory.
+        let batch_size = 5000;
         let mut total_updated = 0;
         let mut processed = 0;
-        let mut unknown_remaining = 0;
         let mut hosting_promoted = 0;
         let mut residential_promoted = 0;
         let mut excluded_promoted = 0;
-        let batch_size = 500;
 
-        loop {
-            // Fetch a chunk of unknown ASNs
-            let asns_models = asns::Entity::find()
+        for chunk in target_asns.chunks(batch_size) {
+            let batch_asns = asns::Entity::find()
                 .filter(asns::Column::Category.eq("unknown"))
-                .limit(batch_size)
+                .filter(asns::Column::Asn.is_in(chunk.iter().cloned()))
                 .all(&*self.db)
                 .await
                 .map_err(|e| AsnError::MaxMindError(format!("DB error: {}", e)))?;
 
-            if asns_models.is_empty() {
-                break;
+            if batch_asns.is_empty() {
+                continue;
             }
-
-            let mut chunk_updated = 0;
 
             // Wrap the entire batch in a transaction for efficiency
             use sea_orm::TransactionTrait;
@@ -491,7 +513,7 @@ impl AsnFetcher {
                 .await
                 .map_err(|e| AsnError::MaxMindError(format!("Tx error: {}", e)))?;
 
-            for model in asns_models {
+            for model in batch_asns {
                 processed += 1;
                 let tags = AsnManager::extract_tags(&model.org);
                 let category_str = ipverse_map.get(&model.asn).map(|s| s.as_str());
@@ -519,8 +541,6 @@ impl AsnFetcher {
                     active.category = Set(cat_str.to_string());
                     active.tags = Set(Some(tags.join(",")));
                     changed = true;
-                } else {
-                    unknown_remaining += 1;
                 }
 
                 active.last_updated = Set(Some(Utc::now().into()));
@@ -530,59 +550,50 @@ impl AsnFetcher {
                     .map_err(|e| AsnError::MaxMindError(format!("Update error: {}", e)))?;
 
                 if changed {
-                    chunk_updated += 1;
+                    total_updated += 1;
                 }
             }
 
             tx.commit()
                 .await
                 .map_err(|e| AsnError::MaxMindError(format!("Commit error: {}", e)))?;
-
-            total_updated += chunk_updated;
-
-            if processed % 5000 == 0 {
-                tracing::info!(
-                    "Recategorization progress: processed {} ASNs, {} updated so far...",
-                    processed,
-                    total_updated
-                );
-            }
-
-            // Sleep to reduce CPU/DB pressure
-            time::sleep(time::Duration::from_millis(200)).await;
-
-            if processed > 250000 {
-                tracing::warn!(
-                    "Recategorization hit processing limit (250k ASNs). Some ASNs may remain uncategorized."
-                );
-                break;
-            }
         }
 
         if processed > 0 {
             tracing::info!(
-                "Recategorization complete: processed {} total, {} promoted from Unknown ({} hosting, {} residential, {} excluded), {} still unknown.",
+                "Recategorization complete: processed {} ASNs, {} promoted from Unknown ({} hosting, {} residential, {} excluded).",
                 processed,
                 total_updated,
                 hosting_promoted,
                 residential_promoted,
-                excluded_promoted,
-                unknown_remaining
+                excluded_promoted
             );
             // Refresh in-memory manager
             let _ = self.load_from_database().await;
         } else {
-            tracing::info!("No unknown ASNs found to recategorize.");
+            tracing::info!("No unknown ASNs found in ipverse map to recategorize.");
         }
 
         Ok(total_updated)
     }
 
     /// Fetch ASN and Country data for a single IP using local MaxMind databases.
+    ///
+    /// This is a READ-ONLY lookup — it does NOT write to the database.
+    /// All ASN/range data should come from the initial import (iptoasn + ipverse).
+    /// MaxMind is used as a fallback for IPs not covered by imported ranges.
     pub async fn fetch_asn_for_ip(&self, ip: &str) -> Result<AsnRecord, AsnError> {
         let ip_addr: std::net::IpAddr = ip.parse().map_err(|_| AsnError::AsnNotFound)?;
 
-        // 1. Try local ASN lookup
+        // 1. Try in-memory manager first (from initial import) — only for IPv4
+        if let std::net::IpAddr::V4(v4) = ip_addr {
+            let manager = self.asn_manager.read().await;
+            if let Some(record) = manager.get_asn_for_ip(v4) {
+                return Ok(record.clone());
+            }
+        }
+
+        // 2. Fall back to MaxMind lookup (read-only, no DB writes)
         let asn_reader_lock = self.maxmind_asn.read().await;
         let mut asn_val = None;
         let mut org_val = None;
@@ -599,7 +610,7 @@ impl AsnFetcher {
         }
         drop(asn_reader_lock);
 
-        // 2. Try local Country lookup
+        // 3. Try local Country lookup
         let country_reader_lock = self.maxmind_country.read().await;
         let mut country_code = None;
 
@@ -623,46 +634,28 @@ impl AsnFetcher {
         let tags = AsnManager::extract_tags(&org);
 
         let record = AsnRecord {
-            asn: asn.clone(),
-            org: org.clone(),
+            asn,
+            org,
             category,
             country: country_code,
             last_updated: Some(Utc::now()),
             server_count: 0,
-            tags: tags.clone(),
+            tags,
         };
 
-        // Save to cache for fast dashboard listing
-        let _ = self
-            .asn_repo
-            .upsert_asn(
-                &asn,
-                &org,
-                match record.category {
-                    AsnCategory::Hosting => "hosting",
-                    AsnCategory::Residential => "residential",
-                    AsnCategory::Excluded => "excluded",
-                    AsnCategory::Unknown => "unknown",
-                },
-                record.country.as_deref(),
-                Some(tags),
-            )
-            .await;
-
-        // Add range to manager if it's IPv4.
-        // Since lookup_prefix is missing in this context, we jumpstart by adding a /24 range.
-        if let std::net::IpAddr::V4(v4) = ip_addr {
-            let octets = v4.octets();
-            let cidr = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+        // Cache in-memory only — do NOT pollute the database with scanner-discovered ASNs.
+        // Only the initial import should create DB entries.
+        {
             let mut manager = self.asn_manager.write().await;
-            manager.add_range(cidr.clone(), asn.clone());
-            // Also save range to DB
-            let _ = self.asn_repo.upsert_asn_range(&cidr, &asn).await;
-        }
+            manager.add_asn(record.clone());
 
-        // Add to in-memory manager
-        let mut manager = self.asn_manager.write().await;
-        manager.add_asn(record.clone());
+            // Cache /24 range in memory for future lookups
+            if let std::net::IpAddr::V4(v4) = ip_addr {
+                let octets = v4.octets();
+                let cidr = format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]);
+                manager.add_range(cidr, record.asn.clone());
+            }
+        }
 
         Ok(record)
     }
@@ -714,8 +707,8 @@ impl AsnFetcher {
                 tracing::info!("MaxMind databases reloaded.");
             }
 
-            // 2. Refresh Full ASN Discovery Database
-            let _ = self.import_full_database().await;
+            // 2. Refresh Full ASN Discovery Database (upsert only, not clean slate)
+            let _ = self.import_full_database(false).await;
         }
     }
 }

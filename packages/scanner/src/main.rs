@@ -150,8 +150,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let range_count = asn_fetcher.asn_manager().read().await.range_count();
     let asn_count = asn_fetcher.asn_manager().read().await.asn_count();
     if asn_count < 100 || range_count < 100 || args.force_asn_import {
-        tracing::info!("Running full ASN database import...");
-        match asn_fetcher.import_full_database().await {
+        let clean_slate = args.force_asn_import || asn_count > 0;
+        tracing::info!("Running full ASN database import (clean: {})...", clean_slate);
+        match asn_fetcher.import_full_database(clean_slate).await {
             Ok(()) => tracing::info!("Full ASN import completed."),
             Err(e) => tracing::error!("Full ASN import failed: {}", e),
         }
@@ -171,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&asn_repo),
         args.test_mode || args.quick_test,
         args.test_interval as u32,
+        args.target_rps,
     );
 
     // 6. Load servers

@@ -293,13 +293,32 @@ impl AsnRepository {
         Ok(())
     }
 
-    /// Get scan progress per category: total ranges, scanned ranges, total epochs.
+    /// Drop all ASN data from the database. Used for clean re-imports.
+    pub async fn drop_all_asn_data(&self) -> Result<(), DbErr> {
+        // Delete ranges first (foreign key constraint), then ASNs.
+        let sql = r#"
+            DELETE FROM asn_ranges;
+            DELETE FROM asns;
+        "#;
+        self.db
+            .execute(Statement::from_string(
+                self.db.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await?;
+
+        tracing::info!("Dropped all ASN data from database.");
+        Ok(())
+    }
+
+    /// Get scan progress per category: total ranges, current cycle progress, and first-loop progress.
     pub async fn get_scan_progress(&self) -> Result<Vec<CategoryProgress>, DbErr> {
         let sql = r#"
             SELECT a.category,
                    COUNT(r.cidr)::bigint as total_ranges,
                    SUM(CASE WHEN r.scan_offset > 0 THEN 1 ELSE 0 END)::bigint as scanned_ranges,
-                   SUM(r.scan_epoch)::bigint as total_epochs
+                   SUM(r.scan_epoch)::bigint as total_epochs,
+                   SUM(CASE WHEN r.last_scanned_at IS NOT NULL THEN 1 ELSE 0 END)::bigint as ever_scanned_ranges
             FROM asn_ranges r
             JOIN asns a ON r.asn = a.asn
             GROUP BY a.category
@@ -314,6 +333,7 @@ impl AsnRepository {
             .map(|row| {
                 let total: i64 = row.try_get("", "total_ranges").unwrap_or(0);
                 let scanned: i64 = row.try_get("", "scanned_ranges").unwrap_or(0);
+                let ever_scanned: i64 = row.try_get("", "ever_scanned_ranges").unwrap_or(0);
                 CategoryProgress {
                     category: row.try_get("", "category").unwrap_or_default(),
                     total_ranges: total,
@@ -321,6 +341,11 @@ impl AsnRepository {
                     total_epochs: row.try_get("", "total_epochs").unwrap_or(0),
                     cycle_progress_pct: if total > 0 {
                         (scanned as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    },
+                    first_loop_pct: if total > 0 {
+                        (ever_scanned as f64 / total as f64) * 100.0
                     } else {
                         0.0
                     },
@@ -340,4 +365,6 @@ pub struct CategoryProgress {
     pub scanned_ranges: i64,
     pub total_epochs: i64,
     pub cycle_progress_pct: f64,
+    /// % of ranges that have been scanned at least once (first loop completion).
+    pub first_loop_pct: f64,
 }

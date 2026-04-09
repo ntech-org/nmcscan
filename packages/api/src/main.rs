@@ -145,20 +145,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Full import if forced or if data is missing
     let range_count = asn_fetcher.asn_manager().read().await.range_count();
     let asn_count = asn_fetcher.asn_manager().read().await.asn_count();
-    if asn_count < 100 || range_count < 100 || args.force_asn_import {
+    let need_import = asn_count < 100 || range_count < 100 || args.force_asn_import;
+
+    if need_import {
+        let clean_slate = args.force_asn_import || asn_count > 0;
         tracing::info!(
-            "Running full ASN database import (ASNs: {}, ranges: {})...",
+            "Running full ASN database import (clean: {}, ASNs: {}, ranges: {})...",
+            clean_slate,
             asn_count,
             range_count
         );
-        match asn_fetcher.import_full_database().await {
+        match asn_fetcher.import_full_database(clean_slate).await {
             Ok(()) => tracing::info!("Full ASN import completed successfully."),
             Err(e) => tracing::error!("Full ASN import failed: {}", e),
         }
-    }
-
-    // Run startup recategorization if needed
-    {
+        // Fresh import already categorized via ipverse — no recategorization needed
+    } else {
+        // Run startup recategorization only if data is stale
         let any_recent = asns::Entity::find()
             .filter(asns::Column::LastUpdated.gt(chrono::Utc::now() - chrono::Duration::days(7)))
             .limit(1)

@@ -155,6 +155,8 @@ pub struct Scheduler {
     pub asn_repo: Arc<AsnRepository>,
     pub test_mode: bool,
     test_interval: u32,
+    /// Target RPS — used to scale discovery IP generation.
+    target_rps: u64,
 }
 
 impl Scheduler {
@@ -163,6 +165,7 @@ impl Scheduler {
         asn_repo: Arc<AsnRepository>,
         test_mode: bool,
         test_interval: u32,
+        target_rps: u64,
     ) -> Self {
         Self {
             hot_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -174,6 +177,7 @@ impl Scheduler {
             asn_repo,
             test_mode,
             test_interval,
+            target_rps,
         }
     }
 
@@ -320,11 +324,12 @@ impl Scheduler {
     }
 
     pub async fn fill_warm_queue_if_needed(&self) {
-        // Always run discovery — discovery targets go to the dedicated
-        // discovery_queue, so queue size doesn't matter.
-        // This prevents the stall where all main queue items have future next_scan_at.
+        // INTERLEAVED DISCOVERY: Fetch hosting ranges (90% of discovery scan capacity)
+        // IPs per range is scaled from target RPS to keep the discovery queue well-fed.
+        // At 100 RPS with a ~15s tick interval: 100 * 15 * 0.9 = ~1350 IPs needed.
+        // With ~500 ranges returned: 1350 / 500 ≈ 3 IPs per range.
+        let hosting_ips_per_range = std::cmp::max(1u64, (self.target_rps * 15 * 9 / 10).div_ceil(500));
 
-        // INTERLEAVED DISCOVERY: Fetch hosting ranges
         match self.asn_repo.get_ranges_to_scan("hosting", 500).await {
             Ok(ranges) => {
                 if ranges.is_empty() {
@@ -333,11 +338,12 @@ impl Scheduler {
                     );
                     return;
                 }
-                let count = self.fill_discovery_queue(ranges, 2, 200).await.unwrap_or(0);
+                let count = self.fill_discovery_queue(ranges, 2, hosting_ips_per_range as usize).await.unwrap_or(0);
                 if count > 0 {
                     tracing::info!(
-                        "Discovery: Added {} new targets to discovery queue (from hosting)",
-                        count
+                        "Discovery: Added {} new targets to discovery queue (from hosting, {} IPs/range)",
+                        count,
+                        hosting_ips_per_range
                     );
                 } else {
                     tracing::debug!(
@@ -352,8 +358,6 @@ impl Scheduler {
     }
 
     pub async fn fill_cold_queue_if_needed(&self) {
-        // Always run discovery — discovery targets go to the dedicated discovery_queue.
-
         // 1. Try to recycle dead/ignored servers (these go to main cold queue)
         if let Ok(dead_servers) = self.server_repo.get_dead_servers(1000).await {
             for server in dead_servers {
@@ -370,7 +374,10 @@ impl Scheduler {
             }
         }
 
-        // 2. DISCOVERY: Fetch residential ranges only (unknown ranges are not worth scanning)
+        // 2. DISCOVERY: Fetch residential ranges (10% of discovery scan capacity)
+        // Residential scanning is deliberately rate-limited to minimize impact on home networks.
+        let residential_ips_per_range = std::cmp::max(1u64, (self.target_rps * 15 / 10).div_ceil(500));
+
         let ranges = self
             .asn_repo
             .get_ranges_to_scan("residential", 500)
@@ -379,12 +386,13 @@ impl Scheduler {
         let source = "residential";
 
         if !ranges.is_empty() {
-            let count = self.fill_discovery_queue(ranges, 3, 200).await.unwrap_or(0);
+            let count = self.fill_discovery_queue(ranges, 3, residential_ips_per_range as usize).await.unwrap_or(0);
             if count > 0 {
                 tracing::info!(
-                    "Discovery: Added {} new targets to discovery queue (from {})",
+                    "Discovery: Added {} new targets to discovery queue (from {}, {} IPs/range)",
                     count,
-                    source
+                    source,
+                    residential_ips_per_range
                 );
             } else {
                 tracing::debug!(

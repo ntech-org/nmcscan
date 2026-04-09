@@ -20,6 +20,7 @@
         scanned_ranges: number;
         total_epochs: number;
         cycle_progress_pct: number;
+        first_loop_pct: number;
     }
 
     interface ScanProgress {
@@ -126,21 +127,55 @@
 
 <Separator />
 
-<!-- Scan cycle progress -->
+<!-- Continuous discovery scan progress -->
 <div class="space-y-4">
-    <h2 class="text-sm font-semibold tracking-tight">Scan Cycle Progress</h2>
+    <div class="flex items-center gap-2">
+        <h2 class="text-sm font-semibold tracking-tight">Continuous Discovery Scan</h2>
+        <div class="group relative">
+            <svg class="w-3.5 h-3.5 text-muted-foreground cursor-help" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10" />
+                <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
+                <circle cx="12" cy="17" r="0.5" fill="currentColor" />
+            </svg>
+            <div class="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-72 p-3 bg-popover text-popover-foreground rounded-lg shadow-lg border text-xs opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none group-hover:pointer-events-auto z-50">
+                Discovery scanning is continuous and cyclical. Each category scans all IP ranges in a cycle,
+                then resets and starts the next epoch with a fresh shuffle. Progress shows completion of
+                the <strong>current cycle</strong>, not overall scanning — it will reset periodically.
+            </div>
+        </div>
+    </div>
     {#if scanProgress?.categories?.length}
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
             {#each scanProgress.categories as cat}
+                {@const avgEpoch = cat.total_ranges > 0 ? Math.round(cat.total_epochs / cat.total_ranges) : 0}
+                {@const cyclingSoon = cat.cycle_progress_pct >= 90}
                 <div class="space-y-2">
-                    <div class="flex items-center justify-between text-xs">
+                    <div class="flex items-center justify-between text-xs gap-2">
                         <span class="capitalize text-muted-foreground">{cat.category}</span>
-                        <span class="font-mono">{cat.cycle_progress_pct.toFixed(1)}%</span>
+                        <div class="flex items-center gap-1.5">
+                            {#if cyclingSoon}
+                                <span class="text-[9px] px-1.5 py-0 rounded-full bg-amber-500/10 text-amber-500 border border-amber-500/20 font-medium">
+                                    Epoch #{avgEpoch + 1} cycling soon
+                                </span>
+                            {:else}
+                                <span class="text-muted-foreground font-mono">Epoch #{avgEpoch}</span>
+                            {/if}
+                            <span class="font-mono tabular-nums">Cycle: {cat.cycle_progress_pct.toFixed(1)}%</span>
+                        </div>
                     </div>
                     <Progress value={cat.cycle_progress_pct} max={100} class="h-1.5" />
                     <div class="text-[10px] text-muted-foreground">
-                        {formatNum(cat.scanned_ranges)} / {formatNum(cat.total_ranges)} ranges
-                        <span class="ml-2">{formatNum(cat.total_epochs)} epochs</span>
+                        {formatNum(cat.scanned_ranges)} / {formatNum(cat.total_ranges)} ranges scanned this cycle
+                    </div>
+                    <div class="space-y-1.5 mt-2">
+                        <div class="flex items-center justify-between text-[10px]">
+                            <span class="text-muted-foreground">First loop completion</span>
+                            <span class="font-mono tabular-nums text-emerald-500">{cat.first_loop_pct.toFixed(1)}%</span>
+                        </div>
+                        <Progress value={cat.first_loop_pct} max={100} class="h-1" />
+                        <div class="text-[9px] text-muted-foreground">
+                            Ranges ever scanned at least once (this resets on ASN database changes)
+                        </div>
                     </div>
                 </div>
             {/each}

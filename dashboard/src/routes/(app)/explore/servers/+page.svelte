@@ -18,6 +18,8 @@
     import HardDrive from "@lucide/svelte/icons/hard-drive";
     import Monitor from "@lucide/svelte/icons/monitor";
     import Filter from "@lucide/svelte/icons/filter";
+    import ArrowUpAZ from "@lucide/svelte/icons/arrow-up-a-z";
+    import ArrowDownAZ from "@lucide/svelte/icons/arrow-down-a-z";
 
     interface Server {
         ip: string;
@@ -66,6 +68,11 @@
     
     let sortBy = $state(urlParams.get("sort_by") || "players");
     let sortOrder = $state(urlParams.get("sort_order") || "desc");
+
+    // Cursor-based pagination state from URL (for bookmarkable pages)
+    let cursorIp = $state(urlParams.get("cursor_ip") || "");
+    let cursorPlayers = $state(urlParams.get("cursor_players") || "");
+    let cursorLastSeen = $state(urlParams.get("cursor_last_seen") || "");
 
     let rawSearchText = $state("");
     let isParsing = false;
@@ -238,6 +245,15 @@
             params.set("sort_order", sortOrder);
 
             if (!append) {
+                // Include cursor params from URL state on initial load
+                if (cursorIp) params.set("cursor_ip", cursorIp);
+                if (cursorPlayers) params.set("cursor_players", cursorPlayers);
+                if (cursorLastSeen) params.set("cursor_last_seen", cursorLastSeen);
+                // Clear cursor state after using it (so filter changes reset to page 1)
+                cursorIp = "";
+                cursorPlayers = "";
+                cursorLastSeen = "";
+
                 goto(`?${params.toString()}`, {
                     replaceState: true,
                     noScroll: true,
@@ -248,7 +264,7 @@
                 params.set("cursor_ip", last.ip);
                 if (sortBy === "players") params.set("cursor_players", last.players_online.toString());
                 if (sortBy === "last_seen" && last.last_seen) params.set("cursor_last_seen", last.last_seen);
-                
+
                 // Also update URL with cursor when loading more
                 goto(`?${params.toString()}`, {
                     replaceState: true,
@@ -473,6 +489,23 @@
                                 <option value="last_seen">Sort: Last Seen</option>
                                 <option value="ip">Sort: IP Address</option>
                             </select>
+                        </div>
+                        <div class="flex-shrink-0">
+                            <Button
+                                variant="outline"
+                                onclick={() => {
+                                    sortOrder = sortOrder === "desc" ? "asc" : "desc";
+                                    buildSearchTextFromSidebar();
+                                }}
+                                class="h-11 w-11 rounded-md"
+                                title={sortOrder === "desc" ? "Sort ascending" : "Sort descending"}
+                            >
+                                {#if sortOrder === "desc"}
+                                    <ArrowDownAZ class="h-4 w-4" />
+                                {:else}
+                                    <ArrowUpAZ class="h-4 w-4" />
+                                {/if}
+                            </Button>
                         </div>
                     </div>
                 </Card.Header>

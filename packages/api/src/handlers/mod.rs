@@ -122,6 +122,7 @@ pub struct ServerQuery {
     pub country: Option<String>,
     pub brand: Option<String>,
     pub server_type: Option<String>,
+    pub login: Option<String>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
     pub cursor_players: Option<i32>,
@@ -503,7 +504,11 @@ async fn list_servers(
         flags_filter.extend(f.split(',').map(|s| s.to_string()));
     }
 
-    let login_obstacle = parsed.as_ref().and_then(|p| p.login.as_deref());
+    // Explicit login query param overrides DSL-parsed login
+    let login_obstacle = query
+        .login
+        .as_deref()
+        .or(parsed.as_ref().and_then(|p| p.login.as_deref()));
 
     let servers = state
         .server_repo

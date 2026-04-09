@@ -40,7 +40,7 @@ RUN cargo build --workspace --release
 FROM debian:trixie-slim AS api-runtime
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates wget && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/nmcscan-api /usr/local/bin/
