@@ -32,38 +32,15 @@ NMCScan is designed for ethical operation:
 | **Pure protocol** | Only standard SLP/RakNet ping and login handshake — no exploits |
 | **Hot-reloadable exclusions** | New exclusions via API without restart |
 
-## 🏗️ Architecture
-
-```
-                     ┌─────────────────┐
-                     │   exclude.conf   │
-                     └────────┬────────┘
-                              │
-    ┌─────────────┐    ┌──────▼───────┐    ┌──────────────────────┐
-    │ ASN Fetcher  │───▶│  Scheduler   │    │  Scanner             │
-    │ MaxMind +    │    │  Hot/Warm/   │───▶│  SLP (Java)          │
-    │ iptoasn.com  │    │  Cold/Disc.  │    │  RakNet (Bedrock)    │
-    │ ipverse      │    └──────┬───────┘    │  Login protocol      │
-    └─────────────┘           │             └──────────┬───────────┘
-                              │                        │
-    ┌─────────────┐    ┌──────▼───────┐                │
-    │ Login Queue  │    │   Axum API   │◀───────────────┘
-    │ 60/sec       │    │  Port 3000   │
-    └─────────────┘    └──────┬───────┘     ┌──────────────────┐
-                              │             │   PostgreSQL     │
-                       ┌──────▼───────┐     │   + pg_trgm      │
-                       │  Dashboard    │     │   + mat. views   │
-                       │  SvelteKit    │     └──────────────────┘
-                       └──────────────┘
-```
+**Note: Always ensure you have permission to scan IP ranges and respect local laws and regulations. Use the exclude list to block any sensitive ranges. This depends on hosting provider policies. We strongly advise to scan with caution, most providers will KILL your service when abuse reports come in.*
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-- **Rust** 1.75+ (2021 edition)
+- **Rust** Latest Rust recommend (1.x) (2021 edition)
 - **PostgreSQL** 16+ with `pg_trgm` extension
-- **Bun** (for the dashboard frontend, optional)
+- **Bun** (for the dashboard frontend, optional - **recommended**)
 
 ### Docker Compose (Recommended)
 
@@ -81,8 +58,9 @@ docker compose up -d --build
 
 This starts three containers:
 - **postgres** — PostgreSQL 16 with tuned settings
-- **nmcscan** — The Rust scanner binary (API on port 3000)
-- **dashboard** — SvelteKit frontend
+- **nmcscan-scanner** — The Rust scanner binary (depends on API to be ready)
+- **nmcscan-api** — The Rust API server: may be ran without scanner to just serve the DB
+- **dashboard** — SvelteKit frontend - exposes port 3000 with the dashboard, proxied to the API
 
 ### Manual Setup
 
@@ -182,35 +160,7 @@ FORCE_ASN_IMPORT=true ./target/release/nmcscan
 
 ## 📡 API Endpoints
 
-The REST API runs on port 3000 by default. Full documentation in [API.md](API.md).
-
-### Public (no auth)
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/health` | Health check with server count |
-| `GET /api/info` | Contact info (email, Discord) |
-
-### Protected (auth required)
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/stats` | Global stats (servers, players, ASN breakdown) |
-| `GET /api/servers` | List servers with DSL search, filters, cursor pagination |
-| `GET /api/server/{ip}` | Server details |
-| `GET /api/server/{ip}/history` | Historical player counts |
-| `GET /api/server/{ip}/players` | Players seen on a server |
-| `GET /api/players?name=X` | Search players across all servers |
-| `GET /api/asns` | Paginated ASN list |
-| `GET /api/exclude` | Paginated exclude list |
-| `POST /api/exclude` | Add exclusion |
-| `POST /api/scan/test` | Trigger test scan |
-| `GET /api/scan/progress` | Scan progress |
-| `GET /api/login-queue/status` | Login queue stats |
-| `POST /api/login-queue/trigger` | Trigger single login test |
-| `GET /api/keys` | List API keys |
-| `POST /api/keys` | Create API key |
-| `DELETE /api/keys/{id}` | Revoke API key |
+The REST API runs on port 3000 by default. See [API.md](API.md).
 
 ### Query DSL
 
@@ -235,24 +185,7 @@ Anything else: searches description/MOTD, incase-sensitive.
 
 ## 🗄️ Database
 
-NMCScan uses PostgreSQL with SeaORM with the following schema:
-
-| Table | Purpose |
-|-------|---------|
-| `servers` | Server records with INET IP, SMALLINT port, auto-computed flags |
-| `server_players` | Players seen on servers |
-| `server_history` | Historical player counts (capped at 500 per server) |
-| `asns` | ASN records with org, category, country, tags |
-| `asn_ranges` | CIDR ranges mapped to ASNs with scan progress tracking |
-| `daily_stats` | Daily scan counts per tier |
-| `api_keys` | User-generated API keys (SHA-256 hashed) |
-| `minecraft_accounts` | Stored Minecraft accounts |
-| `users` / `accounts` / `sessions` | Auth.js OAuth tables |
-
-### Materialized Views
-
-- **`asn_stats`** — ASN with server counts (refreshed every 5 minutes)
-- **`global_stats`** — Aggregate server/player counts
+NMCScan uses PostgreSQL with SeaORM with the following schema.
 
 ## 📊 Performance
 
@@ -280,40 +213,7 @@ See [deployment.md](deployment.md) for a full production deployment guide using 
 | Disk | 10 GB | 50+ GB (PostgreSQL WAL) |
 | Network | 100 Mbps | 1 Gbps |
 
-## 📁 Project Structure
-
-```
-NMCScan/
-├── src/
-│   ├── main.rs                    # Entry point, CLI, orchestration
-│   ├── network/
-│   │   ├── slp.rs                 # Java Server List Ping protocol
-│   │   ├── raknet.rs              # Bedrock RakNet unconnected ping
-│   │   ├── login.rs               # Offline-mode login protocol
-│   │   └── scanner.rs             # Rate-limited concurrent scanner
-│   ├── services/
-│   │   ├── scheduler.rs           # Hot/Warm/Cold/Discovery queues
-│   │   ├── login_queue.rs         # Background login testing
-│   │   └── asn_fetcher.rs         # ASN data management
-│   ├── handlers/
-│   │   ├── mod.rs                 # Axum router + API endpoints
-│   │   ├── api_keys.rs            # API key CRUD
-│   │   └── minecraft_accounts.rs  # Minecraft account CRUD
-│   ├── models/
-│   │   ├── asn.rs                 # ASN categories and manager
-│   │   └── entities/              # SeaORM entity definitions
-│   ├── repositories/              # Data access layer
-│   └── utils/
-│       ├── exclude.rs             # Exclude list manager
-│       └── query_parser.rs        # DSL query parser
-├── migration/                     # SeaORM migrations (8 total)
-├── dashboard/                     # SvelteKit frontend
-├── compose.yaml                   # Docker Compose
-├── Dockerfile                     # Multi-stage Rust build
-├── exclude.conf                   # IP exclusion list
-├── Cargo.toml
-└── README.md
-```
+*NOTE: I personally run NMCScan on a 1 vCore Ryzen VPS with 4 GB of RAM and a 1Gbps network connection, and it performs well at the default 100 RPS and 2,500 concurrency. Adjust the `TARGET_RPS` and `TARGET_CONCURRENCY` settings based on your server's capabilities and network conditions.*
 
 ## 📝 License
 

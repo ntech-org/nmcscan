@@ -15,7 +15,7 @@ cp .env.example .env
 # Run tests
 cargo test
 
-# Run the scanner in test mode (scans known servers only)
+# Run the scanner in test mode (scans known servers only, safe for development)
 cargo run -- --test-mode
 ```
 
