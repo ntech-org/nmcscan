@@ -71,8 +71,12 @@ pub async fn run_scanner_loop(
     loop {
         tokio::select! {
             _ = status_interval.tick() => {
-                let (h, w, c, d) = scheduler.get_queue_sizes().await;
-                tracing::info!("Queue sizes: Hot={}, Warm={}, Cold={}, Discovery={}", h, w, c, d);
+                let ((hot_ready, hot_total), (warm_ready, warm_total), (cold_ready, cold_total), discovery) = 
+                    scheduler.get_queue_readiness().await;
+                tracing::info!(
+                    "Queue sizes: Hot={}/{} ready/total, Warm={}/{} ready/total, Cold={}/{} ready/total, Discovery={}",
+                    hot_ready, hot_total, warm_ready, warm_total, cold_ready, cold_total, discovery
+                );
                 tracing::info!("Status: Active Tasks={}, Scans today: Hot={}, Warm={}, Cold={}",
                     active_tasks.load(Ordering::Relaxed),
                     hot_count.load(Ordering::Relaxed),

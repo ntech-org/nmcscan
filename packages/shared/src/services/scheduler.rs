@@ -687,6 +687,18 @@ impl Scheduler {
         )
     }
 
+    /// Get ready vs total counts for each queue (for status logging).
+    pub async fn get_queue_readiness(&self) -> ((usize, usize), (usize, usize), (usize, usize), usize) {
+        let hot_ready = self.count_ready_in_queue(&self.hot_queue).await;
+        let hot_total = self.hot_queue.lock().await.len();
+        let warm_ready = self.count_ready_in_queue(&self.warm_queue).await;
+        let warm_total = self.warm_queue.lock().await.len();
+        let cold_ready = self.count_ready_in_queue(&self.cold_queue).await;
+        let cold_total = self.cold_queue.lock().await.len();
+        let discovery = self.discovery_queue.lock().await.len();
+        ((hot_ready, hot_total), (warm_ready, warm_total), (cold_ready, cold_total), discovery)
+    }
+
     /// Get queue sizes as a serializable struct for the API.
     pub async fn get_queue_stats(&self) -> QueueStats {
         let (hot, warm, cold, discovery) = self.get_queue_sizes().await;
@@ -704,8 +716,17 @@ impl Scheduler {
         dedup.len()
     }
 
+    /// Count how many items in a queue are ready to scan (next_scan_at <= now or None).
+    async fn count_ready_in_queue(&self, queue: &Arc<Mutex<VecDeque<ServerTarget>>>) -> usize {
+        let q = queue.lock().await;
+        let now = Utc::now();
+        q.iter()
+            .filter(|s| s.next_scan_at.map_or(true, |t| t <= now))
+            .count()
+    }
+
     /// Periodically refill queues from DB with servers whose scan interval has elapsed.
-    /// Only runs when queue is below 25% of threshold to prevent aggressive re-scanning.
+    /// Only runs when there aren't enough READY servers in the queue to prevent aggressive re-scanning.
     pub async fn try_refill_queues(&self) {
         let configs = vec![
             (1, 2, 10_000, 5_000u64), // priority, interval_hours, threshold, limit
@@ -720,10 +741,11 @@ impl Scheduler {
                 _ => &self.cold_queue,
             };
 
-            let current_len = queue.lock().await.len();
-            // Only refill when queue is below 25% of threshold
+            // Count only READY servers (next_scan_at <= now), not total queue length
+            let ready_count = self.count_ready_in_queue(queue).await;
+            // Only refill when ready servers are below 25% of threshold
             let refill_threshold = threshold / 4;
-            if current_len >= refill_threshold {
+            if ready_count >= refill_threshold {
                 continue;
             }
 
@@ -740,10 +762,12 @@ impl Scheduler {
                 continue;
             }
 
+            let total_len = queue.lock().await.len();
             tracing::info!(
-                "Queue refill: priority={} queue has {} items (threshold: {}), adding {} servers from DB",
+                "Queue refill: priority={} queue has {}/{} ready/total items (threshold: {}), adding {} servers from DB",
                 priority,
-                current_len,
+                ready_count,
+                total_len,
                 refill_threshold,
                 ready_servers.len()
             );

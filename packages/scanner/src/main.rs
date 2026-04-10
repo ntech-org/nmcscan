@@ -213,13 +213,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Non-test mode: queues start empty and fill naturally via background tasks
     // (try_refill_queues, fill_warm_queue_if_needed, fill_cold_queue_if_needed)
 
-    let (h, w, c, d) = scheduler.get_queue_sizes().await;
+    let ((h_ready, h_total), (w_ready, w_total), (c_ready, c_total), d) = scheduler.get_queue_readiness().await;
     tracing::info!(
-        "Scheduler queues: Hot={}, Warm={}, Cold={}, Discovery={}",
-        h,
-        w,
-        c,
-        d
+        "Scheduler queues: Hot={}/{} ready/total, Warm={}/{} ready/total, Cold={}/{} ready/total, Discovery={}",
+        h_ready, h_total, w_ready, w_total, c_ready, c_total, d
     );
 
     let scheduler = Arc::new(scheduler);
