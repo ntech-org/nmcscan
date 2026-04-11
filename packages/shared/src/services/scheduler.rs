@@ -8,7 +8,7 @@ use crate::repositories::{AsnRepository, ServerRepository};
 use chrono::{DateTime, Utc};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -151,6 +151,11 @@ pub struct Scheduler {
     /// Discovery deduplication: tracks recently-added IP:port combinations.
     /// Prevents the same target from being queued multiple times within the TTL window.
     discovery_dedup: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Main queue deduplication: tracks IP:port combinations currently in hot/warm/cold queues.
+    /// Prevents the same server from being added multiple times (e.g., from DB refill).
+    hot_dedup: Arc<Mutex<HashSet<String>>>,
+    warm_dedup: Arc<Mutex<HashSet<String>>>,
+    cold_dedup: Arc<Mutex<HashSet<String>>>,
     pub server_repo: Arc<ServerRepository>,
     pub asn_repo: Arc<AsnRepository>,
     pub test_mode: bool,
@@ -173,6 +178,9 @@ impl Scheduler {
             cold_queue: Arc::new(Mutex::new(VecDeque::new())),
             discovery_queue: Arc::new(Mutex::new(VecDeque::new())),
             discovery_dedup: Arc::new(Mutex::new(HashMap::new())),
+            hot_dedup: Arc::new(Mutex::new(HashSet::new())),
+            warm_dedup: Arc::new(Mutex::new(HashSet::new())),
+            cold_dedup: Arc::new(Mutex::new(HashSet::new())),
             server_repo,
             asn_repo,
             test_mode,
@@ -215,13 +223,28 @@ impl Scheduler {
             return;
         }
 
-        let queue = match server.priority {
-            1 => &self.hot_queue,
-            2 => &self.warm_queue,
-            _ => &self.cold_queue,
+        let (queue, dedup_set) = match server.priority {
+            1 => (&self.hot_queue, &self.hot_dedup),
+            2 => (&self.warm_queue, &self.warm_dedup),
+            _ => (&self.cold_queue, &self.cold_dedup),
         };
+
+        let key = format!("{}:{}", server.ip, server.port);
+
+        // Check dedup: skip if this server is already in the queue
+        {
+            let mut dedup = dedup_set.lock().await;
+            if dedup.contains(&key) {
+                tracing::debug!("Skipping duplicate server in queue: {} (priority={})", key, server.priority);
+                return;
+            }
+            dedup.insert(key.clone());
+        }
+
         let mut q = queue.lock().await;
         if q.len() >= MAX_QUEUE_SIZE {
+            // Remove from dedup since we're not adding
+            dedup_set.lock().await.remove(&key);
             return;
         }
         if at_front {
@@ -253,44 +276,58 @@ impl Scheduler {
         let warm_info = self.find_earliest_ready(&self.warm_queue, &now).await;
         let cold_info = self.find_earliest_ready(&self.cold_queue, &now).await;
 
-        // Collect ready tiers with their earliest scan time
-        let mut ready: Vec<(&Arc<Mutex<VecDeque<ServerTarget>>>, usize, DateTime<Utc>)> =
+        // Collect ready tiers with their earliest scan time and corresponding dedup set
+        let mut ready: Vec<(&Arc<Mutex<VecDeque<ServerTarget>>>, &Arc<Mutex<HashSet<String>>>, usize, DateTime<Utc>)> =
             Vec::new();
         if let Some((idx, t)) = hot_info {
-            ready.push((&self.hot_queue, idx, t));
+            ready.push((&self.hot_queue, &self.hot_dedup, idx, t));
         }
         if let Some((idx, t)) = warm_info {
-            ready.push((&self.warm_queue, idx, t));
+            ready.push((&self.warm_queue, &self.warm_dedup, idx, t));
         }
         if let Some((idx, t)) = cold_info {
-            ready.push((&self.cold_queue, idx, t));
+            ready.push((&self.cold_queue, &self.cold_dedup, idx, t));
         }
 
         if !ready.is_empty() {
             // Pick the tier with the earliest-ready item (most overdue)
-            ready.sort_by_key(|(_, _, t)| *t);
-            let (queue, idx, _) = &ready[0];
-            return Some(queue.lock().await.remove(*idx).unwrap());
+            ready.sort_by_key(|(_, _, _, t)| *t);
+            let (queue, dedup_set, idx, _) = &ready[0];
+            let mut q = queue.lock().await;
+            let server = q.remove(*idx).unwrap();
+            // Clean up dedup
+            let key = format!("{}:{}", server.ip, server.port);
+            dedup_set.lock().await.remove(&key);
+            return Some(server);
         }
 
         // 3. Nothing found in first 5000 — deep scan ALL queues for ANY ready item.
-        let queues = [&self.hot_queue, &self.warm_queue, &self.cold_queue];
-        let mut best: Option<(&Arc<Mutex<VecDeque<ServerTarget>>>, usize, DateTime<Utc>)> = None;
+        let queue_dedup_pairs: [(&Arc<Mutex<VecDeque<ServerTarget>>>, &Arc<Mutex<HashSet<String>>>); 3] = [
+            (&self.hot_queue, &self.hot_dedup),
+            (&self.warm_queue, &self.warm_dedup),
+            (&self.cold_queue, &self.cold_dedup),
+        ];
+        let mut best: Option<(&Arc<Mutex<VecDeque<ServerTarget>>>, &Arc<Mutex<HashSet<String>>>, usize, DateTime<Utc>)> = None;
 
-        for queue in &queues {
+        for (queue, _dedup_set) in &queue_dedup_pairs {
             let q = queue.lock().await;
             for i in 0..q.len() {
                 if q[i].next_scan_at.map_or(true, |t| t <= now) {
                     let t = q[i].next_scan_at.unwrap_or(now);
-                    if best.as_ref().map_or(true, |(_, _, bt)| t < *bt) {
-                        best = Some((queue, i, t));
+                    if best.as_ref().map_or(true, |(_, _, _, bt)| t < *bt) {
+                        best = Some((queue, _dedup_set, i, t));
                     }
                 }
             }
         }
 
-        if let Some((queue, idx, _)) = best {
-            return Some(queue.lock().await.remove(idx).unwrap());
+        if let Some((queue, dedup_set, idx, _)) = best {
+            let mut q = queue.lock().await;
+            let server = q.remove(idx).unwrap();
+            // Clean up dedup
+            let key = format!("{}:{}", server.ip, server.port);
+            dedup_set.lock().await.remove(&key);
+            return Some(server);
         }
 
         // Truly nothing ready — return None so the scanner loop can sleep.
@@ -716,6 +753,24 @@ impl Scheduler {
         dedup.len()
     }
 
+    /// Get the queue length for a given priority.
+    async fn get_queue_len(&self, priority: i32) -> usize {
+        match priority {
+            1 => self.hot_queue.lock().await.len(),
+            2 => self.warm_queue.lock().await.len(),
+            _ => self.cold_queue.lock().await.len(),
+        }
+    }
+
+    /// Get the dedup set size for a given priority.
+    async fn get_dedup_size(&self, priority: i32) -> usize {
+        match priority {
+            1 => self.hot_dedup.lock().await.len(),
+            2 => self.warm_dedup.lock().await.len(),
+            _ => self.cold_dedup.lock().await.len(),
+        }
+    }
+
     /// Count how many items in a queue are ready to scan (next_scan_at <= now or None).
     async fn count_ready_in_queue(&self, queue: &Arc<Mutex<VecDeque<ServerTarget>>>) -> usize {
         let q = queue.lock().await;
@@ -762,16 +817,17 @@ impl Scheduler {
                 continue;
             }
 
-            let total_len = queue.lock().await.len();
+            let total_len = self.get_queue_len(priority).await;
+            let dedup_count = self.get_dedup_size(priority).await;
             tracing::info!(
-                "Queue refill: priority={} queue has {}/{} ready/total items (threshold: {}), adding {} servers from DB",
+                "Queue refill: priority={} queue has {}/{} ready/total items (threshold: {}, dedup: {}), adding {} servers from DB",
                 priority,
                 ready_count,
                 total_len,
                 refill_threshold,
+                dedup_count,
                 ready_servers.len()
             );
-            let mut q = queue.lock().await;
             for server in ready_servers {
                 let mut target = ServerTarget::new(
                     server.ip.to_string(),
@@ -781,7 +837,8 @@ impl Scheduler {
                 target.priority = priority;
                 target.last_scanned = server.last_seen.map(|t| t.and_utc());
                 target.next_scan_at = None; // Ready to scan now
-                q.push_back(target);
+                // Use add_server to handle deduplication
+                self.add_server(target, false).await;
             }
         }
     }
@@ -1049,14 +1106,14 @@ mod tests {
         map.insert("10.0.0.1:25565".to_string(), now);
 
         // Check entry exists
-        assert!(map.contains_key("10.0.0.1:25565"));
+        assert!(map.contains("10.0.0.1:25565"));
 
         // Simulate time passing (less than TTL)
         // In real code, we'd check: now.duration_since(instant).as_secs() < ttl_secs
         // Here we just verify the logic structure
 
         // Entry should still exist
-        assert!(map.contains_key("10.0.0.1:25565"));
+        assert!(map.contains("10.0.0.1:25565"));
 
         // After TTL expires, entry should be removed by retain()
         // map.retain(|_, instant| now.duration_since(*instant).as_secs() < ttl_secs);
