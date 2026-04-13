@@ -461,7 +461,7 @@ async fn get_stats(State(state): State<AppState>) -> Json<StatsResponse> {
 async fn list_servers(
     State(state): State<AppState>,
     Query(query): Query<ServerQuery>,
-) -> Json<Vec<ServerResponse>> {
+) -> Result<Json<Vec<ServerResponse>>, StatusCode> {
     // Parse DSL tokens from the search parameter if present
     let parsed = query
         .search
@@ -551,7 +551,10 @@ async fn list_servers(
             login_obstacle,
         )
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            tracing::error!("Failed to list servers: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let asns_list = state.asn_repo.get_all_asns().await.unwrap_or_default();
 
@@ -580,7 +583,7 @@ async fn list_servers(
         })
         .collect();
 
-    Json(responses)
+    Ok(Json(responses))
 }
 
 /// GET /api/server/{ip} - Get server details.
