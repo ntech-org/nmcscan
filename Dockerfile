@@ -1,42 +1,43 @@
-# Shared workspace builder stage - builds all dependencies once
-FROM rust:1-slim-trixie AS builder
-
+# === DEPENDENCY PLANNING ===
+# Use pre-built cargo-chef image so we don't install it every build
+FROM lukemathwalker/cargo-chef:latest-rust-slim-trixie AS chef
 WORKDIR /app
 
-# Install build dependencies
+# Analyze the workspace and produce a recipe file describing all dependencies
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# === DEPENDENCY BUILDING ===
+# Build ONLY third-party dependencies from the recipe. This layer is cached
+# until any Cargo.toml changes — source code changes don't affect it.
+FROM chef AS cacher
 RUN apt-get update && \
     apt-get install -y --no-install-recommends pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy workspace Cargo.toml
-COPY Cargo.toml ./
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --workspace --release --recipe-path recipe.json
 
-# Copy all member Cargo.toml files for workspace resolution
-COPY packages/shared/Cargo.toml packages/shared/
-COPY packages/api/Cargo.toml packages/api/
-COPY packages/scanner/Cargo.toml packages/scanner/
-COPY migration/Cargo.toml migration/
+# === APPLICATION BUILD ===
+# Copy compiled deps from cacher, then copy source and build. Only your
+# actual .rs files get recompiled when they change.
+FROM chef AS builder
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
 
-# Create stub files for dependency resolution
-RUN mkdir -p packages/shared/src packages/api/src packages/scanner/src migration/src && \
-    echo "pub fn main() {}" > packages/shared/src/lib.rs && \
-    echo "fn main() {}" > packages/api/src/main.rs && \
-    echo "fn main() {}" > packages/scanner/src/main.rs && \
-    echo "pub fn main() {}" > migration/src/lib.rs
+# Bring in pre-compiled dependency artifacts
+COPY --from=cacher /app/target target
+COPY --from=cacher /usr/local/cargo /usr/local/cargo
 
-# Fetch dependencies (cached unless Cargo.toml files change)
-RUN cargo fetch
+# Copy everything (source code + Cargo.toml files)
+COPY . .
 
-# Copy actual source code
-COPY packages/shared/src packages/shared/src
-COPY packages/api/src packages/api/src
-COPY packages/scanner/src packages/scanner/src
-COPY migration/src migration/src
-
-# Build entire workspace - all shared dependencies compiled once
+# Build workspace — deps already compiled, only app code compiles
 RUN cargo build --workspace --release
 
-# API service runtime
+# === API RUNTIME ===
 FROM debian:trixie-slim AS api-runtime
 
 RUN apt-get update && \
@@ -58,7 +59,7 @@ ENV LISTEN_ADDR=0.0.0.0:3000
 
 CMD ["nmcscan-api"]
 
-# Scanner service runtime
+# === SCANNER RUNTIME ===
 FROM debian:trixie-slim AS scanner-runtime
 
 RUN apt-get update && \

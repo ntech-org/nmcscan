@@ -13,10 +13,10 @@
 //!    - 0x02 Login Success → offline mode enabled (cracked)
 //!    - 0x03 Set Compression → read threshold, then expect Login Success
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::LazyLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
@@ -110,7 +110,7 @@ const VERSION_PROTOCOL_MAP: &[(i32, &[&str])] = &[
 ];
 
 /// Regex patterns for extracting version from disconnect messages.
-static OUTDATED_PATTERN: Lazy<Regex> = Lazy::new(|| {
+static OUTDATED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:outdated\s*server!?\s*(?:I'?m|I am)\s*still\s*on\s*|Incompatible\s*client!?\s*Please\s*use\s*|Please\s*use\s*Minecraft\s*)([0-9]+(?:\.[0-9]+)+(?:\.[0-9]+)*)").unwrap()
 });
 
