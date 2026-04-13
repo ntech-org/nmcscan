@@ -65,6 +65,7 @@ pub struct ServerResponse {
     pub login_obstacle: Option<String>,
     pub last_login_at: Option<chrono::NaiveDateTime>,
     pub flags: Vec<String>,
+    pub created_at: Option<chrono::NaiveDateTime>,
 }
 
 use nmcscan_shared::models::entities::servers;
@@ -128,6 +129,7 @@ pub struct ServerQuery {
     pub cursor_players: Option<i32>,
     pub cursor_ip: Option<String>,
     pub cursor_last_seen: Option<chrono::NaiveDateTime>,
+    pub cursor_created_at: Option<chrono::NaiveDateTime>,
     pub asn: Option<String>,
     pub min_max_players: Option<i32>,
     pub max_max_players: Option<i32>,
@@ -529,6 +531,7 @@ async fn list_servers(
             query.cursor_players,
             query.cursor_ip.as_deref(),
             query.cursor_last_seen,
+            query.cursor_created_at,
             asn,
             min_max_players,
             max_max_players,
@@ -648,6 +651,7 @@ fn enrich_server_response(
         login_obstacle: server.login_obstacle,
         last_login_at: server.last_login_at,
         flags,
+        created_at: server.created_at,
     }
 }
 

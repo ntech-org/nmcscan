@@ -114,6 +114,41 @@ impl ServerRepository {
         query.all(&self.db).await
     }
 
+    /// Paginate through recently-scanned online servers for login testing.
+    /// Only includes servers with last_seen within the last `max_age_hours`.
+    /// This prevents the login queue from wasting resources on servers that
+    /// haven't been verified by SLP in a long time (likely offline).
+    pub async fn get_online_servers_cursor_recent(
+        &self,
+        limit: u64,
+        cursor_ip: Option<IpNetwork>,
+        cursor_port: Option<i16>,
+        max_age_hours: i64,
+    ) -> Result<Vec<servers::Model>, DbErr> {
+        let cutoff = Utc::now() - chrono::Duration::hours(max_age_hours);
+        let mut query = servers::Entity::find()
+            .filter(servers::Column::Status.eq("online"))
+            .filter(servers::Column::LastSeen.gt(cutoff))
+            .order_by_asc(servers::Column::Ip)
+            .order_by_asc(servers::Column::Port)
+            .limit(limit);
+
+        if let Some(ip) = cursor_ip {
+            let port = cursor_port.unwrap_or(0);
+            query = query.filter(
+                Condition::all().add(
+                    Condition::any().add(servers::Column::Ip.gt(ip)).add(
+                        Condition::all()
+                            .add(servers::Column::Ip.eq(ip))
+                            .add(servers::Column::Port.gt(port)),
+                    ),
+                ),
+            );
+        }
+
+        query.all(&self.db).await
+    }
+
     pub async fn mark_online(
         &self,
         ip: &str,
@@ -428,6 +463,7 @@ impl ServerRepository {
         cursor_players: Option<i32>,
         cursor_ip: Option<&str>,
         cursor_last_seen: Option<NaiveDateTime>,
+        cursor_created_at: Option<NaiveDateTime>,
         asn_filter: Option<&str>,
         min_max_players: Option<i32>,
         max_max_players: Option<i32>,
@@ -539,6 +575,7 @@ impl ServerRepository {
             Some("players") => servers::Column::PlayersOnline,
             Some("last_seen") => servers::Column::LastSeen,
             Some("ip") => servers::Column::Ip,
+            Some("created_at") => servers::Column::CreatedAt,
             _ => servers::Column::PlayersOnline,
         };
 
@@ -590,6 +627,31 @@ impl ServerRepository {
                                     .add(
                                         Condition::all()
                                             .add(servers::Column::LastSeen.eq(c_val))
+                                            .add(servers::Column::Ip.gt(c_ip)),
+                                    ),
+                            );
+                        }
+                    }
+                }
+                Some("created_at") => {
+                    if let Some(c_val) = cursor_created_at {
+                        if order == Order::Desc {
+                            query = query.filter(
+                                Condition::any()
+                                    .add(servers::Column::CreatedAt.lt(c_val))
+                                    .add(
+                                        Condition::all()
+                                            .add(servers::Column::CreatedAt.eq(c_val))
+                                            .add(servers::Column::Ip.gt(c_ip)),
+                                    ),
+                            );
+                        } else {
+                            query = query.filter(
+                                Condition::any()
+                                    .add(servers::Column::CreatedAt.gt(c_val))
+                                    .add(
+                                        Condition::all()
+                                            .add(servers::Column::CreatedAt.eq(c_val))
                                             .add(servers::Column::Ip.gt(c_ip)),
                                     ),
                             );
@@ -654,7 +716,14 @@ impl ServerRepository {
         interval_hours: i64,
         limit: u64,
     ) -> Result<Vec<servers::Model>, DbErr> {
-        let stale_time = Utc::now() - chrono::Duration::hours(interval_hours);
+        // Add a 30-second safety buffer to prevent the refill from racing with
+        // requeue_server. Without this buffer, a server that was just scanned and
+        // is in-flight (scan in progress, last_seen not yet updated by batch flush)
+        // could be re-added by the refill with next_scan_at = now, causing an
+        // immediate rescan before requeue_server can set next_scan_at = now + interval.
+        let stale_time = Utc::now()
+            - chrono::Duration::hours(interval_hours)
+            - chrono::Duration::seconds(30);
         servers::Entity::find()
             .filter(servers::Column::Priority.eq(priority))
             .filter(servers::Column::Status.ne("ignored"))
@@ -689,6 +758,17 @@ impl ServerRepository {
             .filter(servers::Column::Priority.eq(3))
             .order_by_asc(servers::Column::LastSeen)
             .limit(limit)
+            .all(&self.db)
+            .await
+    }
+
+    /// Get all servers (any status except 'ignored') for the discovery skip-list.
+    /// Returns IP:port combinations that are already known to the system.
+    pub async fn get_all_known_servers(&self) -> Result<Vec<servers::Model>, DbErr> {
+        servers::Entity::find()
+            .filter(servers::Column::Status.ne("ignored"))
+            .order_by_asc(servers::Column::Ip)
+            .order_by_asc(servers::Column::Port)
             .all(&self.db)
             .await
     }
@@ -810,6 +890,27 @@ impl ServerRepository {
         servers::Entity::update(server)
             .filter(servers::Column::Ip.eq(parse_ip(ip)))
             .filter(servers::Column::Port.eq(port))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Update last_seen for a server, used by the login queue to re-prioritize
+    /// servers that respond to login attempts (proving they're still online).
+    /// This helps move servers from the cold queue back to the hot queue.
+    pub async fn update_last_seen(
+        &self,
+        ip: &str,
+        port: i16,
+    ) -> Result<(), DbErr> {
+        servers::Entity::update_many()
+            .filter(servers::Column::Ip.eq(parse_ip(ip)))
+            .filter(servers::Column::Port.eq(port))
+            .set(servers::ActiveModel {
+                last_seen: Set(Some(Utc::now().naive_utc())),
+                status: Set("online".to_string()),
+                ..Default::default()
+            })
             .exec(&self.db)
             .await?;
         Ok(())

@@ -137,9 +137,14 @@ fn mix_bits(x: u64) -> u64 {
 /// Maximum items per queue to prevent unbounded memory growth.
 const MAX_QUEUE_SIZE: usize = 100_000;
 
-/// TTL for discovery deduplication: 1 hour.
-/// Prevents the same IP:port from being added to the discovery queue within this window.
-const DISCOVERY_DEDUP_TTL_SECS: u64 = 3600;
+/// TTL for discovery deduplication: 3 hours.
+/// Must be longer than the hot queue interval (2h) to prevent re-discovering
+/// servers that are already scheduled for a hot queue rescan.
+const DISCOVERY_DEDUP_TTL_SECS: u64 = 10800;
+
+/// How many main queue picks before forcing one discovery pick.
+/// 9 means: 9 main scans → 1 discovery scan → reset (10% discovery bandwidth).
+const DISCOVERY_RATIO_EVERY: u64 = 9;
 
 pub struct Scheduler {
     hot_queue: Arc<Mutex<VecDeque<ServerTarget>>>,
@@ -151,11 +156,17 @@ pub struct Scheduler {
     /// Discovery deduplication: tracks recently-added IP:port combinations.
     /// Prevents the same target from being queued multiple times within the TTL window.
     discovery_dedup: Arc<Mutex<HashMap<String, Instant>>>,
-    /// Main queue deduplication: tracks IP:port combinations currently in hot/warm/cold queues.
-    /// Prevents the same server from being added multiple times (e.g., from DB refill).
-    hot_dedup: Arc<Mutex<HashSet<String>>>,
-    warm_dedup: Arc<Mutex<HashSet<String>>>,
-    cold_dedup: Arc<Mutex<HashSet<String>>>,
+    /// Global deduplication across ALL main queues (hot/warm/cold).
+    /// Prevents the same server from existing in multiple queues simultaneously
+    /// (e.g., in warm from refill AND in hot from requeue after discovery).
+    queue_dedup: Arc<Mutex<HashSet<String>>>,
+    /// Counter for enforcing discovery scan ratio.
+    /// Every `DISCOVERY_RATIO_EVERY` main queue picks, one discovery target is forced.
+    discovery_counter: Arc<Mutex<u64>>,
+    /// Known server IP:port combinations from the database.
+    /// Used by discovery to skip IPs that are already known servers,
+    /// preventing re-discovery of servers that are managed by the main queues.
+    known_servers: Arc<Mutex<HashSet<String>>>,
     pub server_repo: Arc<ServerRepository>,
     pub asn_repo: Arc<AsnRepository>,
     pub test_mode: bool,
@@ -178,15 +189,37 @@ impl Scheduler {
             cold_queue: Arc::new(Mutex::new(VecDeque::new())),
             discovery_queue: Arc::new(Mutex::new(VecDeque::new())),
             discovery_dedup: Arc::new(Mutex::new(HashMap::new())),
-            hot_dedup: Arc::new(Mutex::new(HashSet::new())),
-            warm_dedup: Arc::new(Mutex::new(HashSet::new())),
-            cold_dedup: Arc::new(Mutex::new(HashSet::new())),
+            queue_dedup: Arc::new(Mutex::new(HashSet::new())),
+            discovery_counter: Arc::new(Mutex::new(0)),
+            known_servers: Arc::new(Mutex::new(HashSet::new())),
             server_repo,
             asn_repo,
             test_mode,
             test_interval,
             target_rps,
         }
+    }
+
+    /// Load all known server IP:port combinations from the database at startup.
+    /// This populates the known_servers set so discovery can skip IPs that are
+    /// already known servers (managed by the main hot/warm/cold queues).
+    pub async fn load_known_servers(&self) -> Result<usize, sea_orm::DbErr> {
+        let servers = self.server_repo.get_all_known_servers().await?;
+        let mut known = self.known_servers.lock().await;
+        known.clear();
+        for server in &servers {
+            known.insert(format!("{}:{}", server.ip, server.port));
+        }
+        let count = known.len();
+        tracing::info!("Loaded {} known server IPs into discovery skip-list", count);
+        Ok(count)
+    }
+
+    /// Register a newly discovered server so future discovery cycles skip it.
+    /// Called by requeue_server when a discovery target is found online.
+    pub async fn register_known_server(&self, ip: &str, port: u16) {
+        let key = format!("{}:{}", ip, port);
+        self.known_servers.lock().await.insert(key);
     }
 
     pub async fn add_server(&self, server: ServerTarget, at_front: bool) {
@@ -223,17 +256,17 @@ impl Scheduler {
             return;
         }
 
-        let (queue, dedup_set) = match server.priority {
-            1 => (&self.hot_queue, &self.hot_dedup),
-            2 => (&self.warm_queue, &self.warm_dedup),
-            _ => (&self.cold_queue, &self.cold_dedup),
+        let queue = match server.priority {
+            1 => &self.hot_queue,
+            2 => &self.warm_queue,
+            _ => &self.cold_queue,
         };
 
         let key = format!("{}:{}", server.ip, server.port);
 
-        // Check dedup: skip if this server is already in the queue
+        // Check dedup: skip if this server is already in ANY main queue
         {
-            let mut dedup = dedup_set.lock().await;
+            let mut dedup = self.queue_dedup.lock().await;
             if dedup.contains(&key) {
                 tracing::debug!("Skipping duplicate server in queue: {} (priority={})", key, server.priority);
                 return;
@@ -244,7 +277,7 @@ impl Scheduler {
         let mut q = queue.lock().await;
         if q.len() >= MAX_QUEUE_SIZE {
             // Remove from dedup since we're not adding
-            dedup_set.lock().await.remove(&key);
+            self.queue_dedup.lock().await.remove(&key);
             return;
         }
         if at_front {
@@ -256,78 +289,92 @@ impl Scheduler {
 
     /// Get the next server to scan. Picks from the queue whose earliest-ready item
     /// is due first. Never returns a server whose next_scan_at is in the future.
-    /// This prevents the resource leak where servers get over-scanned.
     ///
-    /// Discovery targets (always ready) are checked first to prevent stalls
-    /// when main queues are full of items with future next_scan_at.
+    /// Main queues (hot/warm/cold) are checked FIRST to prevent starvation.
+    /// Discovery gets a guaranteed minimum share: every `DISCOVERY_RATIO_EVERY`
+    /// main queue picks forces one discovery scan, ensuring discovery never starves
+    /// even when the hot queue has hundreds of thousands of always-ready servers.
     pub async fn next_server(&self) -> Option<ServerTarget> {
-        // 1. Check discovery queue first — always ready, O(1) pop
+        let now = Utc::now();
+
+        // 1. Check if it's time to force a discovery scan (ratio enforcement).
         {
-            let mut dq = self.discovery_queue.lock().await;
-            if let Some(target) = dq.pop_front() {
-                return Some(target);
+            let mut counter = self.discovery_counter.lock().await;
+            if *counter >= DISCOVERY_RATIO_EVERY {
+                *counter = 0;
+                let mut dq = self.discovery_queue.lock().await;
+                if let Some(target) = dq.pop_front() {
+                    return Some(target);
+                }
+                // Discovery queue empty — fall through to main queues
             }
         }
 
-        let now = Utc::now();
-
-        // 2. For each tier, find the index of the earliest-ready item (up to 5000 deep).
+        // 2. Check main queues for ready items (hot/warm/cold by earliest-ready).
         let hot_info = self.find_earliest_ready(&self.hot_queue, &now).await;
         let warm_info = self.find_earliest_ready(&self.warm_queue, &now).await;
         let cold_info = self.find_earliest_ready(&self.cold_queue, &now).await;
 
-        // Collect ready tiers with their earliest scan time and corresponding dedup set
-        let mut ready: Vec<(&Arc<Mutex<VecDeque<ServerTarget>>>, &Arc<Mutex<HashSet<String>>>, usize, DateTime<Utc>)> =
+        // Collect ready tiers with their earliest scan time
+        let mut ready: Vec<(&Arc<Mutex<VecDeque<ServerTarget>>>, usize, DateTime<Utc>)> =
             Vec::new();
         if let Some((idx, t)) = hot_info {
-            ready.push((&self.hot_queue, &self.hot_dedup, idx, t));
+            ready.push((&self.hot_queue, idx, t));
         }
         if let Some((idx, t)) = warm_info {
-            ready.push((&self.warm_queue, &self.warm_dedup, idx, t));
+            ready.push((&self.warm_queue, idx, t));
         }
         if let Some((idx, t)) = cold_info {
-            ready.push((&self.cold_queue, &self.cold_dedup, idx, t));
+            ready.push((&self.cold_queue, idx, t));
         }
 
         if !ready.is_empty() {
             // Pick the tier with the earliest-ready item (most overdue)
-            ready.sort_by_key(|(_, _, _, t)| *t);
-            let (queue, dedup_set, idx, _) = &ready[0];
+            ready.sort_by_key(|(_, _, t)| *t);
+            let (queue, idx, _) = &ready[0];
             let mut q = queue.lock().await;
             let server = q.remove(*idx).unwrap();
-            // Clean up dedup
+            // Clean up global dedup and increment discovery counter
             let key = format!("{}:{}", server.ip, server.port);
-            dedup_set.lock().await.remove(&key);
+            self.queue_dedup.lock().await.remove(&key);
+            *self.discovery_counter.lock().await += 1;
             return Some(server);
         }
 
-        // 3. Nothing found in first 5000 — deep scan ALL queues for ANY ready item.
-        let queue_dedup_pairs: [(&Arc<Mutex<VecDeque<ServerTarget>>>, &Arc<Mutex<HashSet<String>>>); 3] = [
-            (&self.hot_queue, &self.hot_dedup),
-            (&self.warm_queue, &self.warm_dedup),
-            (&self.cold_queue, &self.cold_dedup),
-        ];
-        let mut best: Option<(&Arc<Mutex<VecDeque<ServerTarget>>>, &Arc<Mutex<HashSet<String>>>, usize, DateTime<Utc>)> = None;
+        // 3. Nothing ready in first 5000 — deep scan main queues for ANY ready item.
+        let queues = [&self.hot_queue, &self.warm_queue, &self.cold_queue];
+        let mut best: Option<(&Arc<Mutex<VecDeque<ServerTarget>>>, usize, DateTime<Utc>)> = None;
 
-        for (queue, _dedup_set) in &queue_dedup_pairs {
+        for queue in &queues {
             let q = queue.lock().await;
             for i in 0..q.len() {
                 if q[i].next_scan_at.map_or(true, |t| t <= now) {
                     let t = q[i].next_scan_at.unwrap_or(now);
-                    if best.as_ref().map_or(true, |(_, _, _, bt)| t < *bt) {
-                        best = Some((queue, _dedup_set, i, t));
+                    if best.as_ref().map_or(true, |(_, _, bt)| t < *bt) {
+                        best = Some((queue, i, t));
                     }
                 }
             }
         }
 
-        if let Some((queue, dedup_set, idx, _)) = best {
+        if let Some((queue, idx, _)) = best {
             let mut q = queue.lock().await;
             let server = q.remove(idx).unwrap();
-            // Clean up dedup
+            // Clean up global dedup and increment discovery counter
             let key = format!("{}:{}", server.ip, server.port);
-            dedup_set.lock().await.remove(&key);
+            self.queue_dedup.lock().await.remove(&key);
+            *self.discovery_counter.lock().await += 1;
             return Some(server);
+        }
+
+        // 4. No main queue items ready — fall back to discovery queue.
+        // Reset counter since we're already doing a discovery scan.
+        *self.discovery_counter.lock().await = 0;
+        {
+            let mut dq = self.discovery_queue.lock().await;
+            if let Some(target) = dq.pop_front() {
+                return Some(target);
+            }
         }
 
         // Truly nothing ready — return None so the scanner loop can sleep.
@@ -522,30 +569,46 @@ impl Scheduler {
             // Compute IPs via deterministic shuffle at current offset
             let mut added = 0u64;
             let offset = current_offset as u64;
+
+            // Load known servers once per range to avoid repeated lock acquisitions.
+            // Discovery skips IPs that are already known servers, preventing
+            // re-discovery of servers managed by the main hot/warm/cold queues.
+            let known = self.known_servers.lock().await.clone();
+
             while (added as usize) < ips_per_range && (offset + added) < total_ips as u64 {
                 let position = offset + added;
                 let ip_val = ip_at_position(position, base_ip, total_ips as u64, seed);
                 let ip_str = format_ip(ip_val);
 
-                let mut java_target = ServerTarget::new(ip_str.clone(), 25565, "java".to_string());
-                java_target.category = if priority == 2 {
-                    AsnCategory::Hosting
-                } else {
-                    AsnCategory::Residential
-                };
-                java_target.priority = priority;
-                java_target.is_discovery = true;
-                all_targets.push(java_target);
+                // Skip if this IP is already a known server (both ports)
+                let java_key = format!("{}:25565", ip_str);
+                let bedrock_key = format!("{}:19132", ip_str);
+                let java_known = known.contains(&java_key);
+                let bedrock_known = known.contains(&bedrock_key);
 
-                let mut bedrock_target = ServerTarget::new(ip_str, 19132, "bedrock".to_string());
-                bedrock_target.category = if priority == 2 {
-                    AsnCategory::Hosting
-                } else {
-                    AsnCategory::Residential
-                };
-                bedrock_target.priority = priority;
-                bedrock_target.is_discovery = true;
-                all_targets.push(bedrock_target);
+                if !java_known {
+                    let mut java_target = ServerTarget::new(ip_str.clone(), 25565, "java".to_string());
+                    java_target.category = if priority == 2 {
+                        AsnCategory::Hosting
+                    } else {
+                        AsnCategory::Residential
+                    };
+                    java_target.priority = priority;
+                    java_target.is_discovery = true;
+                    all_targets.push(java_target);
+                }
+
+                if !bedrock_known {
+                    let mut bedrock_target = ServerTarget::new(ip_str.clone(), 19132, "bedrock".to_string());
+                    bedrock_target.category = if priority == 2 {
+                        AsnCategory::Hosting
+                    } else {
+                        AsnCategory::Residential
+                    };
+                    bedrock_target.priority = priority;
+                    bedrock_target.is_discovery = true;
+                    all_targets.push(bedrock_target);
+                }
 
                 added += 1;
             }
@@ -641,6 +704,12 @@ impl Scheduler {
 
         if was_online {
             server.mark_online();
+
+            // If this was a new discovery target that's online, register it as a known server
+            // so future discovery cycles skip it. This permanently prevents re-discovery.
+            if is_new_discovery {
+                self.register_known_server(&server.ip.to_string(), server.port).await;
+            }
 
             // Progressive Port Scanning Logic (only for Java servers)
             // User requested: "make sure the progressive scanning is in the hot stage instead of the discovery stage"
@@ -762,13 +831,9 @@ impl Scheduler {
         }
     }
 
-    /// Get the dedup set size for a given priority.
-    async fn get_dedup_size(&self, priority: i32) -> usize {
-        match priority {
-            1 => self.hot_dedup.lock().await.len(),
-            2 => self.warm_dedup.lock().await.len(),
-            _ => self.cold_dedup.lock().await.len(),
-        }
+    /// Get the dedup set size across all main queues.
+    async fn get_dedup_size(&self) -> usize {
+        self.queue_dedup.lock().await.len()
     }
 
     /// Count how many items in a queue are ready to scan (next_scan_at <= now or None).
@@ -804,41 +869,134 @@ impl Scheduler {
                 continue;
             }
 
-            let ready_servers = match self
-                .server_repo
-                .get_servers_for_refill(priority, interval_hours, limit)
-                .await
-            {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+            // Fetch from DB in batches, skipping servers already in the dedup set.
+            // This prevents the same 5,000 oldest servers from blocking all others
+            // when the dedup set is larger than a single batch.
+            let total_len_before = self.get_queue_len(priority).await;
+            let dedup_before = self.get_dedup_size().await;
+            let slots_available = (limit as usize).saturating_sub(total_len_before);
 
-            if ready_servers.is_empty() {
-                continue;
+            if slots_available == 0 {
+                continue; // Queue is already at capacity
             }
 
-            let total_len = self.get_queue_len(priority).await;
-            let dedup_count = self.get_dedup_size(priority).await;
-            tracing::info!(
-                "Queue refill: priority={} queue has {}/{} ready/total items (threshold: {}, dedup: {}), adding {} servers from DB",
-                priority,
-                ready_count,
-                total_len,
-                refill_threshold,
-                dedup_count,
-                ready_servers.len()
-            );
-            for server in ready_servers {
-                let mut target = ServerTarget::new(
-                    server.ip.to_string(),
-                    server.port.try_into().unwrap_or(25565),
-                    server.server_type,
+            let mut total_queried = 0u64;
+            let mut total_new_found = 0usize;
+            let mut seen_keys: HashSet<String> = HashSet::new();
+
+            // Fetch in rounds: each round fetches a batch, filters against dedup,
+            // and adds new servers. Stop when we've filled the available slots
+            // or the query returns fewer results than requested.
+            for _round in 0..3 {
+                // Fetch enough to cover all eligible servers beyond what's already queued
+                let batch_limit = limit * 10;
+
+                let ready_servers = match self
+                    .server_repo
+                    .get_servers_for_refill(priority, interval_hours, batch_limit)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+
+                if ready_servers.is_empty() {
+                    break;
+                }
+
+                total_queried += ready_servers.len() as u64;
+
+                // Filter out servers already in the queue (by dedup set) or already
+                // seen in a previous round of this refill cycle.
+                let dedup = self.queue_dedup.lock().await;
+                let new_servers: Vec<_> = ready_servers
+                    .into_iter()
+                    .filter(|s| {
+                        let key = format!("{}:{}", s.ip, s.port);
+                        !dedup.contains(&key) && seen_keys.insert(key)
+                    })
+                    .take(slots_available.saturating_sub(total_new_found))
+                    .collect();
+                drop(dedup);
+
+                total_new_found += new_servers.len();
+
+                if new_servers.is_empty() {
+                    // All fetched servers are either in the queue or already seen
+                    // this round — further rounds won't help
+                    break;
+                }
+
+                // Schedule each server based on its actual last_seen time:
+                // next_scan_at = last_seen + interval.
+                //
+                // This eliminates the race condition with requeue_server:
+                // - requeue_server sets next_scan_at = now + interval (from the current scan)
+                // - refill sets next_scan_at = last_seen + interval (from the DB record)
+                //
+                // Since last_seen is from the PREVIOUS scan (not the current one),
+                // refill's next_scan_at is always <= now (server is due or overdue).
+                // requeue_server's next_scan_at is always now + interval (in the future).
+                //
+                // The dedup prevents duplicate entries: whichever adds first wins.
+                // If refill adds first (next_scan_at <= now), the server is scanned
+                // immediately, then requeue_server re-adds with next_scan_at = now + interval.
+                // If requeue_server adds first (during the scan window), refill skips it.
+                // Either way, the server gets the correct next_scan_at from requeue_server
+                // after its most recent scan.
+                for server in new_servers.iter() {
+                    let mut target = ServerTarget::new(
+                        server.ip.to_string(),
+                        server.port.try_into().unwrap_or(25565),
+                        server.server_type.clone(),
+                    );
+                    target.priority = priority;
+                    target.last_scanned = server.last_seen.map(|t| t.and_utc());
+
+                    if let Some(last_seen) = server.last_seen {
+                        target.next_scan_at = Some(last_seen.and_utc() + chrono::Duration::hours(interval_hours as i64));
+                    } else {
+                        // No last_seen — schedule immediately (never been scanned)
+                        target.next_scan_at = Some(Utc::now());
+                    }
+
+                    self.add_server(target, false).await;
+                }
+
+                if total_new_found >= slots_available {
+                    break;
+                }
+            }
+
+            let total_len_after = self.get_queue_len(priority).await;
+            let dedup_after = self.get_dedup_size().await;
+            let actually_added = total_len_after.saturating_sub(total_len_before);
+
+            if actually_added > 0 {
+                tracing::info!(
+                    "Queue refill: priority={} queue had {}/{} ready/total (dedup: {}), queried {} from DB, found {} new, actually added {}",
+                    priority,
+                    ready_count,
+                    total_len_before,
+                    dedup_before,
+                    total_queried,
+                    total_new_found,
+                    actually_added
                 );
-                target.priority = priority;
-                target.last_scanned = server.last_seen.map(|t| t.and_utc());
-                target.next_scan_at = None; // Ready to scan now
-                // Use add_server to handle deduplication
-                self.add_server(target, false).await;
+            } else if total_new_found > 0 {
+                tracing::debug!(
+                    "Queue refill: priority={} found {} new servers but 0 added (queue at capacity, dedup: {})",
+                    priority,
+                    total_new_found,
+                    dedup_after
+                );
+            } else if total_queried > 0 {
+                tracing::debug!(
+                    "Queue refill: priority={} queried {} servers from DB but 0 new (all in queue, dedup: {})",
+                    priority,
+                    total_queried,
+                    dedup_before
+                );
             }
         }
     }
@@ -1106,14 +1264,14 @@ mod tests {
         map.insert("10.0.0.1:25565".to_string(), now);
 
         // Check entry exists
-        assert!(map.contains("10.0.0.1:25565"));
+        assert!(map.contains_key("10.0.0.1:25565"));
 
         // Simulate time passing (less than TTL)
         // In real code, we'd check: now.duration_since(instant).as_secs() < ttl_secs
         // Here we just verify the logic structure
 
         // Entry should still exist
-        assert!(map.contains("10.0.0.1:25565"));
+        assert!(map.contains_key("10.0.0.1:25565"));
 
         // After TTL expires, entry should be removed by retain()
         // map.retain(|_, instant| now.duration_since(*instant).as_secs() < ttl_secs);

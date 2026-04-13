@@ -213,6 +213,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Non-test mode: queues start empty and fill naturally via background tasks
     // (try_refill_queues, fill_warm_queue_if_needed, fill_cold_queue_if_needed)
 
+    // Load known server IPs into the discovery skip-list.
+    // This prevents discovery from re-scanning IPs that are already known servers.
+    if let Ok(count) = scheduler.load_known_servers().await {
+        tracing::info!("Discovery skip-list: {} known server IPs loaded from DB", count);
+    }
+
     let ((h_ready, h_total), (w_ready, w_total), (c_ready, c_total), d) = scheduler.get_queue_readiness().await;
     tracing::info!(
         "Scheduler queues: Hot={}/{} ready/total, Warm={}/{} ready/total, Cold={}/{} ready/total, Discovery={}",

@@ -40,6 +40,7 @@
         login_obstacle?: string | null;
         last_login_at?: string | null;
         flags?: string[];
+        created_at?: string | null;
     }
 
     let servers = $state<Server[]>([]);
@@ -73,6 +74,7 @@
     let cursorIp = $state(urlParams.get("cursor_ip") || "");
     let cursorPlayers = $state(urlParams.get("cursor_players") || "");
     let cursorLastSeen = $state(urlParams.get("cursor_last_seen") || "");
+    let cursorCreatedAt = $state(urlParams.get("cursor_created_at") || "");
 
     let rawSearchText = $state("");
     let isParsing = false;
@@ -249,10 +251,12 @@
                 if (cursorIp) params.set("cursor_ip", cursorIp);
                 if (cursorPlayers) params.set("cursor_players", cursorPlayers);
                 if (cursorLastSeen) params.set("cursor_last_seen", cursorLastSeen);
+                if (cursorCreatedAt) params.set("cursor_created_at", cursorCreatedAt);
                 // Clear cursor state after using it (so filter changes reset to page 1)
                 cursorIp = "";
                 cursorPlayers = "";
                 cursorLastSeen = "";
+                cursorCreatedAt = "";
 
                 goto(`?${params.toString()}`, {
                     replaceState: true,
@@ -264,6 +268,7 @@
                 params.set("cursor_ip", last.ip);
                 if (sortBy === "players") params.set("cursor_players", last.players_online.toString());
                 if (sortBy === "last_seen" && last.last_seen) params.set("cursor_last_seen", last.last_seen);
+                if (sortBy === "created_at" && last.created_at) params.set("cursor_created_at", last.created_at);
 
                 // Also update URL with cursor when loading more
                 goto(`?${params.toString()}`, {
@@ -487,6 +492,7 @@
                             >
                                 <option value="players">Sort: Players</option>
                                 <option value="last_seen">Sort: Last Seen</option>
+                                <option value="created_at">Sort: First Seen</option>
                                 <option value="ip">Sort: IP Address</option>
                             </select>
                         </div>
@@ -516,6 +522,7 @@
                                 <Table.Head class="w-16"></Table.Head>
                                 <Table.Head>Server Address</Table.Head>
                                 <Table.Head>Status</Table.Head>
+                                <Table.Head>First Seen</Table.Head>
                                 <Table.Head>Login</Table.Head>
                                 <Table.Head>Players</Table.Head>
                                 <Table.Head>Software</Table.Head>
@@ -525,7 +532,7 @@
                         <Table.Body>
                             {#if loading && servers.length === 0}
                                 <Table.Row>
-                                    <Table.Cell colspan={7} class="h-32 text-center text-muted-foreground">
+                                    <Table.Cell colspan={8} class="h-32 text-center text-muted-foreground">
                                         <div class="flex flex-col items-center justify-center gap-2">
                                             <RefreshCcw class="w-6 h-6 animate-spin mx-auto opacity-50 mb-2" />
                                             <span class="italic text-sm">Querying database...</span>
@@ -534,7 +541,7 @@
                                 </Table.Row>
                             {:else if servers.length === 0}
                                 <Table.Row>
-                                    <Table.Cell colspan={7} class="h-32 text-center text-muted-foreground">
+                                    <Table.Cell colspan={8} class="h-32 text-center text-muted-foreground">
                                         <div class="flex flex-col items-center justify-center gap-2">
                                             <Search class="w-8 h-8 opacity-20" />
                                             <span class="italic text-sm">No servers match your advanced criteria.</span>
@@ -581,6 +588,17 @@
                                         {:else}
                                             <Badge variant="outline" class="text-muted-foreground/70 px-2 py-0 text-[10px] uppercase font-bold tracking-wider">Offline</Badge>
                                         {/if}
+                                    </Table.Cell>
+                                    <Table.Cell>
+                                        <div class="flex items-center gap-1.5">
+                                            <span class="font-mono text-xs text-muted-foreground">
+                                                {#if server.created_at}
+                                                    {new Date(server.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
+                                                {:else}
+                                                    <span class="text-muted-foreground/30">—</span>
+                                                {/if}
+                                            </span>
+                                        </div>
                                     </Table.Cell>
                                     <Table.Cell>
                                         {#if server.login_obstacle === 'success'}

@@ -202,19 +202,23 @@ impl LoginQueue {
             // Fetch next batch using cursor pagination if we've exhausted the current batch
             if server_index >= current_batch.len() {
                 server_index = 0;
+                // Only login-test servers that have been SLP-scanned within the last 48 hours.
+                // This avoids wasting resources on servers that haven't been verified recently
+                // (likely offline or dead).
+                const MAX_LOGIN_AGE_HOURS: i64 = 48;
                 match self
                     .server_repo
-                    .get_online_servers_cursor(500, cursor_ip, cursor_port)
+                    .get_online_servers_cursor_recent(500, cursor_ip, cursor_port, MAX_LOGIN_AGE_HOURS)
                     .await
                 {
                     Ok(batch) => {
                         if batch.is_empty() {
-                            // We've cycled through all servers — reset cursor and start over
+                            // We've cycled through all recently-scanned servers — reset cursor and start over
                             cursor_ip = None;
                             cursor_port = None;
                             match self
                                 .server_repo
-                                .get_online_servers_cursor(500, None, None)
+                                .get_online_servers_cursor_recent(500, None, None, MAX_LOGIN_AGE_HOURS)
                                 .await
                             {
                                 Ok(b) => current_batch = b,
@@ -283,12 +287,26 @@ impl LoginQueue {
                 let result = login::attempt_login_smart(addr, protocol).await;
                 let obstacle_str = result.obstacle.to_string();
 
-                // Update server record
+                // Update server record with login result
                 if let Err(e) = server_repo
                     .update_login_result(&ip.to_string(), port as i16, &obstacle_str)
                     .await
                 {
                     tracing::error!("Failed to update login result for {}:{}: {}", ip, port, e);
+                }
+
+                // If the server responded (not a timeout or unreachable), update last_seen.
+                // This re-prioritizes the server so the scanner picks it up sooner,
+                // moving it from the cold queue back to the hot queue if it's still online.
+                if result.obstacle != LoginObstacle::Timeout
+                    && result.obstacle != LoginObstacle::Unreachable
+                {
+                    if let Err(e) = server_repo
+                        .update_last_seen(&ip.to_string(), port as i16)
+                        .await
+                    {
+                        tracing::debug!("Failed to update last_seen for {}:{}: {}", ip, port, e);
+                    }
                 }
 
                 total_attempts.fetch_add(1, Ordering::Relaxed);
