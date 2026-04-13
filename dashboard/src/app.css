@@ -193,3 +193,62 @@ body {
 		display: none;
 	}
 }
+
+/* Full-width page container for public pages */
+@utility container-wide {
+	@apply w-full max-w-[1920px] mx-auto px-6 md:px-8 lg:px-12;
+}
+
+/* Glass-morphism card effect */
+@utility glass {
+	@apply bg-card/60 backdrop-blur-xl border border-border/50 shadow-lg;
+}
+
+@utility glass-subtle {
+	@apply bg-background/40 backdrop-blur-md border border-border/30;
+}
+
+/* Smooth row hover animation */
+@utility row-hover {
+	transition: background-color 0.15s ease, box-shadow 0.15s ease;
+	&:hover {
+		box-shadow: inset 0 0 0 1px var(--color-border);
+	}
+}
+
+/* Subtle gradient header bar */
+@utility header-gradient {
+	background: linear-gradient(180deg, var(--color-background) 0%, var(--color-background) / 0.95 100%);
+}
+
+/* Pulse animation for live indicators */
+@utility pulse-live {
+	animation: pulse-live 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes pulse-live {
+	0%, 100% {
+		opacity: 1;
+		transform: scale(1);
+	}
+	50% {
+		opacity: 0.5;
+		transform: scale(1.5);
+	}
+}
+
+/* Smooth fade-in for page content */
+@utility fade-in {
+	animation: fade-in 0.3s ease-out;
+}
+
+@keyframes fade-in {
+	from {
+		opacity: 0;
+		transform: translateY(4px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}

@@ -43,9 +43,6 @@
     let stats = $state<Stats | null>(null);
     let scanProgress = $state<ScanProgress | null>(null);
     let loginStatus = $state<LoginQueueStatus | null>(null);
-    let testScanning = $state(false);
-    let testScanResult = $state<{ status: string; servers_added: number } | null>(null);
-    let testScanRegion = $state('quick');
     let error = $state<string | null>(null);
 
     async function loadData() {
@@ -63,28 +60,6 @@
         }
     }
 
-    async function triggerTestScan() {
-        testScanning = true;
-        testScanResult = null;
-        try {
-            const payload: any = {};
-            if (testScanRegion === 'quick') payload.quick = true;
-            else if (testScanRegion !== 'default') payload.region = testScanRegion;
-
-            const res = await fetchWithAuth('/api/scan/test', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            testScanResult = await res.json();
-            setTimeout(() => loadData(), 2000);
-        } catch (e) {
-            error = e instanceof Error ? e.message : 'Failed to trigger test scan';
-        } finally {
-            testScanning = false;
-        }
-    }
-
     function formatNum(n: number | undefined | null): string {
         return (n ?? 0).toLocaleString();
     }
@@ -97,7 +72,7 @@
     });
 </script>
 
-<!-- Stats row -->
+<!-- Hero Stats -->
 <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-6">
     <div class="space-y-1">
         <div class="text-3xl font-bold tracking-tight">{formatNum(stats?.total_servers)}</div>
@@ -127,7 +102,7 @@
 
 <Separator />
 
-<!-- Continuous discovery scan progress -->
+<!-- Scan Progress -->
 <div class="space-y-4">
     <div class="flex items-center gap-2">
         <h2 class="text-sm font-semibold tracking-tight">Continuous Discovery Scan</h2>
@@ -187,7 +162,7 @@
 
 <Separator />
 
-<!-- Queue sizes + login queue side by side -->
+<!-- Queues + Login Queue -->
 <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
     <!-- Queue sizes -->
     <div class="space-y-3">
@@ -254,44 +229,6 @@
             </div>
         {:else}
             <p class="text-xs text-muted-foreground">Loading...</p>
-        {/if}
-    </div>
-</div>
-
-<Separator />
-
-<!-- Scanner control -->
-<div class="space-y-3">
-    <h2 class="text-sm font-semibold tracking-tight">Scanner Control</h2>
-    <div class="flex items-center gap-3 flex-wrap">
-        <select
-            class="h-9 px-3 bg-background border border-input rounded-md text-sm focus:ring-1 focus:ring-ring outline-none"
-            bind:value={testScanRegion}
-        >
-            <option value="quick">Quick Test (10)</option>
-            <option value="default">All Known (50)</option>
-            <option value="us">US Servers</option>
-            <option value="eu">EU Servers</option>
-        </select>
-        <button
-            class="inline-flex items-center gap-2 h-9 px-4 bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 rounded-md text-sm font-medium transition-colors"
-            onclick={triggerTestScan}
-            disabled={testScanning}
-        >
-            {#if testScanning}
-                <svg class="animate-spin h-3.5 w-3.5" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                Deploying...
-            {:else}
-                Execute Scan
-            {/if}
-        </button>
-        {#if testScanResult}
-            <span class="text-xs text-emerald-500">
-                Dispatched {testScanResult.servers_added} servers
-            </span>
-        {/if}
-        {#if error}
-            <span class="text-xs text-destructive">{error}</span>
         {/if}
     </div>
 </div>
