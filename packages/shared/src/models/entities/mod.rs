@@ -4,6 +4,7 @@ pub mod asn_ranges;
 pub mod asn_stats;
 pub mod asns;
 pub mod daily_stats;
+pub mod exclusions;
 pub mod minecraft_accounts;
 pub mod server_history;
 pub mod server_players;

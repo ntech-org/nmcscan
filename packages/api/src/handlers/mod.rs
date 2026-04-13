@@ -88,11 +88,16 @@ pub struct AppState {
     pub stats_repo: Arc<StatsRepository>,
     pub api_key_repo: Arc<ApiKeyRepository>,
     pub minecraft_account_repo: Arc<MinecraftAccountRepository>,
+    pub exclusion_repo: Arc<nmcscan_shared::repositories::ExclusionRepository>,
     pub scheduler: Option<Arc<nmcscan_shared::services::scheduler::Scheduler>>,
     pub exclude_list: Arc<ExcludeManager>,
     pub api_key: Option<String>,
     pub contact_email: Option<String>,
     pub discord_link: Option<String>,
+    /// Scanner service URL for live status and control.
+    pub scanner_url: String,
+    /// HTTP client for communicating with the scanner service.
+    pub http_client: reqwest::Client,
 }
 
 #[derive(Clone)]
@@ -186,11 +191,18 @@ pub struct AddExcludeRequest {
 
 /// Login queue trigger request.
 #[derive(Deserialize)]
-#[allow(dead_code)]
-pub struct LoginTriggerRequest {
+pub struct LoginQueueTriggerRequest {
     pub ip: String,
     #[serde(default = "default_login_port")]
     pub port: u16,
+}
+
+/// Response from the scanner's /scan/test endpoint.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub struct ScannerTestScanResponse {
+    pub status: String,
+    pub servers_added: usize,
 }
 
 #[allow(dead_code)]
@@ -811,89 +823,102 @@ async fn get_asn(
     }
 }
 
-/// GET /api/exclude - Get current exclude list.
+/// GET /api/exclude - Get current exclude list from database.
 async fn get_exclude_list(
+    State(state): State<AppState>,
     Query(query): Query<PaginationQuery>,
-) -> Json<PaginatedResponse<ExcludeEntry>> {
+) -> Result<Json<PaginatedResponse<ExcludeEntry>>, StatusCode> {
     let page = query.page.unwrap_or(0);
     let limit = query.limit.unwrap_or(50);
 
-    let content = std::fs::read_to_string("exclude.conf").unwrap_or_default();
-    let mut all_entries: Vec<ExcludeEntry> = content
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
+    let exclusions = state
+        .exclusion_repo
+        .get_all(page as u64, limit as u64)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            let (network, comment) = if let Some(idx) = line.find('#') {
-                (line[..idx].trim(), Some(line[idx + 1..].trim()))
-            } else {
-                (line, None)
-            };
+    let total = state
+        .exclusion_repo
+        .count()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? as i64;
 
-            if network.is_empty() {
-                return None;
-            }
-
-            Some(ExcludeEntry {
-                network: network.to_string(),
-                comment: comment.map(String::from),
-            })
+    let items: Vec<ExcludeEntry> = exclusions
+        .into_iter()
+        .map(|e| ExcludeEntry {
+            network: e.network,
+            comment: e.comment,
         })
         .collect();
 
-    all_entries.reverse();
-
-    let total = all_entries.len() as i64;
-    let start = (page * limit) as usize;
-    let end = std::cmp::min(start + limit as usize, all_entries.len());
-
-    let items = if start < all_entries.len() {
-        all_entries[start..end].to_vec()
-    } else {
-        Vec::new()
-    };
-
-    Json(PaginatedResponse {
+    Ok(Json(PaginatedResponse {
         items,
         total,
         page,
         limit,
-    })
+    }))
 }
 
-/// POST /api/exclude - Add a new exclusion.
+/// POST /api/exclude - Add a new exclusion to the database.
 async fn add_exclusion(
     State(state): State<AppState>,
     Json(payload): Json<AddExcludeRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     state
-        .exclude_list
-        .add_exclusion(&payload.network, payload.comment.as_deref())
+        .exclusion_repo
+        .insert(&payload.network, payload.comment.as_deref(), "manual")
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
+    // Also add to in-memory exclude list for immediate effect on the API side
+    // (scanner service loads from DB at startup, so this is API-side only)
+    state.exclude_list.insert_network(&payload.network).await;
+
     tracing::info!(
-        "IP/Network {} excluded via dashboard: {:?}",
+        "IP/Network {} excluded via database: {:?}",
         payload.network,
         payload.comment
     );
     Ok(StatusCode::CREATED)
 }
 
-/// POST /api/scan/test - Trigger a test scan with known servers.
+/// POST /api/scan/test - Trigger a test scan with known servers (proxied to scanner).
 async fn trigger_test_scan(
     State(state): State<AppState>,
     Json(payload): Json<TestScanRequest>,
-) -> Json<TestScanResponse> {
-    use nmcscan_shared::utils::test_mode;
+) -> Result<Json<TestScanResponse>, StatusCode> {
+    let scanner_url = format!("{}/scan/test", state.scanner_url.trim_end_matches('/'));
 
+    let response = state
+        .http_client
+        .post(&scanner_url)
+        .json(&serde_json::json!({
+            "quick": payload.quick,
+            "region": payload.region,
+            "count": payload.count,
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to reach scanner: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let status = response.status();
+    let _body: crate::handlers::ScannerTestScanResponse = response.json().await.map_err(|_| {
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    if !status.is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    // Also register servers in DB for dashboard tracking
+    use nmcscan_shared::utils::test_mode;
     let quick = payload.quick.unwrap_or(false);
     let count = payload.count.unwrap_or(10);
 
-    let test_servers = if quick {
+    let test_servers: Vec<(String, u16, String, String)> = if quick {
         test_mode::get_quick_test_servers()
     } else if let Some(region) = payload.region {
         let mut servers = test_mode::get_servers_by_region(&region);
@@ -910,25 +935,13 @@ async fn trigger_test_scan(
         servers
     };
 
-    for (ip, port, _name, host) in &test_servers {
+    for (ip, port, _name, _host) in &test_servers {
         let server_type = if *port == 19132 { "bedrock" } else { "java" };
-        let mut target = nmcscan_shared::services::scheduler::ServerTarget::new(
-            ip.clone(),
-            *port,
-            server_type.to_string(),
-        );
-        target.category = nmcscan_shared::models::asn::AsnCategory::Hosting;
-        target.priority = 1;
-        target.hostname = Some(host.clone());
-
-        let port: i16 = (*port).try_into().unwrap_or(25565);
+        let port_i16: i16 = (*port).try_into().unwrap_or(25565);
         let _ = state
             .server_repo
-            .insert_server_if_new(ip, port, server_type)
+            .insert_server_if_new(ip, port_i16, server_type)
             .await;
-        if let Some(scheduler) = &state.scheduler {
-            scheduler.add_server(target, true).await;
-        }
     }
 
     let servers_info: Vec<TestServerInfo> = test_servers
@@ -936,47 +949,70 @@ async fn trigger_test_scan(
         .map(|(ip, port, name, _host)| TestServerInfo { ip, port, name })
         .collect();
 
-    Json(TestScanResponse {
-        status: "ok".to_string(),
+    Ok(Json(TestScanResponse {
+        status: "dispatched_to_scanner".to_string(),
         servers_added: servers_info.len(),
         servers: servers_info,
-    })
-}
-
-/// GET /api/login-queue/status - Get login queue status and statistics.
-/// Note: Login queue is now part of the scanner service.
-async fn login_queue_status() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "unavailable",
-        "message": "Login queue is managed by the scanner service (nmcscan-scanner)"
     }))
 }
 
-/// POST /api/login-queue/start - Start the login queue.
-/// Note: Login queue is now part of the scanner service.
+/// GET /api/login-queue/status - Get login queue status from scanner.
+async fn login_queue_status(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let scanner_url = format!("{}/login-queue/status", state.scanner_url.trim_end_matches('/'));
+
+    let response = state
+        .http_client
+        .get(&scanner_url)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!("Scanner unreachable: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let body: serde_json::Value = response.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(body))
+}
+
+/// POST /api/login-queue/start - Proxy to scanner (no-op, scanner manages lifecycle).
 async fn login_queue_start() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "status": "unavailable",
-        "message": "Login queue is managed by the scanner service (nmcscan-scanner)"
+        "status": "ok",
+        "message": "Login queue is managed by the scanner service. It starts automatically."
     }))
 }
 
-/// POST /api/login-queue/stop - Stop the login queue.
-/// Note: Login queue is now part of the scanner service.
+/// POST /api/login-queue/stop - Proxy to scanner (no-op).
 async fn login_queue_stop() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "status": "unavailable",
-        "message": "Login queue is managed by the scanner service (nmcscan-scanner)"
+        "status": "ok",
+        "message": "Login queue cannot be stopped remotely. Restart the scanner service to stop it."
     }))
 }
 
-/// POST /api/login-queue/trigger - Manually trigger a login attempt.
-/// Note: Login queue is now part of the scanner service.
-async fn login_queue_trigger() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "unavailable",
-        "message": "Login queue is managed by the scanner service (nmcscan-scanner)"
-    }))
+/// POST /api/login-queue/trigger - Trigger a login attempt via the scanner.
+async fn login_queue_trigger(
+    State(state): State<AppState>,
+    Json(payload): Json<LoginQueueTriggerRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let scanner_url = format!("{}/login-queue/trigger", state.scanner_url.trim_end_matches('/'));
+
+    let response = state
+        .http_client
+        .post(&scanner_url)
+        .json(&serde_json::json!({
+            "ip": payload.ip,
+            "port": payload.port,
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to reach scanner: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let body: serde_json::Value = response.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(body))
 }
 
 /// GET /api/scan/progress - Get scan cycle progress and queue stats.
@@ -988,14 +1024,38 @@ async fn get_scan_progress(
         .get_scan_progress()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Try to get queue sizes from the scanner's HTTP API
     let queues = if let Some(scheduler) = &state.scheduler {
         scheduler.get_queue_stats().await
     } else {
-        nmcscan_shared::services::scheduler::QueueStats {
-            hot: 0,
-            warm: 0,
-            cold: 0,
-            discovery: 0,
+        // Query the scanner's HTTP endpoint
+        let scanner_url = format!("{}/status", state.scanner_url.trim_end_matches('/'));
+        match state.http_client.get(&scanner_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        if let Some(queues_obj) = body.get("queues") {
+                            nmcscan_shared::services::scheduler::QueueStats {
+                                hot: queues_obj.get("hot").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                warm: queues_obj.get("warm").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                cold: queues_obj.get("cold").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                discovery: queues_obj.get("discovery").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                            }
+                        } else {
+                            nmcscan_shared::services::scheduler::QueueStats {
+                                hot: 0, warm: 0, cold: 0, discovery: 0,
+                            }
+                        }
+                    }
+                    Err(_) => nmcscan_shared::services::scheduler::QueueStats {
+                        hot: 0, warm: 0, cold: 0, discovery: 0,
+                    },
+                }
+            }
+            _ => nmcscan_shared::services::scheduler::QueueStats {
+                hot: 0, warm: 0, cold: 0, discovery: 0,
+            },
         }
     };
     Ok(Json(ScanProgressResponse { categories, queues }))

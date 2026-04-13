@@ -6,7 +6,7 @@
 use migration::Migrator;
 use nmcscan_shared::models::entities::{asns, servers};
 use nmcscan_shared::repositories::{
-    ApiKeyRepository, AsnRepository, ServerRepository, StatsRepository,
+    ApiKeyRepository, AsnRepository, ExclusionRepository, ServerRepository, StatsRepository,
 };
 use nmcscan_shared::services::asn_fetcher::AsnFetcher;
 use nmcscan_shared::utils::exclude::{ExcludeList, ExcludeManager};
@@ -65,6 +65,10 @@ struct Args {
     /// Force ASN database re-import from iptoasn.com on startup
     #[arg(long, env = "FORCE_ASN_IMPORT", default_value = "false")]
     force_asn_import: bool,
+
+    /// Scanner service URL for live status and control (e.g., http://nmcscan-scanner:3001)
+    #[arg(long, env = "SCANNER_URL", default_value = "http://localhost:3001")]
+    scanner_url: String,
 }
 
 #[tokio::main]
@@ -137,6 +141,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key_repo = Arc::new(ApiKeyRepository::new((*db).clone()));
     let minecraft_account_repo =
         Arc::new(nmcscan_shared::repositories::MinecraftAccountRepository::new((*db).clone()));
+    let exclusion_repo = Arc::new(ExclusionRepository::new((*db).clone()));
+
+    // Seed exclusions from config files into the database
+    if !exclude_content.is_empty() {
+        match exclusion_repo.seed_from_config(&exclude_content, "config_file").await {
+            Ok(n) => tracing::info!("Seeded {} exclusions from exclude.conf into DB", n),
+            Err(e) => tracing::warn!("Failed to seed exclude.conf exclusions: {}", e),
+        }
+    }
 
     // 4. Initialize ASN fetcher and import/update ASN data
     tracing::info!("Initializing ASN fetcher...");
@@ -267,11 +280,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats_repo: Arc::clone(&stats_repo),
         api_key_repo: Arc::clone(&api_key_repo),
         minecraft_account_repo: Arc::clone(&minecraft_account_repo),
+        exclusion_repo: Arc::clone(&exclusion_repo),
         scheduler: None, // Not available in API-only mode
         exclude_list: Arc::clone(&exclude_manager),
         api_key: args.api_key.clone(),
         contact_email: args.contact_email.clone(),
         discord_link: args.discord_link.clone(),
+        scanner_url: args.scanner_url.clone(),
+        http_client: reqwest::Client::new(),
     };
 
     let listen_addr = args.listen_addr.clone();

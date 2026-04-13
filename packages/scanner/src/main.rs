@@ -5,11 +5,13 @@
 
 mod login_queue;
 mod scanner;
+mod scanner_http;
 mod scanner_loop;
 
 use crate::scanner::Scanner;
+use crate::scanner_http::{run_http_server, ScannerState};
 use nmcscan_shared::models::asn::AsnCategory;
-use nmcscan_shared::repositories::{AsnRepository, ServerRepository, StatsRepository};
+use nmcscan_shared::repositories::{AsnRepository, ExclusionRepository, ServerRepository, StatsRepository};
 use nmcscan_shared::services::asn_fetcher::AsnFetcher;
 use nmcscan_shared::services::scheduler::{Scheduler, ServerTarget};
 use nmcscan_shared::utils::exclude::{ExcludeList, ExcludeManager};
@@ -141,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_repo = Arc::new(ServerRepository::new((*db).clone()));
     let asn_repo = Arc::new(AsnRepository::new((*db).clone()));
     let stats_repo = Arc::new(StatsRepository::new((*db).clone()));
+    let exclusion_repo = Arc::new(ExclusionRepository::new((*db).clone()));
 
     // 4. Initialize ASN fetcher
     let asn_fetcher = Arc::new(AsnFetcher::new(Arc::clone(&db), Arc::clone(&asn_repo)));
@@ -160,6 +163,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Create scanner and scheduler
     let exclude_manager = Arc::new(ExcludeManager::new(&args.exclude_file));
+
+    // Merge exclusions from database into in-memory list (DB is source of truth for runtime changes)
+    if let Ok(db_exclusions) = exclusion_repo.get_all_networks().await {
+        let db_count = db_exclusions.len();
+        for network in db_exclusions {
+            exclude_manager.insert_network(&network).await;
+        }
+        if db_count > 0 {
+            tracing::info!("Merged {} exclusions from database", db_count);
+        }
+    }
+
     let scanner = Scanner::new(
         Arc::clone(&exclude_manager),
         Arc::clone(&asn_fetcher),
@@ -233,7 +248,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     login_queue.start();
     tracing::info!("Login queue started");
 
-    // 8. Start background tasks
+    // 8. Start HTTP server for API communication (status + control)
+    let http_state = ScannerState {
+        scheduler: Arc::clone(&scheduler),
+        login_queue: Arc::clone(&login_queue),
+    };
+    let http_handle = tokio::spawn(async move {
+        if let Err(e) = run_http_server(http_state, "0.0.0.0:3001").await {
+            tracing::error!("Scanner HTTP server error: {}", e);
+        }
+    });
+
+    // 9. Start background tasks
     let scheduler_filler = Arc::clone(&scheduler);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
@@ -277,11 +303,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("✅ Scanner Service started");
     tracing::info!("   ASN Manager: {} ASNs, {} ranges", asn_count, range_count);
+    tracing::info!("   Scanner HTTP API: listening on 0.0.0.0:3001");
 
     // Wait for tasks
     tokio::select! {
         _ = scanner_handle => tracing::info!("Scanner stopped"),
         _ = asn_refresh_handle => tracing::info!("ASN refresh stopped"),
+        _ = http_handle => tracing::info!("HTTP server stopped"),
     }
 
     Ok(())

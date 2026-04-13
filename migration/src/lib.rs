@@ -10,6 +10,7 @@ mod m20260406_000007_create_minecraft_accounts;
 mod m20260406_000008_optimize_database_types;
 mod m20260408_000009_add_scaling_indexes;
 mod m20260413_000010_add_created_at;
+mod m20260413_000011_create_exclusions;
 
 pub struct Migrator;
 
@@ -27,6 +28,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260406_000008_optimize_database_types::Migration),
             Box::new(m20260408_000009_add_scaling_indexes::Migration),
             Box::new(m20260413_000010_add_created_at::Migration),
+            Box::new(m20260413_000011_create_exclusions::Migration),
         ]
     }
 }

@@ -54,9 +54,10 @@ services:
       - DATABASE_URL=postgres://nmcscan:nmcscan_secret@postgres:5432/nmcscan
       - EXCLUDE_FILE=/app/exclude.conf
       - FORCE_ASN_IMPORT=${FORCE_ASN_IMPORT:-false}
+      - SCANNER_URL=http://nmcscan-scanner:3001
     volumes:
-      - ./exclude.conf:/app/exclude.conf:ro
-      - ./honeypots.conf:/app/honeypots.conf:ro
+      - ./exclude.conf:/app/exclude.conf
+      - ./honeypots.conf:/app/honeypots.conf
       - geoip_data:/app/data/maxmind
     working_dir: /app
     ports:
@@ -97,9 +98,12 @@ services:
       - TEST_REGIONS
       - FORCE_ASN_IMPORT=${FORCE_ASN_IMPORT:-false}
     volumes:
-      - ./exclude.conf:/app/exclude.conf:ro
-      - ./honeypots.conf:/app/honeypots.conf:ro
+      - ./exclude.conf:/app/exclude.conf
+      - ./honeypots.conf:/app/honeypots.conf
       - geoip_data:/app/data/maxmind
+    ports:
+      # Internal scanner status/control endpoint (not exposed publicly by default)
+      - "127.0.0.1:3002:3001"
 
   dashboard:
     build: ./dashboard

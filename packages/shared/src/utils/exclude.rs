@@ -213,6 +213,21 @@ impl ExcludeManager {
         Ok(())
     }
 
+    /// Insert a network directly into the in-memory list without file I/O.
+    /// Used when the database is the source of truth (API adds via DB).
+    pub async fn insert_network(&self, network: &str) {
+        let normalized = normalize_ip_line(network.trim());
+        let mut lock = self.inner.write().await;
+        let networks = &mut lock.networks;
+
+        // Try parsing as CIDR or single IP
+        if let Ok(net) = normalized.parse::<Ipv4Network>() {
+            networks.push(net);
+        } else if let Ok(ip) = normalized.parse::<Ipv4Addr>() {
+            networks.push(Ipv4Network::new(ip, 32).unwrap());
+        }
+    }
+
     /// Get current list count.
     #[allow(dead_code)]
     pub async fn len(&self) -> usize {
