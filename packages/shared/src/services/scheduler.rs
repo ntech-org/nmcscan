@@ -473,6 +473,7 @@ impl Scheduler {
 
     /// Re-queue a server after scanning.
     /// Sets next_scan_at based on priority and whether it was online.
+    /// For online servers, also probes adjacent ports (progressive port scanning).
     pub async fn requeue_server(&self, mut server: ServerTarget, was_online: bool) {
         let is_new_discovery = server.last_scanned.is_none();
         let now = Utc::now();
@@ -485,6 +486,11 @@ impl Scheduler {
             if is_new_discovery {
                 self.register_known_server(&server.ip, server.port).await;
             }
+
+            // Progressive port scanning: probe adjacent ports for active servers.
+            // Multiple Minecraft servers can run on the same IP with different ports.
+            let category = server.category.clone();
+            self.probe_adjacent_ports(&server.ip, server.port, category).await;
         } else {
             server.mark_offline();
         }
@@ -514,6 +520,52 @@ impl Scheduler {
         };
         server.next_scan_at = Some(now + delay);
         self.add_server(server).await;
+    }
+
+    /// Probe adjacent ports (+1, -1) when an online server is found.
+    /// Only probes ports that aren't already known servers, and within valid port range.
+    /// Probed targets are added to the queue with high priority but a short delay.
+    async fn probe_adjacent_ports(&self, ip: &str, base_port: u16, category: AsnCategory) {
+        // Only probe if we're not already scanning too many targets for this IP
+        // (prevent queue explosion for IPs with many ports)
+        let known = self.known_servers.lock().await;
+
+        let mut probe_ports = Vec::with_capacity(2);
+
+        // Probe port +1
+        if base_port < 65535 {
+            let port = base_port + 1;
+            let key = format!("{}:{}", ip, port);
+            if !known.contains(&key) {
+                probe_ports.push(port);
+            }
+        }
+
+        // Probe port -1
+        if base_port > 1 {
+            let port = base_port - 1;
+            let key = format!("{}:{}", ip, port);
+            if !known.contains(&key) {
+                probe_ports.push(port);
+            }
+        }
+
+        drop(known);
+
+        for port in probe_ports {
+            let server_type = if port == 19132 {
+                "bedrock".to_string()
+            } else {
+                "java".to_string()
+            };
+            let mut target = ServerTarget::new(ip.to_string(), port, server_type);
+            target.priority = 1;
+            target.category = category.clone();
+            target.is_discovery = true;
+            // Add a short delay so the main server scan finishes first
+            target.next_scan_at = Some(Utc::now() + chrono::Duration::seconds(30));
+            self.add_server(target).await;
+        }
     }
 
     /// Get queue statistics for monitoring.
