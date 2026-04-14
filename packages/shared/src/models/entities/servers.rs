@@ -24,7 +24,7 @@ pub struct Model {
     pub login_obstacle: Option<String>,
     pub last_login_at: Option<DateTime>,
     pub flags: Option<String>,
-    pub created_at: Option<DateTime>,
+    pub created_at: Option<DateTimeWithTimeZone>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

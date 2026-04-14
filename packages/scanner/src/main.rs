@@ -129,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Initialize database
     let mut opt = ConnectOptions::new(&args.database);
-    opt.max_connections(200)
+    opt.max_connections(500)
         .acquire_timeout(std::time::Duration::from_secs(30))
         .sqlx_logging(false);
 
@@ -222,11 +222,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = server_repo
                 .insert_server_if_new(ip, port_i16, &server_type)
                 .await;
-            scheduler.add_server(target, false).await;
+            scheduler.add_server(target).await;
         }
     }
     // Non-test mode: queues start empty and fill naturally via background tasks
-    // (try_refill_queues, fill_warm_queue_if_needed, fill_cold_queue_if_needed)
+    // (fill_discovery_queue, try_refill_queues)
 
     // Load known server IPs into the discovery skip-list.
     // This prevents discovery from re-scanning IPs that are already known servers.
@@ -234,10 +234,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Discovery skip-list: {} known server IPs loaded from DB", count);
     }
 
-    let ((h_ready, h_total), (w_ready, w_total), (c_ready, c_total), d) = scheduler.get_queue_readiness().await;
+    let queue_stats = scheduler.get_queue_readiness().await;
     tracing::info!(
-        "Scheduler queues: Hot={}/{} ready/total, Warm={}/{} ready/total, Cold={}/{} ready/total, Discovery={}",
-        h_ready, h_total, w_ready, w_total, c_ready, c_total, d
+        "Scheduler queue: {}/{} ready/total, Discovery dedup={}",
+        queue_stats.0.0, queue_stats.0.1, queue_stats.3
     );
 
     let scheduler = Arc::new(scheduler);
@@ -262,17 +262,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 9. Start background tasks
     let scheduler_filler = Arc::clone(&scheduler);
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-        let mut tick = 0u64;
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
         loop {
             interval.tick().await;
-            tick += 1;
             if !scheduler_filler.test_mode {
-                if tick % 3 == 0 {
-                    scheduler_filler.fill_warm_queue_if_needed().await;
-                    scheduler_filler.fill_cold_queue_if_needed().await;
-                }
+                // Fill discovery queue with new targets
+                scheduler_filler.fill_discovery_queue().await;
+                // Recycle dead servers from DB
                 scheduler_filler.try_refill_queues().await;
+            }
+        }
+    });
+
+    // Periodic cleanup: delete dead servers from the database (every 6 hours)
+    let server_repo_cleanup = Arc::clone(&server_repo);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(6 * 3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Run first cleanup after a short delay at startup
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        loop {
+            interval.tick().await;
+            match server_repo_cleanup.purge_dead_servers().await {
+                Ok(count) if count > 0 => {
+                    tracing::info!("Purged {} dead servers from database", count);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!("Failed to purge dead servers: {}", e),
             }
         }
     });

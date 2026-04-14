@@ -4,8 +4,7 @@
 //! and stores the result (obstacle type) directly on the server record.
 //! Rate-limited to ~60 attempts/second with low concurrency.
 //!
-//! On startup, waits 30 minutes before processing servers that were never login-tested.
-//! This gives the scanner time to do its initial SLP pass and populate version data.
+//! DB writes are batched (50 results or 2s) to reduce pool pressure.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,6 +30,14 @@ pub struct LoginQueueStats {
     pub unreachable: u64,
     pub timeout: u64,
     pub last_server: Option<String>,
+}
+
+/// A pending login result to be batched.
+struct PendingLoginResult {
+    ip: String,
+    port: i16,
+    obstacle: String,
+    should_update_last_seen: bool,
 }
 
 /// Login queue service.
@@ -61,7 +68,7 @@ impl LoginQueue {
                 last_server: None,
             })),
             total_attempts: Arc::new(AtomicU64::new(0)),
-            semaphore: Arc::new(Semaphore::new(20)), // Max 20 concurrent login attempts
+            semaphore: Arc::new(Semaphore::new(20)),
         }
     }
 
@@ -77,7 +84,6 @@ impl LoginQueue {
             queue.run_loop().await;
         });
 
-        // Update stats
         let stats = Arc::clone(&self.stats);
         tokio::spawn(async move {
             let mut s = stats.lock().await;
@@ -87,18 +93,15 @@ impl LoginQueue {
         tracing::info!("Login queue started (60/sec rate limit, 20 max concurrent)");
     }
 
-    /// Stop the login queue.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
         tracing::info!("Login queue stopping...");
     }
 
-    /// Check if the queue is running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
 
-    /// Get current statistics.
     pub async fn get_stats(&self) -> LoginQueueStats {
         let mut stats = self.stats.lock().await;
         stats.running = self.running.load(Ordering::Relaxed);
@@ -106,7 +109,6 @@ impl LoginQueue {
         stats.clone()
     }
 
-    /// Manually trigger a login attempt to a specific server.
     pub async fn login_single(&self, ip: &str, port: u16) -> LoginResult {
         let addr: SocketAddr = match format!("{}:{}", ip, port).parse() {
             Ok(a) => a,
@@ -120,12 +122,10 @@ impl LoginQueue {
             }
         };
 
-        // Use latest protocol version for manual attempts
         let result = login::attempt_login(addr, 775).await;
         let obstacle_str = result.obstacle.to_string();
         let port: i16 = port.try_into().unwrap_or(25565);
 
-        // Store result
         if let Err(e) = self
             .server_repo
             .update_login_result(ip, port, &obstacle_str)
@@ -138,31 +138,59 @@ impl LoginQueue {
         result
     }
 
-    /// Main loop: continuously fetch online servers and attempt login.
+    /// Main loop with batched DB writes.
     async fn run_loop(&self) {
         tracing::info!("Login queue loop started");
 
-        // Give the scanner 30 minutes to do initial SLP pass before we start login testing.
-        // This ensures servers have version data populated from SLP first.
         let mut initial_delay_done = false;
-        const INITIAL_DELAY_SECONDS: i64 = 1800; // 30 minutes
+        const INITIAL_DELAY_SECONDS: i64 = 1800;
 
-        // Token bucket: refill every 16.6ms for ~60/sec rate
         let mut interval = time::interval(Duration::from_micros(16667));
 
-        // Cursor-based pagination state — cycles through ALL online servers.
+        // Cursor-based pagination
         let mut cursor_ip: Option<IpNetwork> = None;
         let mut cursor_port: Option<i16> = None;
         let mut server_index = 0usize;
         let mut current_batch: Vec<nmcscan_shared::models::entities::servers::Model> = Vec::new();
 
+        // Batch DB write channel
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PendingLoginResult>(200);
+        let repo = Arc::clone(&self.server_repo);
+
+        tokio::spawn(async move {
+            let mut results = Vec::with_capacity(50);
+            let mut last_seen_updates = Vec::with_capacity(50);
+            let mut flush_interval = time::interval(Duration::from_secs(2));
+
+            loop {
+                tokio::select! {
+                    Some(pending) = rx.recv() => {
+                        let should_update = pending.should_update_last_seen;
+                        let ip = pending.ip.clone();
+                        let port = pending.port;
+                        results.push((pending.ip, pending.port, pending.obstacle));
+                        if should_update {
+                            last_seen_updates.push((ip, port));
+                        }
+                        if results.len() >= 50 {
+                            flush_login_batch(&repo, &mut results, &mut last_seen_updates).await;
+                        }
+                    }
+                    _ = flush_interval.tick() => {
+                        if !results.is_empty() {
+                            flush_login_batch(&repo, &mut results, &mut last_seen_updates).await;
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
+
         while self.running.load(Ordering::Relaxed) {
             interval.tick().await;
 
-            // Check initial delay on first iteration
+            // Check initial delay
             if !initial_delay_done {
-                // Check if any server has been login-tested recently (within last 30 min)
-                // If so, the initial delay is already satisfied by previous run
                 let servers = match self.server_repo.get_online_servers(10).await {
                     Ok(s) => s,
                     Err(_) => {
@@ -173,9 +201,7 @@ impl LoginQueue {
 
                 let has_recent_login = servers.iter().any(|s| {
                     s.last_login_at
-                        .map(|lt| {
-                            (Utc::now().naive_utc() - lt).num_seconds() < INITIAL_DELAY_SECONDS
-                        })
+                        .map(|lt| (Utc::now().naive_utc() - lt).num_seconds() < INITIAL_DELAY_SECONDS)
                         .unwrap_or(false)
                 });
 
@@ -186,7 +212,7 @@ impl LoginQueue {
                     initial_delay_done = true;
                 } else if has_never_tested {
                     tracing::info!(
-                        "No servers have been login-tested yet. Waiting {} minutes before starting...",
+                        "No servers have been login-tested yet. Waiting {} minutes...",
                         INITIAL_DELAY_SECONDS / 60
                     );
                     time::sleep(Duration::from_secs(INITIAL_DELAY_SECONDS as u64)).await;
@@ -194,17 +220,13 @@ impl LoginQueue {
                     initial_delay_done = true;
                     continue;
                 } else {
-                    // Mix of tested and untested servers - proceed normally
                     initial_delay_done = true;
                 }
             }
 
-            // Fetch next batch using cursor pagination if we've exhausted the current batch
+            // Fetch next batch
             if server_index >= current_batch.len() {
                 server_index = 0;
-                // Only login-test servers that have been SLP-scanned within the last 48 hours.
-                // This avoids wasting resources on servers that haven't been verified recently
-                // (likely offline or dead).
                 const MAX_LOGIN_AGE_HOURS: i64 = 48;
                 match self
                     .server_repo
@@ -213,7 +235,6 @@ impl LoginQueue {
                 {
                     Ok(batch) => {
                         if batch.is_empty() {
-                            // We've cycled through all recently-scanned servers — reset cursor and start over
                             cursor_ip = None;
                             cursor_port = None;
                             match self
@@ -247,12 +268,11 @@ impl LoginQueue {
 
             let server = &current_batch[server_index];
 
-            // Update cursor to this server's position for the next batch fetch
             cursor_ip = Some(server.ip.clone());
             cursor_port = Some(server.port);
             server_index += 1;
 
-            // Skip if recently tested (within 1 hour)
+            // Skip if recently tested
             if let Some(last_login) = server.last_login_at {
                 let elapsed = chrono::Utc::now().naive_utc() - last_login;
                 if elapsed.num_seconds() < 3600 {
@@ -262,56 +282,41 @@ impl LoginQueue {
 
             let ip = server.ip.clone();
             let port = server.port;
-            let server_version = server.version.clone(); // SLP-reported version string
+            let server_version = server.version.clone();
 
-            // Acquire concurrency permit
             let permit = match self.semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => continue,
             };
 
-            let server_repo = Arc::clone(&self.server_repo);
+            let tx = tx.clone();
             let stats = Arc::clone(&self.stats);
             let total_attempts = Arc::clone(&self.total_attempts);
 
             tokio::spawn(async move {
                 let addr = SocketAddr::new(ip.ip(), port as u16);
 
-                // Extract protocol version from SLP-reported version string if available
                 let protocol = server_version
                     .as_ref()
                     .and_then(|v| login::version_to_protocol(v))
                     .unwrap_or(LATEST_PROTOCOL);
 
-                // Use smart login that extracts version from disconnect messages
                 let result = login::attempt_login_smart(addr, protocol).await;
                 let obstacle_str = result.obstacle.to_string();
 
-                // Update server record with login result
-                if let Err(e) = server_repo
-                    .update_login_result(&ip.to_string(), port as i16, &obstacle_str)
-                    .await
-                {
-                    tracing::error!("Failed to update login result for {}:{}: {}", ip, port, e);
-                }
+                let should_update_last_seen = result.obstacle != LoginObstacle::Timeout
+                    && result.obstacle != LoginObstacle::Unreachable;
 
-                // If the server responded (not a timeout or unreachable), update last_seen.
-                // This re-prioritizes the server so the scanner picks it up sooner,
-                // moving it from the cold queue back to the hot queue if it's still online.
-                if result.obstacle != LoginObstacle::Timeout
-                    && result.obstacle != LoginObstacle::Unreachable
-                {
-                    if let Err(e) = server_repo
-                        .update_last_seen(&ip.to_string(), port as i16)
-                        .await
-                    {
-                        tracing::debug!("Failed to update last_seen for {}:{}: {}", ip, port, e);
-                    }
-                }
+                // Send to batch writer instead of direct DB write
+                let _ = tx.send(PendingLoginResult {
+                    ip: ip.to_string(),
+                    port: port as i16,
+                    obstacle: obstacle_str,
+                    should_update_last_seen,
+                }).await;
 
                 total_attempts.fetch_add(1, Ordering::Relaxed);
 
-                // Update stats
                 {
                     let mut s = stats.lock().await;
                     match result.obstacle {
@@ -328,23 +333,12 @@ impl LoginQueue {
 
                 if result.obstacle == LoginObstacle::Success {
                     tracing::info!("Login SUCCESS: {}:{}", ip, port);
-                } else {
-                    tracing::debug!(
-                        "Login {}: {}:{} - {} (version: {}, protocol: {})",
-                        obstacle_str,
-                        ip,
-                        port,
-                        result.disconnect_reason.as_deref().unwrap_or("no reason"),
-                        server_version.as_deref().unwrap_or("unknown"),
-                        protocol
-                    );
                 }
 
                 drop(permit);
             });
         }
 
-        // Mark as stopped
         {
             let mut s = self.stats.lock().await;
             s.running = false;
@@ -352,7 +346,6 @@ impl LoginQueue {
         tracing::info!("Login queue loop stopped");
     }
 
-    /// Record a login result in stats.
     async fn record_result(&self, result: &LoginResult) {
         self.total_attempts.fetch_add(1, Ordering::Relaxed);
         let mut s = self.stats.lock().await;
@@ -364,6 +357,24 @@ impl LoginQueue {
             LoginObstacle::Rejected => s.rejected += 1,
             LoginObstacle::Unreachable => s.unreachable += 1,
             LoginObstacle::Timeout => s.timeout += 1,
+        }
+    }
+}
+
+/// Flush a batch of login results to the DB.
+async fn flush_login_batch(
+    repo: &ServerRepository,
+    results: &mut Vec<(String, i16, String)>,
+    last_seen_updates: &mut Vec<(String, i16)>,
+) {
+    if !results.is_empty() {
+        if let Err(e) = repo.batch_update_login_results(results.split_off(0)).await {
+            tracing::error!("Failed to batch update login results: {}", e);
+        }
+    }
+    if !last_seen_updates.is_empty() {
+        if let Err(e) = repo.batch_update_last_seen(last_seen_updates.split_off(0).as_slice()).await {
+            tracing::error!("Failed to batch update last_seen: {}", e);
         }
     }
 }

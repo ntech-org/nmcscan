@@ -85,15 +85,15 @@ pub async fn run_http_server(
 }
 
 async fn get_status(State(state): State<ScannerState>) -> Json<ScannerStatus> {
-    let (hot, warm, cold, discovery) = state.scheduler.get_queue_sizes().await;
+    let queue_stats = state.scheduler.get_queue_stats().await;
     let login_stats = state.login_queue.get_stats().await;
 
     Json(ScannerStatus {
         queues: QueueSizes {
-            hot,
-            warm,
-            cold,
-            discovery,
+            hot: queue_stats.hot,
+            warm: queue_stats.warm,
+            cold: queue_stats.cold,
+            discovery: queue_stats.discovery,
         },
         login_queue: LoginQueueStatus {
             running: login_stats.running,
@@ -137,7 +137,6 @@ async fn post_test_scan(
     let total = test_servers.len();
     tracing::info!("Test scan triggered: dispatching {} servers", total);
 
-    // Add servers to the scheduler's hot queue
     for (ip, port, _name, _host) in test_servers {
         let server_type = if port == 19132 {
             "bedrock".to_string()
@@ -146,9 +145,9 @@ async fn post_test_scan(
         };
         let mut target =
             nmcscan_shared::services::scheduler::ServerTarget::new(ip.clone(), port, server_type);
-        target.priority = 1; // Hot queue
-        target.next_scan_at = None; // Scan immediately
-        state.scheduler.add_server(target, false).await;
+        target.priority = 1;
+        target.next_scan_at = None;
+        state.scheduler.add_server(target).await;
     }
 
     Json(TestScanResponse {

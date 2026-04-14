@@ -65,7 +65,7 @@ pub struct ServerResponse {
     pub login_obstacle: Option<String>,
     pub last_login_at: Option<chrono::NaiveDateTime>,
     pub flags: Vec<String>,
-    pub created_at: Option<chrono::NaiveDateTime>,
+    pub created_at: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
 use nmcscan_shared::models::entities::servers;
@@ -134,7 +134,7 @@ pub struct ServerQuery {
     pub cursor_players: Option<i32>,
     pub cursor_ip: Option<String>,
     pub cursor_last_seen: Option<chrono::NaiveDateTime>,
-    pub cursor_created_at: Option<chrono::NaiveDateTime>,
+    pub cursor_created_at: Option<chrono::DateTime<chrono::FixedOffset>>,
     pub asn: Option<String>,
     pub min_max_players: Option<i32>,
     pub max_max_players: Option<i32>,
@@ -1044,20 +1044,22 @@ async fn get_scan_progress(
                                 warm: queues_obj.get("warm").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
                                 cold: queues_obj.get("cold").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
                                 discovery: queues_obj.get("discovery").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                total: 0,
+                                ready: 0,
                             }
                         } else {
                             nmcscan_shared::services::scheduler::QueueStats {
-                                hot: 0, warm: 0, cold: 0, discovery: 0,
+                                hot: 0, warm: 0, cold: 0, discovery: 0, total: 0, ready: 0,
                             }
                         }
                     }
                     Err(_) => nmcscan_shared::services::scheduler::QueueStats {
-                        hot: 0, warm: 0, cold: 0, discovery: 0,
+                        hot: 0, warm: 0, cold: 0, discovery: 0, total: 0, ready: 0,
                     },
                 }
             }
             _ => nmcscan_shared::services::scheduler::QueueStats {
-                hot: 0, warm: 0, cold: 0, discovery: 0,
+                hot: 0, warm: 0, cold: 0, discovery: 0, total: 0, ready: 0,
             },
         }
     };

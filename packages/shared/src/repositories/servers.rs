@@ -1,6 +1,6 @@
 use crate::models::entities::{server_history, server_players, servers};
 use chrono::{NaiveDateTime, Utc};
-use sea_orm::prelude::IpNetwork;
+use sea_orm::prelude::{DateTimeWithTimeZone, IpNetwork};
 use sea_orm::sea_query::Expr;
 use sea_orm::*;
 use std::str::FromStr;
@@ -463,7 +463,7 @@ impl ServerRepository {
         cursor_players: Option<i32>,
         cursor_ip: Option<&str>,
         cursor_last_seen: Option<NaiveDateTime>,
-        cursor_created_at: Option<NaiveDateTime>,
+        cursor_created_at: Option<DateTimeWithTimeZone>,
         asn_filter: Option<&str>,
         min_max_players: Option<i32>,
         max_max_players: Option<i32>,
@@ -872,6 +872,32 @@ impl ServerRepository {
         Ok(result.rows_affected)
     }
 
+    /// Delete servers that have been consistently offline for an extended period.
+    /// Cleans up dead servers that are no longer worth re-scanning.
+    pub async fn purge_dead_servers(&self) -> Result<u64, DbErr> {
+        // Delete servers that have never been seen online and were created >30 days ago.
+        // These are IPs that responded once but never had players — likely honeypots or dead instances.
+        let never_seen_result = servers::Entity::delete_many()
+            .filter(servers::Column::LastSeen.is_null())
+            .filter(
+                servers::Column::CreatedAt.lt(chrono::Utc::now() - chrono::Duration::days(30)),
+            )
+            .exec(&self.db)
+            .await?;
+
+        // Delete servers with 20+ consecutive failures that haven't been seen in 14+ days.
+        // These were once online but have been dead for a long time.
+        let long_dead_result = servers::Entity::delete_many()
+            .filter(servers::Column::ConsecutiveFailures.gte(20))
+            .filter(
+                servers::Column::LastSeen.lt(chrono::Utc::now() - chrono::Duration::days(14)),
+            )
+            .exec(&self.db)
+            .await?;
+
+        Ok(never_seen_result.rows_affected + long_dead_result.rows_affected)
+    }
+
     /// Update login obstacle result for a server.
     /// The PostgreSQL trigger will automatically recompute flags.
     pub async fn update_login_result(
@@ -912,6 +938,77 @@ impl ServerRepository {
                 ..Default::default()
             })
             .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Batch update login results for multiple servers.
+    /// Uses a single SQL statement with unnest for efficiency.
+    pub async fn batch_update_login_results(
+        &self,
+        results: Vec<(String, i16, String)>, // (ip, port, obstacle)
+    ) -> Result<(), DbErr> {
+        if results.is_empty() {
+            return Ok(());
+        }
+
+        let sql = r#"
+            UPDATE servers
+            SET
+                login_obstacle = v.obstacle,
+                last_login_at = CURRENT_TIMESTAMP
+            FROM (
+                SELECT unnest($1::text[]) AS ip,
+                       unnest($2::smallint[]) AS port,
+                       unnest($3::text[]) AS obstacle
+            ) v
+            WHERE servers.ip = v.ip::inet AND servers.port = v.port
+        "#;
+
+        let ips: Vec<String> = results.iter().map(|(ip, _, _)| ip.clone()).collect();
+        let ports: Vec<i16> = results.iter().map(|(_, p, _)| *p).collect();
+        let obstacles: Vec<String> = results.iter().map(|(_, _, o)| o.clone()).collect();
+
+        self.db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                [ips.into(), ports.into(), obstacles.into()],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Batch update last_seen for multiple servers.
+    pub async fn batch_update_last_seen(
+        &self,
+        servers: &[(String, i16)], // (ip, port)
+    ) -> Result<(), DbErr> {
+        if servers.is_empty() {
+            return Ok(());
+        }
+
+        let sql = r#"
+            UPDATE servers
+            SET
+                last_seen = CURRENT_TIMESTAMP,
+                status = 'online'
+            FROM (
+                SELECT unnest($1::text[]) AS ip,
+                       unnest($2::smallint[]) AS port
+            ) v
+            WHERE servers.ip = v.ip::inet AND servers.port = v.port
+        "#;
+
+        let ips: Vec<String> = servers.iter().map(|(ip, _)| ip.clone()).collect();
+        let ports: Vec<i16> = servers.iter().map(|(_, p)| *p).collect();
+
+        self.db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                [ips.into(), ports.into()],
+            ))
             .await?;
         Ok(())
     }

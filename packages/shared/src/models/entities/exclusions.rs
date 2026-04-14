@@ -8,7 +8,7 @@ pub struct Model {
     #[sea_orm(unique)]
     pub network: String,
     pub comment: Option<String>,
-    pub created_at: Option<DateTime>,
+    pub created_at: Option<DateTimeWithTimeZone>,
     pub source: String,
 }
 
