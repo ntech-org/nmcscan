@@ -2,11 +2,17 @@
 //!
 //! High-performance Minecraft server scanning service.
 //! This service can run independently of the API service.
+//!
+//! Multi-pass architecture:
+//! - Pass 1: TCP Connect scan (verify port is open)
+//! - Pass 2: Full SLP/RakNet ping (get server status)
+//! - Pass 3: Login queue (offline login test)
 
 mod login_queue;
 mod scanner;
 mod scanner_http;
 mod scanner_loop;
+mod syn_scanner;
 
 use crate::scanner::Scanner;
 use crate::scanner_http::{run_http_server, ScannerState};

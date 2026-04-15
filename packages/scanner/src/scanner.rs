@@ -1,10 +1,15 @@
 //! Rate-limited concurrent scanner.
 //!
+//! Multi-pass scanning architecture:
+//! - Pass 1: TCP Connect scan (verify port is open)
+//! - Pass 2: Full SLP/RakNet ping (get server status)
+//!
 //! Hardcoded limits:
 //! - Max 200 simultaneous tasks
 //! - ~100 new connections per second
 //! - 3 second timeout per connection
 
+use crate::syn_scanner;
 use nmcscan_shared::utils::exclude::ExcludeManager;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -21,6 +26,7 @@ pub struct Scanner {
     cold_rate_limiter: Arc<RateLimiter>,
     exclude_list: Arc<ExcludeManager>,
     asn_fetcher: Arc<AsnFetcher>,
+    syn_timeout_ms: u64,
 }
 
 /// Token bucket rate limiter.
@@ -93,15 +99,44 @@ impl Scanner {
             cold_rate_limiter: RateLimiter::new(cold_rps),
             exclude_list,
             asn_fetcher,
+            syn_timeout_ms: 3000, // 3 second timeout for SYN scan
         }
     }
 
-    /// Scan a single server with safety checks.
+    /// Pass 1: TCP Connect scan - fast port verification.
+    /// Returns true if port is open/reachable.
+    pub async fn scan_tcp(
+        &self,
+        ip: &str,
+        port: u16,
+    ) -> bool {
+        let ip_addr: IpAddr = match ip.parse() {
+            Ok(addr) => addr,
+            Err(_) => return false,
+        };
+
+        if self.exclude_list.is_excluded(ip_addr).await {
+            return false;
+        }
+
+        self.rate_limiter.acquire().await;
+
+        let _permit = match self.semaphore.acquire().await {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        let result = syn_scanner::scan_tcp_connect(ip, port, self.syn_timeout_ms).await;
+        result.reachable
+    }
+
+    /// Pass 2: Full SLP/RakNet scan - get complete server status.
+    /// This is the expensive scan, only done after TCP connect passes.
     ///
     /// # Safety
     /// - Checks exclude list BEFORE any connection
     /// - If excluded, SKIP immediately (no log, no ping)
-    pub async fn scan_server(
+    pub async fn scan_slp(
         &self,
         ip: &str,
         port: u16,

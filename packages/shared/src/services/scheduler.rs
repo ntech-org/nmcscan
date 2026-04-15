@@ -1,8 +1,11 @@
 //! Simplified priority-based scheduler for efficient server scanning.
 //!
-//! Uses a single unified priority queue instead of the previous 4-queue system.
-//! Discovery targets are generated in bulk and pushed directly to the queue.
-//! No more complex refill logic — servers are scheduled with next_scan_at timestamps.
+//! Multi-pass scanning architecture:
+//! - Pass 1 (TCP Connect): Verify port is open before expensive SLP
+//! - Pass 2 (SLP): Full Server List Ping to get server status
+//! - Pass 3 (Login): Offline login test (handled by login_queue)
+//!
+//! Only servers that pass both TCP and SLP are stored in DB.
 
 use crate::models::asn::AsnCategory;
 use crate::repositories::{AsnRepository, ServerRepository};
@@ -15,6 +18,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
+
+/// Result of a scan pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPassResult {
+    TcpPassed,
+    TcpFailed,
+    SlpPassed,
+    SlpFailed,
+}
 
 /// Queue sizes for API reporting.
 /// Keeps backward compatibility with old fields (hot/warm/cold) while supporting
@@ -42,6 +54,7 @@ pub struct ServerTarget {
     pub is_discovery: bool,
     pub scan_count: i32,
     pub success_rate: f32,
+    pub pass: u8, // 1 = TCP passed, 3 = SLP passed
 }
 
 impl ServerTarget {
@@ -59,6 +72,7 @@ impl ServerTarget {
             success_rate: 0.0,
             server_type,
             is_discovery: false,
+            pass: 0,
         }
     }
 
@@ -466,56 +480,81 @@ impl Scheduler {
         generated_count
     }
 
-    /// Re-queue a server after scanning.
-    /// Sets next_scan_at based on priority and whether it was online.
-    /// For online servers, also probes adjacent ports (progressive port scanning).
-    pub async fn requeue_server(&self, mut server: ServerTarget, was_online: bool) {
+    /// Re-queue a server after a scan pass.
+    /// 
+    /// Pass flow:
+    /// - Pass 1 (TCP): if successful, requeue for Pass 2 (SLP), don't store in DB
+    /// - Pass 3 (SLP): if successful, store in DB with pass=3, register as known
+    /// - If any pass fails: drop from memory (next ASN cycle will retry)
+    pub async fn requeue_server(&self, mut server: ServerTarget, pass_result: ScanPassResult) {
         let is_new_discovery = server.last_scanned.is_none();
         let now = Utc::now();
         server.last_scanned = Some(now);
 
-        if was_online {
-            server.mark_online();
-
-            // Register as known server to skip in future discovery
-            if is_new_discovery {
-                self.register_known_server(&server.ip, server.port).await;
+        match pass_result {
+            ScanPassResult::TcpPassed => {
+                // Pass 1 passed: requeue for Pass 2 (SLP)
+                server.pass = 1;
+                server.priority = 1; // High priority for SLP verification
+                server.next_scan_at = Some(now + chrono::Duration::seconds(5));
+                self.add_server(server).await;
             }
-
-            // Progressive port scanning: probe adjacent ports for active servers.
-            // Multiple Minecraft servers can run on the same IP with different ports.
-            let category = server.category.clone();
-            self.probe_adjacent_ports(&server.ip, server.port, category)
-                .await;
-        } else {
-            server.mark_offline();
-        }
-
-        // Don't re-queue offline discovery targets (prevents memory bloat)
-        if is_new_discovery && !was_online {
-            return;
-        }
-
-        // Determine priority based on scan result
-        if was_online {
-            server.priority = 1; // Hot — rescan frequently
-        } else if server.consecutive_failures > 5 {
-            server.priority = 3; // Cold — scan rarely
-        } else {
-            server.priority = 2; // Warm
-        }
-
-        let delay = if self.test_mode {
-            chrono::Duration::seconds(self.test_interval as i64)
-        } else {
-            match server.priority {
-                1 => chrono::Duration::hours(2),
-                2 => chrono::Duration::hours(24),
-                _ => chrono::Duration::days(7),
+            ScanPassResult::TcpFailed => {
+                // Pass 1 failed: don't requeue, don't store in DB
+                // Next ASN cycle will naturally retry
             }
-        };
-        server.next_scan_at = Some(now + delay);
-        self.add_server(server).await;
+            ScanPassResult::SlpPassed => {
+                // Pass 2 (SLP) passed: full server discovered
+                server.pass = 3;
+                server.mark_online();
+                
+                // Register as known server to skip in future discovery
+                if is_new_discovery {
+                    self.register_known_server(&server.ip, server.port).await;
+                }
+
+                // Progressive port scanning for discovered servers
+                let category = server.category.clone();
+                self.probe_adjacent_ports(&server.ip, server.port, category).await;
+
+                // Determine priority for rescan
+                server.priority = 1; // Hot — rescan frequently
+                let delay = if self.test_mode {
+                    chrono::Duration::seconds(self.test_interval as i64)
+                } else {
+                    chrono::Duration::hours(2)
+                };
+                server.next_scan_at = Some(now + delay);
+                self.add_server(server).await;
+            }
+            ScanPassResult::SlpFailed => {
+                // SLP failed: don't store in DB, don't requeue
+                // Next ASN cycle will naturally retry from offset
+                if is_new_discovery {
+                    // Discovery target that failed SLP - drop
+                } else {
+                    // Known server that went offline - reschedule as cold
+                    server.mark_offline();
+                    server.pass = 0; // Reset pass for retry
+                    server.priority = if server.consecutive_failures > 5 {
+                        3 // Cold
+                    } else {
+                        2 // Warm
+                    };
+                    let delay = if self.test_mode {
+                        chrono::Duration::seconds(self.test_interval as i64)
+                    } else {
+                        match server.priority {
+                            1 => chrono::Duration::hours(2),
+                            2 => chrono::Duration::hours(24),
+                            _ => chrono::Duration::days(7),
+                        }
+                    };
+                    server.next_scan_at = Some(now + delay);
+                    self.add_server(server).await;
+                }
+            }
+        }
     }
 
     /// Probe adjacent ports (+1, -1) when an online server is found.
@@ -580,6 +619,26 @@ impl Scheduler {
             total,
             ready,
         }
+    }
+
+    /// Reset scanning progress - clears ASN range offsets and increments epochs.
+    /// This forces discovery to restart from the beginning while keeping server results.
+    /// Returns the number of ranges reset.
+    pub async fn reset_progress(&self, reset_failures: bool) -> Result<usize, sea_orm::DbErr> {
+        let ranges_reset = self.asn_repo.reset_all_ranges().await?;
+        
+        // Clear in-memory queues
+        {
+            let mut q = self.queue.lock().await;
+            q.clear();
+        }
+        {
+            let mut dedup = self.discovery_dedup.lock().await;
+            dedup.clear();
+        }
+
+        tracing::info!("Scanning progress reset: {} ranges reset", ranges_reset);
+        Ok(ranges_reset)
     }
 
     /// Get queue sizes in the old format for backwards compatibility.

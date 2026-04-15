@@ -380,6 +380,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/exclude", get(get_exclude_list).post(add_exclusion))
         .route("/scan/test", post(trigger_test_scan))
         .route("/scan/progress", get(get_scan_progress))
+        .route("/scan/reset-progress", post(reset_scan_progress))
         .route("/login-queue/status", get(login_queue_status))
         .route("/login-queue/start", post(login_queue_start))
         .route("/login-queue/stop", post(login_queue_stop))
@@ -956,6 +957,49 @@ async fn trigger_test_scan(
         servers_added: servers_info.len(),
         servers: servers_info,
     }))
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ResetProgressRequest {
+    #[serde(default)]
+    pub reset_failures: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ResetProgressResponse {
+    pub status: String,
+    pub ranges_reset: usize,
+}
+
+/// POST /api/scan/reset-progress - Reset scanning progress (proxied to scanner).
+async fn reset_scan_progress(
+    State(state): State<AppState>,
+    Json(payload): Json<ResetProgressRequest>,
+) -> Result<Json<ResetProgressResponse>, StatusCode> {
+    let scanner_url = format!(
+        "{}/scan/reset-progress",
+        state.scanner_url.trim_end_matches('/')
+    );
+
+    let response = state
+        .http_client
+        .post(&scanner_url)
+        .json(&serde_json::json!({
+            "reset_failures": payload.reset_failures,
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to reach scanner: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    if !response.status().is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let result: ResetProgressResponse = response.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(result))
 }
 
 /// GET /api/login-queue/status - Get login queue status from scanner.

@@ -311,6 +311,27 @@ impl AsnRepository {
         Ok(())
     }
 
+    /// Reset all ASN range offsets and increment epochs to restart discovery.
+    /// Returns the number of ranges reset.
+    pub async fn reset_all_ranges(&self) -> Result<usize, DbErr> {
+        let sql = r#"
+            UPDATE asn_ranges
+            SET scan_offset = 0,
+                scan_epoch = scan_epoch + 1,
+                last_scanned_at = NULL
+        "#;
+        let result = self.db
+            .execute(Statement::from_string(
+                self.db.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await?;
+
+        let rows_affected = result.rows_affected();
+        tracing::info!("Reset {} ASN ranges", rows_affected);
+        Ok(rows_affected as usize)
+    }
+
     /// Get scan progress per category: total ranges, current cycle progress, and first-loop progress.
     pub async fn get_scan_progress(&self) -> Result<Vec<CategoryProgress>, DbErr> {
         let sql = r#"

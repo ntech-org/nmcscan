@@ -66,6 +66,22 @@ pub struct LoginTriggerRequest {
     pub port: u16,
 }
 
+#[derive(Deserialize)]
+pub struct ResetProgressRequest {
+    #[serde(default = "default_false")]
+    pub reset_failures: bool,
+}
+
+fn default_false() -> bool {
+    false
+}
+
+#[derive(Serialize)]
+pub struct ResetProgressResponse {
+    pub status: String,
+    pub ranges_reset: usize,
+}
+
 pub async fn run_http_server(
     state: ScannerState,
     listen_addr: &str,
@@ -73,6 +89,7 @@ pub async fn run_http_server(
     let app = Router::new()
         .route("/status", get(get_status))
         .route("/scan/test", post(post_test_scan))
+        .route("/scan/reset-progress", post(post_reset_progress))
         .route("/login-queue/status", get(get_login_status))
         .route("/login-queue/trigger", post(post_login_trigger))
         .with_state(state);
@@ -185,4 +202,20 @@ async fn post_login_trigger(
         "protocol_used": result.protocol_used,
         "latency_ms": result.latency_ms,
     })))
+}
+
+async fn post_reset_progress(
+    State(state): State<ScannerState>,
+    Json(payload): Json<ResetProgressRequest>,
+) -> Result<Json<ResetProgressResponse>, (StatusCode, String)> {
+    match state.scheduler.reset_progress(payload.reset_failures).await {
+        Ok(ranges_reset) => Ok(Json(ResetProgressResponse {
+            status: "ok".to_string(),
+            ranges_reset,
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to reset progress: {}", e),
+        )),
+    }
 }
