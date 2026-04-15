@@ -7,8 +7,8 @@
 use crate::models::asn::AsnCategory;
 use crate::repositories::{AsnRepository, ServerRepository};
 use chrono::{DateTime, Utc};
-use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
@@ -21,12 +21,9 @@ use tokio::sync::Mutex;
 /// the new unified queue model.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueStats {
-    pub hot: usize,      // Legacy: now maps to ready count
-    pub warm: usize,     // Legacy: now 0
-    pub cold: usize,     // Legacy: now 0
     pub discovery: usize, // Discovery dedup count
-    pub total: usize,    // New: total queue size
-    pub ready: usize,    // New: ready count
+    pub total: usize,     // New: total queue size
+    pub ready: usize,     // New: ready count
 }
 
 /// Target server for scanning.
@@ -158,7 +155,9 @@ impl Scheduler {
         target_rps: u64,
     ) -> Self {
         Self {
-            queue: Arc::new(Mutex::new(std::collections::BinaryHeap::with_capacity(100_000))),
+            queue: Arc::new(Mutex::new(std::collections::BinaryHeap::with_capacity(
+                100_000,
+            ))),
             discovery_dedup: Arc::new(Mutex::new(HashMap::new())),
             known_servers: Arc::new(Mutex::new(HashSet::new())),
             server_repo,
@@ -265,10 +264,8 @@ impl Scheduler {
     /// scaling the number of IPs per range based on target RPS.
     pub async fn fill_discovery_queue(&self) {
         // INTERLEAVED DISCOVERY: Fetch hosting ranges (90% of capacity)
-        let hosting_ips_per_range = std::cmp::max(
-            1u64,
-            (self.target_rps * 15 * 9 / 10).div_ceil(500),
-        );
+        let hosting_ips_per_range =
+            std::cmp::max(1u64, (self.target_rps * 15 * 9 / 10).div_ceil(500));
 
         match self.asn_repo.get_ranges_to_scan("hosting", 500).await {
             Ok(ranges) => {
@@ -291,16 +288,10 @@ impl Scheduler {
         }
 
         // Residential ranges (10% of capacity, deliberately limited)
-        let residential_ips_per_range = std::cmp::max(
-            1u64,
-            (self.target_rps * 15 / 10).div_ceil(500),
-        );
+        let residential_ips_per_range =
+            std::cmp::max(1u64, (self.target_rps * 15 / 10).div_ceil(500));
 
-        match self
-            .asn_repo
-            .get_ranges_to_scan("residential", 500)
-            .await
-        {
+        match self.asn_repo.get_ranges_to_scan("residential", 500).await {
             Ok(ranges) => {
                 if !ranges.is_empty() {
                     let count = self
@@ -446,7 +437,11 @@ impl Scheduler {
                 "Discovery: {} ranges reset, {} ranges skipped cooldown (category: {}, min interval: {}h)",
                 ranges_reset,
                 ranges_skipped_cooldown,
-                if priority == 2 { "hosting" } else { "residential" },
+                if priority == 2 {
+                    "hosting"
+                } else {
+                    "residential"
+                },
                 min_epoch_hours
             );
         }
@@ -490,7 +485,8 @@ impl Scheduler {
             // Progressive port scanning: probe adjacent ports for active servers.
             // Multiple Minecraft servers can run on the same IP with different ports.
             let category = server.category.clone();
-            self.probe_adjacent_ports(&server.ip, server.port, category).await;
+            self.probe_adjacent_ports(&server.ip, server.port, category)
+                .await;
         } else {
             server.mark_offline();
         }
@@ -573,13 +569,13 @@ impl Scheduler {
         let q = self.queue.lock().await;
         let now = Utc::now();
         let total = q.len();
-        let ready = q.iter().filter(|s| s.next_scan_at.map_or(true, |t| t <= now)).count();
+        let ready = q
+            .iter()
+            .filter(|s| s.next_scan_at.map_or(true, |t| t <= now))
+            .count();
         let discovery_pending = self.discovery_dedup.lock().await.len();
 
         QueueStats {
-            hot: ready,      // Legacy: maps to ready count
-            warm: 0,         // Legacy: no longer used
-            cold: 0,         // Legacy: no longer used
             discovery: discovery_pending,
             total,
             ready,
@@ -587,11 +583,16 @@ impl Scheduler {
     }
 
     /// Get queue sizes in the old format for backwards compatibility.
-    pub async fn get_queue_readiness(&self) -> ((usize, usize), (usize, usize), (usize, usize), usize) {
+    pub async fn get_queue_readiness(
+        &self,
+    ) -> ((usize, usize), (usize, usize), (usize, usize), usize) {
         let q = self.queue.lock().await;
         let total = q.len();
         let now = Utc::now();
-        let ready = q.iter().filter(|s| s.next_scan_at.map_or(true, |t| t <= now)).count();
+        let ready = q
+            .iter()
+            .filter(|s| s.next_scan_at.map_or(true, |t| t <= now))
+            .count();
         let discovery_pending = self.discovery_dedup.lock().await.len();
 
         // Return in format expected by existing code: ((hot_r, hot_t), (warm_r, warm_t), (cold_r, cold_t), discovery)

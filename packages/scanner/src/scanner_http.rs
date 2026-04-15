@@ -29,9 +29,8 @@ pub struct ScannerStatus {
 
 #[derive(Serialize)]
 pub struct QueueSizes {
-    pub hot: usize,
-    pub warm: usize,
-    pub cold: usize,
+    pub ready: usize,
+    pub total: usize,
     pub discovery: usize,
 }
 
@@ -90,9 +89,8 @@ async fn get_status(State(state): State<ScannerState>) -> Json<ScannerStatus> {
 
     Json(ScannerStatus {
         queues: QueueSizes {
-            hot: queue_stats.hot,
-            warm: queue_stats.warm,
-            cold: queue_stats.cold,
+            ready: queue_stats.ready,
+            total: queue_stats.total,
             discovery: queue_stats.discovery,
         },
         login_queue: LoginQueueStatus {
@@ -125,12 +123,11 @@ async fn post_test_scan(
         servers.truncate(count);
         servers
     } else {
-        let servers: Vec<(String, u16, String, String)> =
-            test_mode::KNOWN_MINECRAFT_SERVERS
-                .iter()
-                .take(count)
-                .map(|s| (s.0.to_string(), s.1, s.2.to_string(), s.3.to_string()))
-                .collect();
+        let servers: Vec<(String, u16, String, String)> = test_mode::KNOWN_MINECRAFT_SERVERS
+            .iter()
+            .take(count)
+            .map(|s| (s.0.to_string(), s.1, s.2.to_string(), s.3.to_string()))
+            .collect();
         servers
     };
 
@@ -175,7 +172,10 @@ async fn post_login_trigger(
     State(state): State<ScannerState>,
     Json(payload): Json<LoginTriggerRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let result = state.login_queue.login_single(&payload.ip, payload.port).await;
+    let result = state
+        .login_queue
+        .login_single(&payload.ip, payload.port)
+        .await;
 
     Ok(Json(serde_json::json!({
         "ip": payload.ip,

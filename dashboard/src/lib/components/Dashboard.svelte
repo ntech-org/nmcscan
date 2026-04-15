@@ -50,7 +50,7 @@
 </script>
 
 <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-    <Card.Root class="py-0">
+    <Card.Root>
         <Card.Header
             class="flex flex-row items-center justify-between space-y-0 pb-2"
         >
@@ -69,7 +69,7 @@
         </Card.Content>
     </Card.Root>
 
-    <Card.Root class="py-0">
+    <Card.Root>
         <Card.Header
             class="flex flex-row items-center justify-between space-y-0 pb-2"
         >
@@ -96,7 +96,7 @@
         </Card.Content>
     </Card.Root>
 
-    <Card.Root class="py-0">
+    <Card.Root>
         <Card.Header
             class="flex flex-row items-center justify-between space-y-0 pb-2"
         >
@@ -115,7 +115,7 @@
         </Card.Content>
     </Card.Root>
 
-    <Card.Root class="py-0">
+    <Card.Root>
         <Card.Header
             class="flex flex-row items-center justify-between space-y-0 pb-2"
         >

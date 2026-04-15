@@ -908,9 +908,8 @@ async fn trigger_test_scan(
         })?;
 
     let status = response.status();
-    let _body: crate::handlers::ScannerTestScanResponse = response.json().await.map_err(|_| {
-        StatusCode::BAD_GATEWAY
-    })?;
+    let _body: crate::handlers::ScannerTestScanResponse =
+        response.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
 
     if !status.is_success() {
         return Err(StatusCode::BAD_GATEWAY);
@@ -960,8 +959,13 @@ async fn trigger_test_scan(
 }
 
 /// GET /api/login-queue/status - Get login queue status from scanner.
-async fn login_queue_status(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let scanner_url = format!("{}/login-queue/status", state.scanner_url.trim_end_matches('/'));
+async fn login_queue_status(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let scanner_url = format!(
+        "{}/login-queue/status",
+        state.scanner_url.trim_end_matches('/')
+    );
 
     let response = state
         .http_client
@@ -998,7 +1002,10 @@ async fn login_queue_trigger(
     State(state): State<AppState>,
     Json(payload): Json<LoginQueueTriggerRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let scanner_url = format!("{}/login-queue/trigger", state.scanner_url.trim_end_matches('/'));
+    let scanner_url = format!(
+        "{}/login-queue/trigger",
+        state.scanner_url.trim_end_matches('/')
+    );
 
     let response = state
         .http_client
@@ -1040,26 +1047,39 @@ async fn get_scan_progress(
                     Ok(body) => {
                         if let Some(queues_obj) = body.get("queues") {
                             nmcscan_shared::services::scheduler::QueueStats {
-                                hot: queues_obj.get("hot").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                                warm: queues_obj.get("warm").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                                cold: queues_obj.get("cold").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                                discovery: queues_obj.get("discovery").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                                total: 0,
-                                ready: 0,
+                                discovery: queues_obj
+                                    .get("discovery")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    as usize,
+                                total: queues_obj
+                                    .get("total")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0) as usize,
+                                ready: queues_obj
+                                    .get("ready")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0) as usize,
                             }
                         } else {
                             nmcscan_shared::services::scheduler::QueueStats {
-                                hot: 0, warm: 0, cold: 0, discovery: 0, total: 0, ready: 0,
+                                discovery: 0,
+                                total: 0,
+                                ready: 0,
                             }
                         }
                     }
                     Err(_) => nmcscan_shared::services::scheduler::QueueStats {
-                        hot: 0, warm: 0, cold: 0, discovery: 0, total: 0, ready: 0,
+                        discovery: 0,
+                        total: 0,
+                        ready: 0,
                     },
                 }
             }
             _ => nmcscan_shared::services::scheduler::QueueStats {
-                hot: 0, warm: 0, cold: 0, discovery: 0, total: 0, ready: 0,
+                discovery: 0,
+                total: 0,
+                ready: 0,
             },
         }
     };

@@ -59,11 +59,28 @@
                 </h2>
                 <p class="text-muted-foreground leading-relaxed">
                     NMCScan is a research system that identifies publicly
-                    accessible Minecraft servers. We only perform a standard <span
-                        class="italic font-medium">Server List Ping</span
-                    >—the same request your Minecraft client sends when you add
-                    a server to your multiplayer list.
+                    accessible Minecraft servers. We perform only the following:
                 </p>
+                <ul
+                    class="list-disc pl-6 space-y-2 text-muted-foreground leading-relaxed"
+                >
+                    <li>
+                        Standard <span class="italic font-medium"
+                            >SLP (Server List Ping)</span
+                        > connection — the same request your Minecraft client sends
+                        when you add a server to your multiplayer list.
+                    </li>
+                    <li>
+                        Progressive port scanning to discover servers on a host;
+                        scanning stops automatically when no additional
+                        responsive servers are found.
+                    </li>
+                    <li>
+                        Login attempts only to servers that responded to SLP
+                        (active servers) — limited, rate-controlled checks used
+                        solely to verify accessibility.
+                    </li>
+                </ul>
             </section>
 
             <section
