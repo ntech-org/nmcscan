@@ -99,7 +99,7 @@ impl Scanner {
             cold_rate_limiter: RateLimiter::new(cold_rps),
             exclude_list,
             asn_fetcher,
-            syn_timeout_ms: 3000, // 3 second timeout for SYN scan
+            syn_timeout_ms: 5000, // 5 second timeout for TCP connect (was 3s)
         }
     }
 
