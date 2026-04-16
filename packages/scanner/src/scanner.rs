@@ -24,6 +24,7 @@ pub struct Scanner {
     semaphore: Arc<Semaphore>,
     rate_limiter: Arc<RateLimiter>,
     cold_rate_limiter: Arc<RateLimiter>,
+    tcp_rate_limiter: Arc<RateLimiter>, // Separate faster rate limiter for TCP
     exclude_list: Arc<ExcludeManager>,
     asn_fetcher: Arc<AsnFetcher>,
     syn_timeout_ms: u64,
@@ -97,14 +98,16 @@ impl Scanner {
             semaphore: Arc::new(Semaphore::new(concurrency as usize)),
             rate_limiter: RateLimiter::new(rps),
             cold_rate_limiter: RateLimiter::new(cold_rps),
+            // TCP (Pass 1) can run faster since it's just a TCP connect
+            tcp_rate_limiter: RateLimiter::new(rps * 2), // 2x the normal RPS for TCP
             exclude_list,
             asn_fetcher,
-            syn_timeout_ms: 5000, // 5 second timeout for TCP connect (was 3s)
+            syn_timeout_ms: 5000,
         }
     }
 
     /// Pass 1: TCP Connect scan - fast port verification.
-    /// Returns true if port is open/reachable.
+/// Uses higher RPS since TCP connect is cheap.
     pub async fn scan_tcp(
         &self,
         ip: &str,
@@ -119,7 +122,7 @@ impl Scanner {
             return false;
         }
 
-        self.rate_limiter.acquire().await;
+        self.tcp_rate_limiter.acquire().await; // Uses faster rate limiter
 
         let _permit = match self.semaphore.acquire().await {
             Ok(p) => p,
