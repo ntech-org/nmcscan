@@ -33,6 +33,12 @@ pub async fn run_scanner_loop(
     let mut status_interval = tokio::time::interval(Duration::from_secs(60));
     let mut stats_flush_interval = tokio::time::interval(Duration::from_secs(10));
 
+    // Persistent pass stats counters
+    let total_tcp_scans = Arc::new(AtomicU32::new(0));
+    let total_tcp_passed = Arc::new(AtomicU32::new(0));
+    let total_slp_passed = Arc::new(AtomicU32::new(0));
+    let total_discovered = Arc::new(AtomicU32::new(0));
+
     // Result batching channel for SLP results (servers that pass Pass 2)
     let (result_tx, mut result_rx) =
         mpsc::channel::<nmcscan_shared::network::ScanResult>(max_concurrency as usize * 2);
@@ -68,13 +74,21 @@ pub async fn run_scanner_loop(
         tokio::select! {
             _ = status_interval.tick() => {
                 let queue_stats = scheduler.get_queue_stats().await;
+                let tcp_total = total_tcp_scans.load(Ordering::Relaxed);
+                let tcp_ok = total_tcp_passed.load(Ordering::Relaxed);
+                let slp_ok = total_slp_passed.load(Ordering::Relaxed);
+                let discovered = total_discovered.load(Ordering::Relaxed);
                 tracing::info!(
-                    "Queue: {}/{} ready/total, Discovery dedup={}, Active={}, Scans today={}",
+                    "Queue: {}/{} ready/total, Dedup={}, Active={}, Scans={}, TCP_ok={}/{}, SLP_ok={}, Discovered={}",
                     queue_stats.ready,
                     queue_stats.total,
                     queue_stats.discovery,
                     active_tasks.load(Ordering::Relaxed),
-                    total_scans.load(Ordering::Relaxed)
+                    total_scans.load(Ordering::Relaxed),
+                    tcp_ok,
+                    tcp_total,
+                    slp_ok,
+                    discovered
                 );
             }
             _ = stats_flush_interval.tick() => {
@@ -89,7 +103,7 @@ pub async fn run_scanner_loop(
             server_opt = scheduler.next_server() => {
                 if let Some(server) = server_opt {
                     if active_tasks.load(Ordering::SeqCst) >= max_concurrency {
-                        scheduler.add_server(server).await;
+                        scheduler.add_server(server, false).await;
                         tokio::time::sleep(Duration::from_millis(10)).await;
                         continue;
                     }
@@ -103,6 +117,12 @@ pub async fn run_scanner_loop(
                     let tcp_pass_buffer = Arc::clone(&tcp_pass_buffer);
                     let slp_pass_buffer = Arc::clone(&slp_pass_buffer);
                     let result_tx = result_tx.clone();
+                    
+                    // Persistent counters
+                    let total_tcp_scans = Arc::clone(&total_tcp_scans);
+                    let total_tcp_passed = Arc::clone(&total_tcp_passed);
+                    let total_slp_passed = Arc::clone(&total_slp_passed);
+                    let total_discovered = Arc::clone(&total_discovered);
 
                     active_tasks.fetch_add(1, Ordering::SeqCst);
 
@@ -162,8 +182,20 @@ pub async fn run_scanner_loop(
                         scheduler.requeue_server(server, pass_result).await;
 
                         scan_buffer.fetch_add(1, Ordering::Relaxed);
+                        
+                        // Update persistent counters
+                        if current_pass == 0 {
+                            total_tcp_scans.fetch_add(1, Ordering::Relaxed);
+                            if pass_result == ScanPassResult::TcpPassed {
+                                total_tcp_passed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        } else if current_pass == 1 && pass_result == ScanPassResult::SlpPassed {
+                            total_slp_passed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        
                         if pass_result == ScanPassResult::SlpPassed && is_discovery {
                             discovery_buffer.fetch_add(1, Ordering::Relaxed);
+                            total_discovered.fetch_add(1, Ordering::Relaxed);
                         }
                         total_scans.fetch_add(1, Ordering::Relaxed);
 

@@ -202,9 +202,12 @@ impl Scheduler {
     }
 
     /// Add a server to the priority queue.
-    pub async fn add_server(&self, server: ServerTarget) {
+    /// 
+    /// If `is_requeue` is true, skips discovery dedup check (for re-queued servers after TCP/SLP).
+    pub async fn add_server(&self, server: ServerTarget, is_requeue: bool) {
         // Discovery targets always go through discovery dedup.
-        if server.is_discovery {
+        // Requeues (already scanned once) skip dedup to avoid being blocked.
+        if server.is_discovery && !is_requeue {
             let key = format!("{}:{}", server.ip, server.port);
             let mut dedup = self.discovery_dedup.lock().await;
 
@@ -504,7 +507,7 @@ impl Scheduler {
                 server.priority = 1; // High priority for SLP verification
                 server.next_scan_at = Some(now + chrono::Duration::seconds(5));
                 tracing::debug!("TCP passed, requeued for SLP: {}:{}", server.ip, server.port);
-                self.add_server(server).await;
+                self.add_server(server, true).await; // is_requeue = true
             }
             ScanPassResult::TcpFailed => {
                 // Pass 1 failed: don't requeue, don't store in DB
@@ -536,7 +539,7 @@ impl Scheduler {
                     chrono::Duration::hours(2)
                 };
                 server.next_scan_at = Some(now + delay);
-                self.add_server(server).await;
+                self.add_server(server, true).await; // is_requeue = true
             }
             ScanPassResult::SlpFailed => {
                 // SLP failed: don't store in DB, don't requeue
@@ -562,7 +565,7 @@ impl Scheduler {
                         }
                     };
                     server.next_scan_at = Some(now + delay);
-                    self.add_server(server).await;
+                    self.add_server(server, true).await; // is_requeue = true
                 }
             }
         }
@@ -610,7 +613,7 @@ impl Scheduler {
             target.is_discovery = true;
             // Add a short delay so the main server scan finishes first
             target.next_scan_at = Some(Utc::now() + chrono::Duration::seconds(30));
-            self.add_server(target).await;
+            self.add_server(target, false).await; // is_requeue = false (new discovery)
         }
     }
 
@@ -689,7 +692,7 @@ impl Scheduler {
                 if let Some(last) = server.last_seen {
                     target.next_scan_at = Some(last.and_utc() + chrono::Duration::days(7));
                 }
-                self.add_server(target).await;
+                self.add_server(target, true).await; // is_requeue = true (rescheduling known server)
             }
         }
 
@@ -713,7 +716,7 @@ impl Scheduler {
                     target.priority = 1;
                 }
                 // Don't set next_scan_at — it's ready now
-                self.add_server(target).await;
+                self.add_server(target, true).await; // is_requeue = true (rescheduling known server)
             }
             tracing::debug!("Refilled {} known servers from DB", count);
         }

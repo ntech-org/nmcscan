@@ -228,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = server_repo
                 .insert_server_if_new(ip, port_i16, &server_type)
                 .await;
-            scheduler.add_server(target).await;
+            scheduler.add_server(target, true).await; // is_requeue = true (test mode)
         }
     }
     // Non-test mode: queues start empty and fill naturally via background tasks

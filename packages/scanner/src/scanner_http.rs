@@ -161,7 +161,7 @@ async fn post_test_scan(
             nmcscan_shared::services::scheduler::ServerTarget::new(ip.clone(), port, server_type);
         target.priority = 1;
         target.next_scan_at = None;
-        state.scheduler.add_server(target).await;
+        state.scheduler.add_server(target, true).await; // is_requeue = true (test scan)
     }
 
     Json(TestScanResponse {
