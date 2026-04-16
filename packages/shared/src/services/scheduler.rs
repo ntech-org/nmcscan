@@ -503,11 +503,13 @@ impl Scheduler {
                 server.pass = 1;
                 server.priority = 1; // High priority for SLP verification
                 server.next_scan_at = Some(now + chrono::Duration::seconds(5));
+                tracing::debug!("TCP passed, requeued for SLP: {}:{}", server.ip, server.port);
                 self.add_server(server).await;
             }
             ScanPassResult::TcpFailed => {
                 // Pass 1 failed: don't requeue, don't store in DB
                 // Next ASN cycle will naturally retry
+                tracing::debug!("TCP failed, dropped: {}:{}", server.ip, server.port);
             }
             ScanPassResult::SlpPassed => {
                 // Pass 2 (SLP) passed: full server discovered
