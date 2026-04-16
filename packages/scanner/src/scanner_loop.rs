@@ -107,7 +107,7 @@ pub async fn run_scanner_loop(
                     active_tasks.fetch_add(1, Ordering::SeqCst);
 
                     tokio::spawn(async move {
-                        let is_discovery = server.last_scanned.is_none();
+                        let is_discovery = server.is_discovery;
                         let current_pass = server.pass;
 
                         // Determine which pass to run

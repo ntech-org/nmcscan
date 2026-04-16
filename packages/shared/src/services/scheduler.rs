@@ -480,6 +480,12 @@ impl Scheduler {
         generated_count
     }
 
+    /// Remove a server from discovery dedup to allow re-discovery.
+    pub async fn remove_from_dedup(&self, ip: &str, port: u16) {
+        let key = format!("{}:{}", ip, port);
+        self.discovery_dedup.lock().await.remove(&key);
+    }
+
     /// Re-queue a server after a scan pass.
     /// 
     /// Pass flow:
@@ -506,11 +512,14 @@ impl Scheduler {
             ScanPassResult::SlpPassed => {
                 // Pass 2 (SLP) passed: full server discovered
                 server.pass = 3;
+                server.is_discovery = false; // No longer a new discovery
                 server.mark_online();
                 
                 // Register as known server to skip in future discovery
                 if is_new_discovery {
                     self.register_known_server(&server.ip, server.port).await;
+                    // Remove from discovery dedup to allow re-discovery later
+                    self.remove_from_dedup(&server.ip, server.port).await;
                 }
 
                 // Progressive port scanning for discovered servers
