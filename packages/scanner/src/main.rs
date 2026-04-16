@@ -74,12 +74,16 @@ struct Args {
     exclude_file: String,
 
     /// Target scans per second (Connections Per Second)
-    #[arg(long, env = "TARGET_RPS", default_value = "100")]
+    #[arg(long, env = "TARGET_RPS", default_value = "400")]
     target_rps: u64,
 
     /// Target concurrent scan tasks
     #[arg(long, env = "TARGET_CONCURRENCY", default_value = "2500")]
     target_concurrency: u32,
+
+    /// TCP connect rate limit (Pass 1) - defaults to 1250
+    #[arg(long, env = "TCP_RPS", default_value = "1250")]
+    tcp_rps: u64,
 
     /// Target scans per second for cold/residential IPs
     #[arg(long, env = "TARGET_COLD_RPS")]
@@ -187,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.target_rps,
         args.target_concurrency,
         args.target_cold_rps,
+        args.tcp_rps,
     );
     let scheduler = Scheduler::new(
         Arc::clone(&server_repo),

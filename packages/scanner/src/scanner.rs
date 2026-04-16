@@ -92,15 +92,14 @@ impl Scanner {
         rps: u64,
         concurrency: u32,
         cold_rps: Option<u64>,
+        tcp_rps: u64,
     ) -> Self {
         let cold_rps = cold_rps.unwrap_or_else(|| (rps / 10).max(1));
         Self {
             semaphore: Arc::new(Semaphore::new(concurrency as usize)),
             rate_limiter: RateLimiter::new(rps),
             cold_rate_limiter: RateLimiter::new(cold_rps),
-            // TCP (Pass 1) has no rate limit - just concurrency control
-            // TCP connect is extremely lightweight, no need to throttle
-            tcp_rate_limiter: None, 
+            tcp_rate_limiter: Some(RateLimiter::new(tcp_rps)), // Separate TCP rate limit
             exclude_list,
             asn_fetcher,
             syn_timeout_ms: 5000,
