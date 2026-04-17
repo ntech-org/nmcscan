@@ -241,7 +241,7 @@ impl AsnManager {
             "opendns",
             "umbrella security",
             // Research & Census Projects
-            "isc",
+            "isc", // MIGHT CAUSE FALSE POSITIVES (3 letter keyword)
             "internet systems consortium",
             "caida",
             "routeviews",
@@ -260,8 +260,10 @@ impl AsnManager {
 
         // 2. Map ipverse category
         match category {
-            Some("hosting") => AsnCategory::Hosting,
-            Some("isp") | Some("business") => AsnCategory::Residential,
+            Some("hosting") => AsnCategory::Hosting, // Safe-ish (OVH, AWS, etc.)
+            Some("residential") => AsnCategory::Residential, // Only explicit residential
+            Some("isp") => AsnCategory::Excluded,    // TOO RISKY. Mix of biz/resi.
+            Some("business") => AsnCategory::Excluded, // HIGH RISK. Corporate nets.
             Some("education_research") | Some("government_admin") => AsnCategory::Excluded,
             _ => AsnCategory::Unknown,
         }
@@ -359,7 +361,7 @@ mod tests {
             AsnCategory::Hosting
         );
         assert_eq!(
-            AsnManager::categorize_from_ipverse("Comcast", Some("isp")),
+            AsnManager::categorize_from_ipverse("Comcast", Some("residential")),
             AsnCategory::Residential
         );
 
@@ -380,7 +382,7 @@ mod tests {
         // Regular categories
         assert_eq!(
             AsnManager::categorize_from_ipverse("Normal Biz", Some("business")),
-            AsnCategory::Residential
+            AsnCategory::Excluded
         );
         assert_eq!(
             AsnManager::categorize_from_ipverse("Unknown Org", Some("unknown_cat")),
